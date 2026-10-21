@@ -1,0 +1,119 @@
+==WARNING== Note: Running with unmodified GPU clocks. If not controlled otherwise, profiling results may be inconsistent.
+==PROF== Connected to process 74616 (/tmp/bench_spread)
+==PROF== Profiling "void cufinufft::spreadinterp::spread_output_driven<float, (int)1, (int)3, (int)6>(cufinufft_gpu_data<T1>, const std::conditional<std::is_same<T1, float>::value, float2, std::conditional<std::is_same<T1, double>::value, double2, void>::type>::type *, std::conditional<std::is_same<T1, float>::value, float2, std::conditional<std::is_same<T1, double>::value, double2, void>::type>::type *, int)": 0%....50%....100% - 13 passes
+method=3 M=100000 nf=2097152 cluster=0 bin=0 maxsub=0 np=0 setpts=0.426 ms execute=2.817 ms total=3.243 ms  Mpts/s(exec)=35.49
+==PROF== Disconnected from process 74616
+[74616] bench_spread@127.0.0.1
+  void spread_output_driven<float, 1, 3, 6>(cufinufft_gpu_data<T1>, const conditional<is_same<T1, float>::value, float2, conditional<is_same<T1, double>::value, double2, void>::type>::type *, conditional<is_same<T1, float>::value, float2, conditional<is_same<T1, double>::value, double2, void>::type>::type *, int) (2197, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 7.5
+    Warning: Data collection happened without fixed GPU frequencies. Profiling results may be inconsistent.
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz         3.49
+    SM Frequency                    Ghz         1.53
+    Elapsed Cycles                cycle      4048835
+    Memory Throughput                 %        32.89
+    DRAM Throughput                   %        23.27
+    Duration                         ms         2.64
+    L1/TEX Cache Throughput           %        56.73
+    L2 Cache Throughput               %        32.89
+    SM Active Cycles              cycle   4002155.71
+    Compute (SM) Throughput           %        33.05
+    ----------------------- ----------- ------------
+
+    OPT   This workload exhibits low compute throughput and memory bandwidth utilization relative to the peak           
+          performance of this device. Achieved compute throughput and/or memory bandwidth below 60.0% of peak           
+          typically indicate latency issues. Look at Scheduler Statistics and Warp State Statistics for potential       
+          reasons.                                                                                                      
+
+    Section: Scheduler Statistics
+    ---------------------------- ----------- ------------
+    Metric Name                  Metric Unit Metric Value
+    ---------------------------- ----------- ------------
+    One or More Eligible                   %        31.81
+    Issued Warp Per Scheduler                        0.32
+    No Eligible                            %        68.19
+    Active Warps Per Scheduler          warp         1.99
+    Eligible Warps Per Scheduler        warp         0.40
+    ---------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 66.95%                                                                                    
+          Every scheduler is capable of issuing one instruction per cycle, but for this workload each scheduler only    
+          issues an instruction every 3.1 cycles. This might leave hardware resources underutilized and may lead to     
+          less optimal performance. Out of the maximum of 8 warps per scheduler, this workload allocates an average of  
+          1.99 active warps per scheduler, but only an average of 0.40 warps were eligible per cycle. Eligible warps    
+          are the subset of active warps that are ready to issue their next instruction. Every cycle with no eligible   
+          warp results in no instruction being issued and the issue slot remains unused. To increase the number of      
+          eligible warps, avoid possible load imbalances due to highly different execution durations per warp.          
+          Reducing stalls indicated on the Warp State Statistics and Source Counters sections can help, too.            
+
+    Section: Warp State Statistics
+    ---------------------------------------- ----------- ------------
+    Metric Name                              Metric Unit Metric Value
+    ---------------------------------------- ----------- ------------
+    Warp Cycles Per Issued Instruction             cycle         6.26
+    Warp Cycles Per Executed Instruction           cycle         6.26
+    Avg. Active Threads Per Warp                                31.40
+    Avg. Not Predicated Off Threads Per Warp                    28.85
+    ---------------------------------------- ----------- ------------
+
+    WRN   The optional metric smsp__pcsamp_sample_count could not be found. Collecting it as an additional metric could 
+          enable the rule to provide more guidance.                                                                     
+
+    Section: Instruction Statistics
+    ---------------------------------------- ----------- ------------
+    Metric Name                              Metric Unit Metric Value
+    ---------------------------------------- ----------- ------------
+    Avg. Executed Instructions Per Scheduler        inst   1271783.64
+    Executed Instructions                           inst     71219884
+    Avg. Issued Instructions Per Scheduler          inst   1271814.64
+    Issued Instructions                             inst     71221620
+    ---------------------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 20.77%                                                                                    
+          This kernel executes 2042150 fused and 1451372 non-fused FP32 instructions. By converting pairs of non-fused  
+          instructions to their fused (https://docs.nvidia.com/cuda/floating-point/#cuda-and-floating-point),           
+          higher-throughput equivalent, the achieved FP32 performance could be increased by up to 21% (relative to its  
+          current performance). Check the Source page to identify where this kernel executes FP32 instructions.         
+
+    Section: Launch Statistics
+    -------------------------------- --------------- ---------------
+    Metric Name                          Metric Unit    Metric Value
+    -------------------------------- --------------- ---------------
+    Block Size                                                   256
+    Function Cache Configuration                     CachePreferNone
+    Grid Size                                                   2197
+    Registers Per Thread             register/thread              51
+    Shared Memory Configuration Size           Kbyte           65.54
+    Driver Shared Memory Per Block        byte/block               0
+    Dynamic Shared Memory Per Block      Kbyte/block           65.15
+    Static Shared Memory Per Block        byte/block               0
+    # SMs                                         SM              14
+    Stack Size                                                  1024
+    Threads                                   thread          562432
+    # TPCs                                                         7
+    Enabled TPC IDs                                              all
+    Uses Green Context                                             0
+    Waves Per SM                                              156.93
+    -------------------------------- --------------- ---------------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Block Limit SM                        block           16
+    Block Limit Registers                 block            4
+    Block Limit Shared Mem                block            1
+    Block Limit Warps                     block            4
+    Theoretical Active Warps per SM        warp            8
+    Theoretical Occupancy                     %           25
+    Achieved Occupancy                        %        24.99
+    Achieved Active Warps Per SM           warp         8.00
+    ------------------------------- ----------- ------------
+
+    OPT   Est. Speedup: 66.95%                                                                                          
+          The 2.00 theoretical warps per scheduler this kernel can issue according to its occupancy are below the       
+          hardware maximum of 8. This kernel's theoretical occupancy (25.0%) is limited by the required amount of       
+          shared memory.                                                                                                
+

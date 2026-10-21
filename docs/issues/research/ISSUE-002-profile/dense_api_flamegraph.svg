@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="332" font-family="DejaVu Sans, Arial, sans-serif">
+<rect width="1400" height="332" fill="#fcfcfc"/>
+<text x="150" y="28" font-size="20" font-weight="bold">cuFINUFFT method 3 — 3D type 1 FP32 spread-only: dense case</text>
+<text x="150" y="49" font-size="13" fill="#444">T1000, ns=6, 64^3 fine grid, M=1,000,000 uniform points, gpu_spreadinterponly=1</text>
+<text x="150" y="66" font-size="11" fill="#666">one representative iteration (median of 8); x-axis: elapsed time within the iteration. CPU NVTX ranges (top), GPU activities (bottom).</text>
+<line x1="150.0" y1="74" x2="150.0" y2="258" stroke="#e6e6e6" stroke-width="1"/>
+<text x="150.0" y="274" font-size="10" fill="#555" text-anchor="middle">0.000 ms</text>
+<line x1="455.0" y1="74" x2="455.0" y2="258" stroke="#e6e6e6" stroke-width="1"/>
+<text x="455.0" y="274" font-size="10" fill="#555" text-anchor="middle">4.928 ms</text>
+<line x1="760.0" y1="74" x2="760.0" y2="258" stroke="#e6e6e6" stroke-width="1"/>
+<text x="760.0" y="274" font-size="10" fill="#555" text-anchor="middle">9.856 ms</text>
+<line x1="1065.0" y1="74" x2="1065.0" y2="258" stroke="#e6e6e6" stroke-width="1"/>
+<text x="1065.0" y="274" font-size="10" fill="#555" text-anchor="middle">14.784 ms</text>
+<line x1="1370.0" y1="74" x2="1370.0" y2="258" stroke="#e6e6e6" stroke-width="1"/>
+<text x="1370.0" y="274" font-size="10" fill="#555" text-anchor="middle">19.712 ms</text>
+<text x="12" y="94" font-size="12" font-weight="bold" fill="#333">CPU / NVTX</text>
+<rect x="150.0" y="78.0" width="1220.0" height="22" fill="#bab0ac" stroke="#ffffff" stroke-width="0.7"><title>:iteration — 19.712 ms</title></rect>
+<text x="153.0" y="93.0" font-size="10" fill="#111">:iteration</text>
+<rect x="150.0" y="103.0" width="4.2" height="22" fill="#4e79a7" stroke="#ffffff" stroke-width="0.7"><title>:makeplan — 0.068 ms</title></rect>
+<rect x="150.5" y="128.0" width="1.0" height="22" fill="#b3cde3" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::two_system_copy — 0.001 ms</title></rect>
+<rect x="150.5" y="153.0" width="1.0" height="22" fill="#b3cde3" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::copy — 0.000 ms</title></rect>
+<rect x="150.5" y="128.0" width="1.1" height="22" fill="#9ecae1" stroke="#ffffff" stroke-width="0.7"><title>CCCL:uninitialized_fill_n — 0.018 ms</title></rect>
+<rect x="150.5" y="153.0" width="1.0" height="22" fill="#9ecae1" stroke="#ffffff" stroke-width="0.7"><title>CCCL:cub::DeviceFor::Bulk — 0.012 ms</title></rect>
+<rect x="151.9" y="128.0" width="1.0" height="22" fill="#b3cde3" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::two_system_copy — 0.001 ms</title></rect>
+<rect x="151.9" y="153.0" width="1.0" height="22" fill="#b3cde3" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::copy — 0.000 ms</title></rect>
+<rect x="151.9" y="128.0" width="1.0" height="22" fill="#9ecae1" stroke="#ffffff" stroke-width="0.7"><title>CCCL:uninitialized_fill_n — 0.010 ms</title></rect>
+<rect x="151.9" y="153.0" width="1.0" height="22" fill="#9ecae1" stroke="#ffffff" stroke-width="0.7"><title>CCCL:cub::DeviceFor::Bulk — 0.006 ms</title></rect>
+<rect x="152.7" y="128.0" width="1.0" height="22" fill="#b3cde3" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::two_system_copy — 0.001 ms</title></rect>
+<rect x="152.7" y="153.0" width="1.0" height="22" fill="#b3cde3" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::copy — 0.000 ms</title></rect>
+<rect x="152.8" y="128.0" width="1.0" height="22" fill="#9ecae1" stroke="#ffffff" stroke-width="0.7"><title>CCCL:uninitialized_fill_n — 0.009 ms</title></rect>
+<rect x="152.8" y="153.0" width="1.0" height="22" fill="#9ecae1" stroke="#ffffff" stroke-width="0.7"><title>CCCL:cub::DeviceFor::Bulk — 0.005 ms</title></rect>
+<rect x="153.5" y="128.0" width="1.0" height="22" fill="#b3cde3" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::two_system_copy — 0.000 ms</title></rect>
+<rect x="153.5" y="153.0" width="1.0" height="22" fill="#b3cde3" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::copy — 0.000 ms</title></rect>
+<rect x="153.5" y="128.0" width="1.0" height="22" fill="#9ecae1" stroke="#ffffff" stroke-width="0.7"><title>CCCL:uninitialized_fill_n — 0.010 ms</title></rect>
+<rect x="153.6" y="153.0" width="1.0" height="22" fill="#9ecae1" stroke="#ffffff" stroke-width="0.7"><title>CCCL:cub::DeviceFor::Bulk — 0.005 ms</title></rect>
+<rect x="154.4" y="103.0" width="59.8" height="22" fill="#f28e2b" stroke="#ffffff" stroke-width="0.7"><title>:setpts — 0.966 ms</title></rect>
+<text x="157.4" y="118.0" font-size="10" fill="#111">:setpts</text>
+<rect x="154.6" y="128.0" width="1.0" height="22" fill="#b3cde3" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::two_system_copy — 0.001 ms</title></rect>
+<rect x="154.7" y="153.0" width="1.0" height="22" fill="#b3cde3" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::copy — 0.000 ms</title></rect>
+<rect x="154.7" y="128.0" width="2.9" height="22" fill="#9ecae1" stroke="#ffffff" stroke-width="0.7"><title>CCCL:uninitialized_fill_n — 0.046 ms</title></rect>
+<rect x="154.7" y="153.0" width="1.0" height="22" fill="#9ecae1" stroke="#ffffff" stroke-width="0.7"><title>CCCL:cub::DeviceFor::Bulk — 0.006 ms</title></rect>
+<rect x="157.7" y="128.0" width="1.0" height="22" fill="#b3cde3" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::two_system_copy — 0.000 ms</title></rect>
+<rect x="157.7" y="153.0" width="1.0" height="22" fill="#b3cde3" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::copy — 0.000 ms</title></rect>
+<rect x="157.8" y="128.0" width="3.0" height="22" fill="#9ecae1" stroke="#ffffff" stroke-width="0.7"><title>CCCL:uninitialized_fill_n — 0.049 ms</title></rect>
+<rect x="157.8" y="153.0" width="1.0" height="22" fill="#9ecae1" stroke="#ffffff" stroke-width="0.7"><title>CCCL:cub::DeviceFor::Bulk — 0.005 ms</title></rect>
+<rect x="161.3" y="128.0" width="24.9" height="22" fill="#a1d99b" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::exclusive_scan — 0.403 ms</title></rect>
+<rect x="187.0" y="128.0" width="24.1" height="22" fill="#a1d99b" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::inclusive_scan — 0.390 ms</title></rect>
+<rect x="212.8" y="128.0" width="1.0" height="22" fill="#b3cde3" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::two_system_copy — 0.001 ms</title></rect>
+<rect x="212.8" y="153.0" width="1.0" height="22" fill="#b3cde3" stroke="#ffffff" stroke-width="0.7"><title>CCCL:thrust::copy — 0.000 ms</title></rect>
+<rect x="212.9" y="128.0" width="1.0" height="22" fill="#9ecae1" stroke="#ffffff" stroke-width="0.7"><title>CCCL:uninitialized_fill_n — 0.013 ms</title></rect>
+<rect x="212.9" y="153.0" width="1.0" height="22" fill="#9ecae1" stroke="#ffffff" stroke-width="0.7"><title>CCCL:cub::DeviceFor::Bulk — 0.009 ms</title></rect>
+<rect x="214.2" y="103.0" width="1155.8" height="22" fill="#59a14f" stroke="#ffffff" stroke-width="0.7"><title>:execute — 18.674 ms</title></rect>
+<text x="217.2" y="118.0" font-size="10" fill="#111">:execute</text>
+<text x="12" y="222" font-size="12" font-weight="bold" fill="#333">GPU</text>
+<rect x="150" y="210" width="1220" height="42" fill="#f4f4f4" stroke="#ddd"/>
+<rect x="151.4" y="215" width="1.5" height="32" fill="#9ecae1" stroke="#ffffff" stroke-width="0.5"><title>void cub::_V_300402_SM_750::detail::for_each::static_kernel&lt;cub::_V_300402_SM_750::detail::for_each::policy_selector, unsigned long, thrust::_V_300402_SM_750::cuda_cub::__uninitialized_fill::functor&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;, int&gt;&gt;(T2, T3) — 0.002 ms</title></rect>
+<rect x="152.4" y="215" width="1.5" height="32" fill="#9ecae1" stroke="#ffffff" stroke-width="0.5"><title>void cub::_V_300402_SM_750::detail::for_each::static_kernel&lt;cub::_V_300402_SM_750::detail::for_each::policy_selector, unsigned long, thrust::_V_300402_SM_750::cuda_cub::__uninitialized_fill::functor&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;, int&gt;&gt;(T2, T3) — 0.002 ms</title></rect>
+<rect x="153.2" y="215" width="1.5" height="32" fill="#9ecae1" stroke="#ffffff" stroke-width="0.5"><title>void cub::_V_300402_SM_750::detail::for_each::static_kernel&lt;cub::_V_300402_SM_750::detail::for_each::policy_selector, unsigned long, thrust::_V_300402_SM_750::cuda_cub::__uninitialized_fill::functor&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;, int&gt;&gt;(T2, T3) — 0.001 ms</title></rect>
+<rect x="154.0" y="215" width="1.5" height="32" fill="#9ecae1" stroke="#ffffff" stroke-width="0.5"><title>void cub::_V_300402_SM_750::detail::for_each::static_kernel&lt;cub::_V_300402_SM_750::detail::for_each::policy_selector, unsigned long, thrust::_V_300402_SM_750::cuda_cub::__uninitialized_fill::functor&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;, int&gt;&gt;(T2, T3) — 0.001 ms</title></rect>
+<rect x="155.1" y="215" width="2.3" height="32" fill="#9ecae1" stroke="#ffffff" stroke-width="0.5"><title>void cub::_V_300402_SM_750::detail::for_each::static_kernel&lt;cub::_V_300402_SM_750::detail::for_each::policy_selector, unsigned long, thrust::_V_300402_SM_750::cuda_cub::__uninitialized_fill::functor&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;, int&gt;&gt;(T2, T3) — 0.038 ms</title></rect>
+<rect x="158.2" y="215" width="2.5" height="32" fill="#9ecae1" stroke="#ffffff" stroke-width="0.5"><title>void cub::_V_300402_SM_750::detail::for_each::static_kernel&lt;cub::_V_300402_SM_750::detail::for_each::policy_selector, unsigned long, thrust::_V_300402_SM_750::cuda_cub::__uninitialized_fill::functor&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;, int&gt;&gt;(T2, T3) — 0.040 ms</title></rect>
+<rect x="161.4" y="215" width="21.1" height="32" fill="#f2a65a" stroke="#ffffff" stroke-width="0.5"><title>void cufinufft::spreadinterp::calc_bin_size_noghost&lt;float, (int)3&gt;(int, cuda::std::__4::array&lt;int, (unsigned long)3&gt;, cuda::std::__4::array&lt;T1, (unsigned long)3&gt;, cuda::std::__4::array&lt;int, (unsigned long)3&gt;, int *, cuda::std::__4::array&lt;const T1 *, (unsigned long)3&gt;, int *) — 0.341 ms</title></rect>
+<rect x="182.6" y="215" width="1.5" height="32" fill="#a1d99b" stroke="#ffffff" stroke-width="0.5"><title>void cub::_V_300402_SM_750::detail::scan::DeviceScanInitKernel&lt;cub::_V_300402_SM_750::detail::scan::policy_selector_from_types&lt;thrust::_V_300402_SM_750::detail::normal_iterator&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;&gt;, thrust::_V_300402_SM_750::detail::normal_iterator&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;&gt;, int, unsigned int, cuda::std::__4::plus&lt;void&gt;&gt;, int *, int *, cub::_V_300402_SM_750::ScanTileState&lt;int, (bool)1&gt;, int&gt;(cub::_V_300402_SM_750::detail::scan::tile_state_kernel_arg_t&lt;T4, T5&gt;, int) — 0.002 ms</title></rect>
+<rect x="182.8" y="215" width="1.5" height="32" fill="#a1d99b" stroke="#ffffff" stroke-width="0.5"><title>void cub::_V_300402_SM_750::detail::scan::DeviceScanKernel&lt;cub::_V_300402_SM_750::detail::scan::policy_selector_from_types&lt;thrust::_V_300402_SM_750::detail::normal_iterator&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;&gt;, thrust::_V_300402_SM_750::detail::normal_iterator&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;&gt;, int, unsigned int, cuda::std::__4::plus&lt;void&gt;&gt;, int *, int *, cub::_V_300402_SM_750::ScanTileState&lt;int, (bool)1&gt;, cuda::std::__4::plus&lt;void&gt;, cub::_V_300402_SM_750::detail::InputValue&lt;int, int *&gt;, unsigned int, int, (bool)0, int&gt;(T2, T3, cub::_V_300402_SM_750::detail::scan::tile_state_kernel_arg_t&lt;T4, T8&gt;, int, T5, T6, T7, int) — 0.003 ms</title></rect>
+<rect x="186.8" y="215" width="18.8" height="32" fill="#f6c177" stroke="#ffffff" stroke-width="0.5"><title>void cufinufft::spreadinterp::calc_inverse_of_global_sort_idx&lt;float, (int)3&gt;(int, cuda::std::__4::array&lt;T1, (unsigned long)3&gt;, cuda::std::__4::array&lt;int, (unsigned long)3&gt;, const int *, const int *, cuda::std::__4::array&lt;const T1 *, (unsigned long)3&gt;, int *, cuda::std::__4::array&lt;int, (unsigned long)3&gt;) — 0.304 ms</title></rect>
+<rect x="205.7" y="215" width="1.9" height="32" fill="#c9a0dc" stroke="#ffffff" stroke-width="0.5"><title>cufinufft::spreadinterp::calc_subprob(const int *, int *, int, int) — 0.030 ms</title></rect>
+<rect x="207.6" y="215" width="1.5" height="32" fill="#a1d99b" stroke="#ffffff" stroke-width="0.5"><title>void cub::_V_300402_SM_750::detail::scan::DeviceScanInitKernel&lt;cub::_V_300402_SM_750::detail::scan::policy_selector_from_types&lt;thrust::_V_300402_SM_750::detail::normal_iterator&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;&gt;, thrust::_V_300402_SM_750::detail::normal_iterator&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;&gt;, int, unsigned int, cuda::std::__4::plus&lt;void&gt;&gt;, int *, int *, cub::_V_300402_SM_750::ScanTileState&lt;int, (bool)1&gt;, int&gt;(cub::_V_300402_SM_750::detail::scan::tile_state_kernel_arg_t&lt;T4, T5&gt;, int) — 0.002 ms</title></rect>
+<rect x="207.7" y="215" width="1.5" height="32" fill="#a1d99b" stroke="#ffffff" stroke-width="0.5"><title>void cub::_V_300402_SM_750::detail::scan::DeviceScanKernel&lt;cub::_V_300402_SM_750::detail::scan::policy_selector_from_types&lt;thrust::_V_300402_SM_750::detail::normal_iterator&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;&gt;, thrust::_V_300402_SM_750::detail::normal_iterator&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;&gt;, int, unsigned int, cuda::std::__4::plus&lt;void&gt;&gt;, int *, int *, cub::_V_300402_SM_750::ScanTileState&lt;int, (bool)1&gt;, cuda::std::__4::plus&lt;void&gt;, cub::_V_300402_SM_750::NullType, unsigned int, int, (bool)0, cub::_V_300402_SM_750::NullType&gt;(T2, T3, cub::_V_300402_SM_750::detail::scan::tile_state_kernel_arg_t&lt;T4, T8&gt;, int, T5, T6, T7, int) — 0.003 ms</title></rect>
+<rect x="213.5" y="215" width="1.5" height="32" fill="#9ecae1" stroke="#ffffff" stroke-width="0.5"><title>void cub::_V_300402_SM_750::detail::for_each::static_kernel&lt;cub::_V_300402_SM_750::detail::for_each::policy_selector, unsigned long, thrust::_V_300402_SM_750::cuda_cub::__uninitialized_fill::functor&lt;thrust::_V_300402_SM_750::device_ptr&lt;int&gt;, int&gt;&gt;(T2, T3) — 0.002 ms</title></rect>
+<rect x="214.0" y="215" width="1.5" height="32" fill="#c9a0dc" stroke="#ffffff" stroke-width="0.5"><title>cufinufft::spreadinterp::map_b_into_subprob(int *, const int *, const int *, int) — 0.003 ms</title></rect>
+<rect x="215.9" y="215" width="1153.8" height="32" fill="#e45756" stroke="#ffffff" stroke-width="0.5"><title>void cufinufft::spreadinterp::spread_output_driven&lt;float, (int)1, (int)3, (int)6&gt;(cufinufft_gpu_data&lt;T1&gt;, const std::conditional&lt;std::is_same&lt;T1, float&gt;::value, float2, std::conditional&lt;std::is_same&lt;T1, double&gt;::value, double2, void&gt;::type&gt;::type *, std::conditional&lt;std::is_same&lt;T1, float&gt;::value, float2, std::conditional&lt;std::is_same&lt;T1, double&gt;::value, double2, void&gt;::type&gt;::type *, int) — 18.642 ms</title></rect>
+<text x="218.9" y="236" font-size="10" fill="#111">spread_output_driven</text>
+<rect x="161.3" y="215" width="1.5" height="32" fill="#bdbdbd" stroke="#ffffff" stroke-width="0.5"><title>[CUDA memset] 1372 B — 0.002 ms</title></rect>
+<rect x="211.7" y="215" width="1.5" height="32" fill="#bdbdbd" stroke="#ffffff" stroke-width="0.5"><title>[CUDA memset] 4 B — 0.000 ms</title></rect>
+<rect x="214.7" y="215" width="1.5" height="32" fill="#bdbdbd" stroke="#ffffff" stroke-width="0.5"><title>[CUDA memset] 2097152 B — 0.018 ms</title></rect>
+<text x="158" y="296" font-size="12" fill="#b23a3a" font-weight="bold">spread_output_driven: 18.642 ms (94.6% of iteration)</text>
+<rect x="150" y="298" width="12" height="12" fill="#bab0ac"/>
+<text x="166" y="308" font-size="10" fill="#444">:iteration</text>
+<rect x="300" y="298" width="12" height="12" fill="#4e79a7"/>
+<text x="316" y="308" font-size="10" fill="#444">:makeplan</text>
+<rect x="450" y="298" width="12" height="12" fill="#f28e2b"/>
+<text x="466" y="308" font-size="10" fill="#444">:setpts</text>
+<rect x="600" y="298" width="12" height="12" fill="#59a14f"/>
+<text x="616" y="308" font-size="10" fill="#444">:execute</text>
+<rect x="750" y="298" width="12" height="12" fill="#9ecae1"/>
+<text x="766" y="308" font-size="10" fill="#444">CCCL / CUB</text>
+<rect x="900" y="298" width="12" height="12" fill="#e45756"/>
+<text x="916" y="308" font-size="10" fill="#444">spread_output_driven</text>
+</svg>

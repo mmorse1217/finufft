@@ -1,0 +1,68 @@
+==WARNING== Note: Running with unmodified GPU clocks. If not controlled otherwise, profiling results may be inconsistent.
+==PROF== Connected to process 74782 (/tmp/bench_spread)
+==PROF== Profiling "void cufinufft::spreadinterp::spread_output_driven<float, (int)1, (int)3, (int)6>(cufinufft_gpu_data<T1>, const std::conditional<std::is_same<T1, float>::value, float2, std::conditional<std::is_same<T1, double>::value, double2, void>::type>::type *, std::conditional<std::is_same<T1, float>::value, float2, std::conditional<std::is_same<T1, double>::value, double2, void>::type>::type *, int)": 0%....50%....100% - 6 passes
+method=3 M=1000000 nf=262144 cluster=0 bin=0 maxsub=0 np=0 setpts=1.050 ms execute=15.974 ms total=17.024 ms  Mpts/s(exec)=62.60
+==PROF== Disconnected from process 74782
+[74782] bench_spread@127.0.0.1
+  void spread_output_driven<float, 1, 3, 6>(cufinufft_gpu_data<T1>, const conditional<is_same<T1, float>::value, float2, conditional<is_same<T1, double>::value, double2, void>::type>::type *, conditional<is_same<T1, float>::value, float2, conditional<is_same<T1, double>::value, double2, void>::type>::type *, int) (1099, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 7.5
+    Warning: Data collection happened without fixed GPU frequencies. Profiling results may be inconsistent.
+    Section: Command line profiler metrics
+    ------------------------------------------------------------------------------ ----------- ------------
+    Metric Name                                                                    Metric Unit Metric Value
+    ------------------------------------------------------------------------------ ----------- ------------
+    smsp__average_warps_issue_stalled_barrier_per_issue_active.max_rate                   inst            1
+    smsp__average_warps_issue_stalled_barrier_per_issue_active.pct                           %       164.15
+    smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio                      inst         1.64
+    smsp__average_warps_issue_stalled_branch_resolving_per_issue_active.max_rate          inst            1
+    smsp__average_warps_issue_stalled_branch_resolving_per_issue_active.pct                  %        28.82
+    smsp__average_warps_issue_stalled_branch_resolving_per_issue_active.ratio             inst         0.29
+    smsp__average_warps_issue_stalled_dispatch_stall_per_issue_active.max_rate            inst            1
+    smsp__average_warps_issue_stalled_dispatch_stall_per_issue_active.pct                    %        17.36
+    smsp__average_warps_issue_stalled_dispatch_stall_per_issue_active.ratio               inst         0.17
+    smsp__average_warps_issue_stalled_drain_per_issue_active.max_rate                     inst            1
+    smsp__average_warps_issue_stalled_drain_per_issue_active.pct                             %         0.15
+    smsp__average_warps_issue_stalled_drain_per_issue_active.ratio                        inst         0.00
+    smsp__average_warps_issue_stalled_imc_miss_per_issue_active.max_rate                  inst            1
+    smsp__average_warps_issue_stalled_imc_miss_per_issue_active.pct                          %         0.03
+    smsp__average_warps_issue_stalled_imc_miss_per_issue_active.ratio                     inst         0.00
+    smsp__average_warps_issue_stalled_lg_throttle_per_issue_active.max_rate               inst            1
+    smsp__average_warps_issue_stalled_lg_throttle_per_issue_active.pct                       %            0
+    smsp__average_warps_issue_stalled_lg_throttle_per_issue_active.ratio                  inst            0
+    smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.max_rate           inst            1
+    smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.pct                   %        26.01
+    smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio              inst         0.26
+    smsp__average_warps_issue_stalled_math_pipe_throttle_per_issue_active.max_rate        inst            1
+    smsp__average_warps_issue_stalled_math_pipe_throttle_per_issue_active.pct                %         6.93
+    smsp__average_warps_issue_stalled_math_pipe_throttle_per_issue_active.ratio           inst         0.07
+    smsp__average_warps_issue_stalled_membar_per_issue_active.max_rate                    inst            1
+    smsp__average_warps_issue_stalled_membar_per_issue_active.pct                            %            0
+    smsp__average_warps_issue_stalled_membar_per_issue_active.ratio                       inst            0
+    smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.max_rate              inst            1
+    smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.pct                      %        32.79
+    smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio                 inst         0.33
+    smsp__average_warps_issue_stalled_misc_per_issue_active.max_rate                      inst            1
+    smsp__average_warps_issue_stalled_misc_per_issue_active.pct                              %            0
+    smsp__average_warps_issue_stalled_misc_per_issue_active.ratio                         inst            0
+    smsp__average_warps_issue_stalled_no_instruction_per_issue_active.max_rate            inst            1
+    smsp__average_warps_issue_stalled_no_instruction_per_issue_active.pct                    %        18.75
+    smsp__average_warps_issue_stalled_no_instruction_per_issue_active.ratio               inst         0.19
+    smsp__average_warps_issue_stalled_not_selected_per_issue_active.max_rate              inst            1
+    smsp__average_warps_issue_stalled_not_selected_per_issue_active.pct                      %        14.52
+    smsp__average_warps_issue_stalled_not_selected_per_issue_active.ratio                 inst         0.15
+    smsp__average_warps_issue_stalled_selected_per_issue_active.max_rate                  inst            1
+    smsp__average_warps_issue_stalled_selected_per_issue_active.pct                          %       100.00
+    smsp__average_warps_issue_stalled_selected_per_issue_active.ratio                     inst         1.00
+    smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.max_rate          inst            1
+    smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.pct                  %       112.48
+    smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio             inst         1.12
+    smsp__average_warps_issue_stalled_sleeping_per_issue_active.max_rate                  inst            1
+    smsp__average_warps_issue_stalled_sleeping_per_issue_active.pct                          %            0
+    smsp__average_warps_issue_stalled_sleeping_per_issue_active.ratio                     inst            0
+    smsp__average_warps_issue_stalled_tex_throttle_per_issue_active.max_rate              inst            1
+    smsp__average_warps_issue_stalled_tex_throttle_per_issue_active.pct                      %            0
+    smsp__average_warps_issue_stalled_tex_throttle_per_issue_active.ratio                 inst            0
+    smsp__average_warps_issue_stalled_wait_per_issue_active.max_rate                      inst            1
+    smsp__average_warps_issue_stalled_wait_per_issue_active.pct                              %       189.64
+    smsp__average_warps_issue_stalled_wait_per_issue_active.ratio                         inst         1.90
+    ------------------------------------------------------------------------------ ----------- ------------
+
