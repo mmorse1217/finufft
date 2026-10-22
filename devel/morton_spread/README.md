@@ -25,8 +25,12 @@ success threshold of
   16 accumulators in registers. Each cell is stored exactly once, non-atomically.
 - Points are counting-sorted by Cartesian query bin `qb` into a dense `bin -> start` table
   (`kernel_compute_qbin`, `kernel_hist`, `kernel_scatter`: the Cartesian preprocessing).
+- The warp walks its bin cube as **contiguous x-runs**: bins along x are consecutive in the
+  sorted point table, so a run is one contiguous point range and is batched in 16s whatever
+  the query-bin size (this is what makes `qb=1`, reread 5.36, usable).
 - Per 16-point batch: one lane per point issues the coalesced `x,y,z,strength` loads into
-  shared memory; 18 lanes evaluate one Horner coefficient each (the nine polynomial
+  shared memory (double-buffered: the next batch's loads are issued before the current batch
+  is scanned); 18 lanes evaluate one Horner coefficient each (the nine polynomial
   coefficients for a lane's index are preloaded into registers once per kernel); the scan
   (`scan_point`) runs two points per iteration for ILP, tests the support branchlessly and
   accumulates the 16 owned cells.
@@ -118,20 +122,20 @@ Widths are PC-sample shares rescaled to the measured kernel time; stall reasons 
 args, not frames. The complete captures (v1, v3, v5, v6, v7, v8) are under
 `profile-artifacts/expA-output-owned/`; v8 is current.
 
-## Verdict (v8)
+## Verdict (current: v9 = v8 + double-buffered staging + contiguous x-run batching)
 
-Correct (`relL2` 5.5e-7 uniform, 7.1e-7 clustered, 6.8e-8 sparse). Warm event timing,
-`qb=4`:
+Correct (`relL2` 5.5e-7 uniform, 7e-7 clustered, 7e-8 sparse). Warm event timing, best
+query-bin size per workload:
 
 | case | method 3 | prototype | ratio |
 |---|---:|---:|---:|
-| uniform `1e6` `64^3` | 15.95 ms | 21.68 ms | 1.36x slower |
-| clustered `1e6` `64^3` | 15.90 ms | 26.35 ms (nsplit=8) | 1.66x slower |
-| sparse `1e5` `128^3` | 2.82 ms | 2.53 ms | **1.11x faster** |
+| uniform `1e6` `64^3` (qb=1, reread 5.36) | 15.95 ms | 16.78 ms | 1.05x slower |
+| clustered `1e6` `64^3` (qb=4, nsplit=8) | 15.90 ms | 26.00 ms | 1.63x slower |
+| sparse `1e5` `128^3` (qb=4) | 2.82 ms | 2.08 ms | **1.36x faster** |
 
-It still misses the >=20%-faster gate on the two mandatory `N=1e6` cases. The clustered
-regression was 4.5x before the split; the remaining uniform gap is the per-point scan and
-staging work (`scan_point` 31% and `stage_coeff` 28% of PC samples) at 21/32 active threads
-per warp. The trajectory and the profiler evidence are in
-[`profile-artifacts/expA-output-owned/README.md`](../../profile-artifacts/expA-output-owned/README.md)
+The uniform spread is now at parity; the remaining blocker for the total-time gate is the
+Cartesian counting-sort preprocessing (11.4 ms at `qb=1` over 262k bins, 5.6 ms at `qb=4`).
+The clustered case is still 1.63x: the split fixed the scheduler starvation (active
+warps/scheduler 1.62 -> 4.26) but not the per-point work. Full trajectory and profiler
+evidence: [`profile-artifacts/expA-output-owned/README.md`](../../profile-artifacts/expA-output-owned/README.md)
 and the issue research note.

@@ -190,7 +190,7 @@ __device__ __constant__ float KER6[9][6] = {
      -7.0930078325137639E-08, 7.2147850125572373E-07, -1.5875417996328233E-06}};
 
 static constexpr int BATCH = 16;
-static constexpr int STAGE = 28;  // 3 coord/support + 2 strength + 18 kernel + pad
+static constexpr int STAGE = 24;  // 18 kernel + 3 coord/support + 2 strength + pad
 
 // Raw pass: lanes 0..cnt-1 issue all the global loads for the batch at once, so
 // the warp waits on one round of coalesced loads instead of ~cnt serialized ones.
@@ -204,12 +204,12 @@ __device__ __forceinline__ void stage_raw(int q0, int cnt, int lane,
   if (lane < cnt) {
     const int q      = q0 + lane;
     float *const row = buf + lane * STAGE;
-    row[0]           = __ldg(x + q);
-    row[1]           = __ldg(y + q);
-    row[2]           = __ldg(z + q);
+    row[18]          = __ldg(x + q);
+    row[19]          = __ldg(y + q);
+    row[20]          = __ldg(z + q);
     const float2 cp  = __ldg(cstr + q);
-    row[27]          = cp.x;   // strength real: arrives with the float4 at +24
-    row[3]           = cp.y;   // strength imag
+    row[21]          = cp.x;
+    row[22]          = cp.y;
   }
 }
 
@@ -224,14 +224,14 @@ __device__ __forceinline__ void stage_coeff(float *__restrict__ row, int lane,
   if (lane < 18) {
     const int d   = lane / 6;
     const int nfd = (d == 0) ? nf1 : ((d == 1) ? nf2 : nf3);
-    const float r    = fold_rescale(row[d], nfd);
+    const float r    = fold_rescale(row[18 + d], nfd);
     const float sval = (float)((int)ceilf(r - (float)(NS / 2)));
     const float zz   = __fmaf_rn(2.f, sval - r, (float)(NS - 1));
-    row[24 + d] = sval;
+    row[18 + d] = sval;
     float v     = coeff[8];
 #pragma unroll
     for (int t = 7; t >= 0; t--) v = __fmaf_rn(zz, v, coeff[t]);
-    row[6 + lane] = v;
+    row[lane] = v;
   }
 }
 
@@ -259,19 +259,20 @@ __device__ __forceinline__ void dim_support(int s, int nfd, int g0, int gs, int 
 __device__ __forceinline__ void scan_point(const float *__restrict__ row, int nf1, int nf2,
                                            int nf3, int gx0, int gy0, int gz0,
                                            float2 (&acc)[16]) {
-  const float4 sv = *reinterpret_cast<const float4 *>(row + 24);
-  const int sx = (int)sv.x, sy = (int)sv.y, sz = (int)sv.z;
-  const float cx = sv.w, cy = row[3];
+  const float2 s01 = *reinterpret_cast<const float2 *>(row + 18);  // s x,y
+  const float2 sc  = *reinterpret_cast<const float2 *>(row + 20);  // s z, strength re
+  const int sx = (int)s01.x, sy = (int)s01.y, sz = (int)sc.x;
+  const float cx = sc.y, cy = row[22];
   int nx, jx, lx, ny, jy, ly, nz, jz, lz;
   dim_support(sx, nf1, gx0, GSX, nx, jx, lx);
   dim_support(sy, nf2, gy0, GSY, ny, jy, ly);
   dim_support(sz, nf3, gz0, GSZ, nz, jz, lz);
   if (!(nx && ny && nz)) return;
-  const float kx0 = row[6 + jx], kx1 = (nx >= 2) ? row[7 + jx] : 0.f;
-  const float ky0 = row[12 + jy], ky1 = (ny >= 2) ? row[13 + jy] : 0.f;
-  const float kz0 = row[18 + jz], kz1 = (nz >= 2) ? row[19 + jz] : 0.f;
-  const float kz2 = (nz >= 3) ? row[20 + jz] : 0.f;
-  const float kz3 = (nz >= 4) ? row[21 + jz] : 0.f;
+  const float kx0 = row[jx], kx1 = (nx >= 2) ? row[jx + 1] : 0.f;
+  const float ky0 = row[6 + jy], ky1 = (ny >= 2) ? row[7 + jy] : 0.f;
+  const float kz0 = row[12 + jz], kz1 = (nz >= 2) ? row[13 + jz] : 0.f;
+  const float kz2 = (nz >= 3) ? row[14 + jz] : 0.f;
+  const float kz3 = (nz >= 4) ? row[15 + jz] : 0.f;
   const float vx[2] = {(lx == 0) ? kx0 : 0.f, (lx == 0) ? kx1 : kx0};
   const float vy[2] = {(ly == 0) ? ky0 : 0.f, (ly == 0) ? ky1 : ky0};
   const float vz[4] = {(lz == 0) ? kz0 : 0.f,
@@ -301,7 +302,7 @@ __global__ void spread_cartesian_owned(
     const cuFloatComplex *__restrict__ c, const int *__restrict__ binstart,
     cuFloatComplex *__restrict__ fw, int nf1, int nf2,
     int nf3, int nqx, int nqy, int nqz, int qb, int tiles_x, int tiles_y, int nsplit) {
-  __shared__ __align__(16) float stage[NWARPS][BATCH][STAGE];
+  __shared__ __align__(16) float stage[NWARPS][2][BATCH][STAGE];
 
   const int warp  = threadIdx.x >> 5;
   const int lane  = threadIdx.x & 31;
@@ -335,35 +336,58 @@ __global__ void spread_cartesian_owned(
   const int bx0 = floordiv(X0 - HALO, qb), bx1 = (X0 + 7 + HALO) / qb;
   const int by0 = floordiv(Y0 - HALO, qb), by1 = (Y0 + 7 + HALO) / qb;
   const int bz0 = floordiv(Z0 - HALO, qb), bz1 = (Z0 + 7 + HALO) / qb;
-  float *const buf = &stage[warp][0][0];
   const float2 *const cf = reinterpret_cast<const float2 *>(c);
 
-  for (int ix = bx0; ix <= bx1; ix++) {
-    int wx = ix % nqx;
-    wx += (wx >> 31) & nqx;
-    for (int iy = by0; iy <= by1; iy++) {
-      int wy = iy % nqy;
-      wy += (wy >> 31) & nqy;
-      for (int iz = bz0; iz <= bz1; iz++) {
-        int wz = iz % nqz;
-        wz += (wz >> 31) & nqz;
-        const int bin   = wx + nqx * (wy + nqy * wz);
-        const int start = binstart[bin], end = binstart[bin + 1];
-        // Round-robin the batches across splits, so every hot bin is shared evenly.
-        for (int q0 = start + split * BATCH; q0 < end; q0 += nsplit * BATCH) {
-          const int cnt = min(BATCH, end - q0);
-          stage_raw(q0, cnt, lane, x, y, z, cf, buf);
+  // Walk the warp's bin cube as contiguous x-runs. Bins along x are consecutive in the
+  // sorted point table, so a whole x-run is one contiguous point range and can be batched
+  // in 16s regardless of the query-bin size (this is what makes qb=1, reread 5.36, usable).
+  const int nxbin = min(bx1 - bx0 + 1, nqx);
+  int wlo         = bx0 % nqx;
+  wlo += (wlo >> 31) & nqx;
+  const int wend = wlo + nxbin - 1;
+  for (int iy = by0; iy <= by1; iy++) {
+    int wy = iy % nqy;
+    wy += (wy >> 31) & nqy;
+    for (int iz = bz0; iz <= bz1; iz++) {
+      int wz = iz % nqz;
+      wz += (wz >> 31) & nqz;
+      const int base = nqx * (wy + nqy * wz);
+      for (int seg = 0; seg < 2; ++seg) {
+        // The x-run can wrap around the periodic boundary: two contiguous segments.
+        const int x0 = (seg == 0) ? wlo : 0;
+        const int x1 = (seg == 0) ? min(wend, nqx - 1) : (wend - nqx);
+        if (x1 < x0) continue;
+        const int qlo  = binstart[base + x0];
+        const int qhi  = binstart[base + x1 + 1];
+        const int step = nsplit * BATCH;
+        int q0         = qlo + split * BATCH;
+        if (q0 < qhi) {
+          int cnt    = min(BATCH, qhi - q0);
+          float *cur = &stage[warp][0][0][0];
+          float *nxt = &stage[warp][1][0][0];
+          stage_raw(q0, cnt, lane, x, y, z, cf, cur);
           __syncwarp();
-          for (int b = 0; b < cnt; b++)
-            stage_coeff(buf + b * STAGE, lane, nf1, nf2, nf3, coeff);
-          __syncwarp();
-          int b = 0;
-          for (; b + 1 < cnt; b += 2) {  // two points per iteration: overlap the loads
-            scan_point(buf + b * STAGE, nf1, nf2, nf3, gx0, gy0, gz0, acc);
-            scan_point(buf + (b + 1) * STAGE, nf1, nf2, nf3, gx0, gy0, gz0, acc);
+          for (;;) {
+            for (int b = 0; b < cnt; b++)
+              stage_coeff(cur + b * STAGE, lane, nf1, nf2, nf3, coeff);
+            __syncwarp();
+            const int qn   = q0 + step;
+            const int cntn = (qn < qhi) ? min(BATCH, qhi - qn) : 0;
+            if (cntn) stage_raw(qn, cntn, lane, x, y, z, cf, nxt);
+            int b = 0;
+            for (; b + 1 < cnt; b += 2) {
+              scan_point(cur + b * STAGE, nf1, nf2, nf3, gx0, gy0, gz0, acc);
+              scan_point(cur + (b + 1) * STAGE, nf1, nf2, nf3, gx0, gy0, gz0, acc);
+            }
+            if (b < cnt) scan_point(cur + b * STAGE, nf1, nf2, nf3, gx0, gy0, gz0, acc);
+            __syncwarp();
+            if (!cntn) break;
+            q0  = qn;
+            cnt = cntn;
+            float *tmp = cur;
+            cur        = nxt;
+            nxt        = tmp;
           }
-          if (b < cnt) scan_point(buf + b * STAGE, nf1, nf2, nf3, gx0, gy0, gz0, acc);
-          __syncwarp();
         }
       }
     }
