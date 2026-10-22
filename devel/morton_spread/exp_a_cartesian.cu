@@ -19,6 +19,7 @@
 
 #include <cuda_runtime.h>
 #include <cufinufft.h>
+#include <cub/device/device_radix_sort.cuh>
 #include <cufinufft/spreadinterp.hpp>
 #include <nvtx3/nvToolsExt.h>
 
@@ -94,6 +95,35 @@ __global__ void kernel_compute_qbin(const float *__restrict__ x, const float *__
 __global__ void kernel_hist(const int *__restrict__ qbin, int M, int *__restrict__ counts) {
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < M; i += blockDim.x * gridDim.x)
     atomicAdd(&counts[qbin[i]], 1);
+}
+
+// Radix-sort preprocessing: fill 0..M-1, gather the sorted payload, mark bin starts.
+__global__ void kernel_fill_idx(int *__restrict__ idx, int M) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < M; i += blockDim.x * gridDim.x)
+    idx[i] = i;
+}
+
+__global__ void kernel_gather_sorted(const int *__restrict__ perm,
+                                     const float *__restrict__ x, const float *__restrict__ y,
+                                     const float *__restrict__ z,
+                                     const cuFloatComplex *__restrict__ c,
+                                     float *__restrict__ sx, float *__restrict__ sy,
+                                     float *__restrict__ sz, cuFloatComplex *__restrict__ sc,
+                                     int M) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < M; i += blockDim.x * gridDim.x) {
+    const int p = perm[i];
+    sx[i]       = x[p];
+    sy[i]       = y[p];
+    sz[i]       = z[p];
+    sc[i]       = c[p];
+  }
+}
+
+// mark start[b] = first sorted position of bin b; empty bins keep the -1 sentinel.
+__global__ void kernel_mark_starts(const unsigned int *__restrict__ keys, int M,
+                                   int *__restrict__ start) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < M; i += blockDim.x * gridDim.x)
+    if (i == 0 || keys[i] != keys[i - 1]) start[keys[i]] = i;
 }
 
 __global__ void kernel_scatter(const int *__restrict__ qbin, int M,
@@ -495,6 +525,7 @@ int main(int argc, char **argv) {
   const int cluster = argc > 5 ? std::atoi(argv[5]) : 0;
   const int qb      = argc > 6 ? std::atoi(argv[6]) : 2;
   const int nrun    = argc > 7 ? std::atoi(argv[7]) : 5;
+  const int prep    = argc > 8 ? std::atoi(argv[8]) : 1;  // 0 = counting sort, 1 = radix sort
 
   std::mt19937 rng(42);
   std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
@@ -540,9 +571,16 @@ int main(int argc, char **argv) {
   // ---- preprocessing: Cartesian query bins (timed as a whole) ----
   const int nqx = (N1 + qb - 1) / qb, nqy = (N2 + qb - 1) / qb, nqz = (N3 + qb - 1) / qb;
   const int nbins = nqx * nqy * nqz;
+  int end_bit = 1;
+  while ((1 << end_bit) < nbins) end_bit++;
   int *d_qbin, *d_counts, *d_cursor, *d_binstart, *d_sorted;
   float *d_sx, *d_sy, *d_sz;
   cuFloatComplex *d_sc;
+  unsigned int *d_keys_out = nullptr;
+  int *d_perm = nullptr, *d_starts = nullptr;
+  void *d_sort_tmp = nullptr;
+  size_t sort_tmp_bytes = 0;
+
   CU(cudaMalloc(&d_qbin, M * sizeof(int)));
   CU(cudaMalloc(&d_counts, nbins * sizeof(int)));
   CU(cudaMalloc(&d_cursor, nbins * sizeof(int)));
@@ -552,7 +590,19 @@ int main(int argc, char **argv) {
   CU(cudaMalloc(&d_sy, M * sizeof(float)));
   CU(cudaMalloc(&d_sz, M * sizeof(float)));
   CU(cudaMalloc(&d_sc, M * sizeof(cuFloatComplex)));
+  CU(cudaMalloc(&d_keys_out, M * sizeof(unsigned int)));
+  CU(cudaMalloc(&d_perm, M * sizeof(int)));
+  CU(cudaMalloc(&d_starts, nbins * sizeof(int)));
+  if (prep == 1) {
+    size_t bytes = 0;
+    cub::DeviceRadixSort::SortPairs(nullptr, bytes, (const unsigned int *)d_qbin, d_keys_out,
+                                    (const unsigned int *)d_sorted, (unsigned int *)d_perm, M,
+                                    0, end_bit);
+    sort_tmp_bytes = bytes;
+    CU(cudaMalloc(&d_sort_tmp, sort_tmp_bytes));
+  }
   std::vector<int> hstart(nbins + 1, 0);
+  std::vector<int> hstarts(nbins, 0);
   std::vector<cuFloatComplex> h_ref(nf), h_new(nf);
 
   std::vector<double> pre_ms;
@@ -563,27 +613,50 @@ int main(int argc, char **argv) {
     kernel_compute_qbin<<<(M + 255) / 256, 256>>>(dx, dy, dz, M, N1, N2, N3, qb, nqx, nqy,
                                                   nqz, d_qbin);
     nvtxRangePop();
-    CU(cudaMemset(d_counts, 0, nbins * sizeof(int)));
-    nvtxRangePushA("preprocess_hist");
-    kernel_hist<<<(M + 255) / 256, 256>>>(d_qbin, M, d_counts);
-    nvtxRangePop();
-    nvtxRangePushA("preprocess_scan");
-    std::vector<int> hcount(nbins);
-    CU(cudaMemcpy(hcount.data(), d_counts, nbins * sizeof(int), cudaMemcpyDeviceToHost));
-    int acc = 0;
-    for (int b = 0; b < nbins; b++) {
-      hstart[b] = acc;
-      acc += hcount[b];
+    if (prep == 1) {
+      // CUB radix sort of (bin, point index): no histogram, no per-bin atomics.
+      nvtxRangePushA("preprocess_sort");
+      kernel_fill_idx<<<(M + 255) / 256, 256>>>(d_sorted, M);
+      cub::DeviceRadixSort::SortPairs(d_sort_tmp, sort_tmp_bytes, (const unsigned int *)d_qbin,
+                                      d_keys_out, (const unsigned int *)d_sorted,
+                                      (unsigned int *)d_perm, M, 0, end_bit);
+      kernel_gather_sorted<<<(M + 255) / 256, 256>>>(d_perm, dx, dy, dz, dc, d_sx, d_sy, d_sz,
+                                                     d_sc, M);
+      nvtxRangePop();
+      nvtxRangePushA("preprocess_starts");
+      CU(cudaMemset(d_starts, 0xFF, nbins * sizeof(int)));
+      kernel_mark_starts<<<(M + 255) / 256, 256>>>(d_keys_out, M, d_starts);
+      CU(cudaMemcpy(hstarts.data(), d_starts, nbins * sizeof(int), cudaMemcpyDeviceToHost));
+      hstart[nbins] = M;
+      for (int b = nbins - 1; b >= 0; --b)
+        hstart[b] = (hstarts[b] >= 0 && hstarts[b] < hstart[b + 1]) ? hstarts[b] : hstart[b + 1];
+      CU(cudaMemcpy(d_binstart, hstart.data(), (nbins + 1) * sizeof(int),
+                    cudaMemcpyHostToDevice));
+      nvtxRangePop();
+    } else {
+      // Counting sort: atomic histogram, host scan, atomic per-bin scatter.
+      CU(cudaMemset(d_counts, 0, nbins * sizeof(int)));
+      nvtxRangePushA("preprocess_hist");
+      kernel_hist<<<(M + 255) / 256, 256>>>(d_qbin, M, d_counts);
+      nvtxRangePop();
+      nvtxRangePushA("preprocess_scan");
+      std::vector<int> hcount(nbins);
+      CU(cudaMemcpy(hcount.data(), d_counts, nbins * sizeof(int), cudaMemcpyDeviceToHost));
+      int acc = 0;
+      for (int b = 0; b < nbins; b++) {
+        hstart[b] = acc;
+        acc += hcount[b];
+      }
+      hstart[nbins] = acc;
+      CU(cudaMemcpy(d_binstart, hstart.data(), (nbins + 1) * sizeof(int),
+                    cudaMemcpyHostToDevice));
+      CU(cudaMemset(d_cursor, 0, nbins * sizeof(int)));
+      nvtxRangePop();
+      nvtxRangePushA("preprocess_scatter");
+      kernel_scatter<<<(M + 255) / 256, 256>>>(d_qbin, M, d_cursor, d_binstart, d_sorted, dx,
+                                               dy, dz, dc, d_sx, d_sy, d_sz, d_sc);
+      nvtxRangePop();
     }
-    hstart[nbins] = acc;
-    CU(cudaMemcpy(d_binstart, hstart.data(), (nbins + 1) * sizeof(int),
-                  cudaMemcpyHostToDevice));
-    CU(cudaMemset(d_cursor, 0, nbins * sizeof(int)));  // per-bin write cursor
-    nvtxRangePop();
-    nvtxRangePushA("preprocess_scatter");
-    kernel_scatter<<<(M + 255) / 256, 256>>>(d_qbin, M, d_cursor, d_binstart, d_sorted, dx,
-                                             dy, dz, dc, d_sx, d_sy, d_sz, d_sc);
-    nvtxRangePop();
     CU(cudaGetLastError());
     CU(cudaDeviceSynchronize());
     const auto t1p = std::chrono::steady_clock::now();
@@ -676,8 +749,9 @@ int main(int argc, char **argv) {
               t4.exec_ms, t4.total_ms);
   std::printf("ctx   method=1 setpts=%.3f ms exec=%.3f ms total=%.3f ms\n", t1.setpts_ms,
               t1.exec_ms, t1.total_ms);
-  std::printf("new   qbins=%d^3 bins=%d preprocess=%.3f ms spread=%.3f ms total=%.3f ms nsplit=%d\n",
-              nqx, nbins, preprocess_ms, new_ms_med, preprocess_ms + new_ms_med, nsplit);
+  std::printf("new   qbins=%d^3 bins=%d prep=%s preprocess=%.3f ms spread=%.3f ms total=%.3f ms nsplit=%d\n",
+              nqx, nbins, prep == 0 ? "count" : "radix", preprocess_ms, new_ms_med,
+              preprocess_ms + new_ms_med, nsplit);
   std::printf("new   speedup_vs_m3_spread=%.2fx spread_ratio=%.3f total_ratio=%.3f\n",
               t3.exec_ms / new_ms_med, new_ms_med / t3.exec_ms,
               (preprocess_ms + new_ms_med) / t3.total_ms);

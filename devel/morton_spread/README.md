@@ -23,8 +23,10 @@ success threshold of
 - Tile `16x16x8`, one CUDA threadblock of **128 threads (4 warps)** per tile.
 - Each warp owns an `8x8x8` sub-region; each lane owns a `2x2x4` group (16 cells) and keeps
   16 accumulators in registers. Each cell is stored exactly once, non-atomically.
-- Points are counting-sorted by Cartesian query bin `qb` into a dense `bin -> start` table
-  (`kernel_compute_qbin`, `kernel_hist`, `kernel_scatter`: the Cartesian preprocessing).
+- Points are sorted by Cartesian query bin `qb` into a dense `bin -> start` table. Two
+  preprocessing paths are selectable (`prep` argument): `0` = counting sort (atomic
+  histogram + per-bin atomic scatter), `1` = CUB `DeviceRadixSort::SortPairs` of
+  (bin, point index) followed by a payload gather and a start-mark/scan pass (default).
 - The warp walks its bin cube as **contiguous x-runs**: bins along x are consecutive in the
   sorted point table, so a run is one contiguous point range and is batched in 16s whatever
   the query-bin size (this is what makes `qb=1`, reread 5.36, usable).
@@ -68,12 +70,13 @@ nvcc -O3 -std=c++17 -arch=sm_75 \
   build/gpu/libcufinufft.a build/gpu/src/common/libfinufft_common.a \
   -lcudart -lcufft -lnvToolsExt -lpthread -ldl -lm
 
-build/gpu/exp_a_cartesian <M> <N1> <N2> <N3> <cluster> <qb> <nrun>
+build/gpu/exp_a_cartesian <M> <N1> <N2> <N3> <cluster> <qb> <nrun> [prep]
 ```
 
 Arguments: `cluster=1` uses the 8 tight Gaussian blobs of the baseline harness, `qb` is the
-Cartesian query-bin edge in cells (best measured: `qb=4`), `nrun` is the number of timed
-runs after two warm-ups (median reported). Each case is run twice by the script because the
+Cartesian query-bin edge in cells (`qb=1` is best for the uniform spread, `qb=4` for
+clustered/sparse), `nrun` is the number of timed runs after two warm-ups (median reported),
+`prep` selects counting sort (0) or radix sort (1, default). Each case is run twice by the script because the
 first process run has low clocks; read the second. The program times pinned method 3 /
 method 4 / method 1 with CUDA events, times preprocessing and the spread (including the
 partial reduction when `nsplit > 1`) separately, checks the fine-grid output against method 3
@@ -122,20 +125,24 @@ Widths are PC-sample shares rescaled to the measured kernel time; stall reasons 
 args, not frames. The complete captures (v1, v3, v5, v6, v7, v8) are under
 `profile-artifacts/expA-output-owned/`; v8 is current.
 
-## Verdict (current: v9 = v8 + double-buffered staging + contiguous x-run batching)
+## Verdict (current: v10 = v8 + double-buffered staging + x-run batching + radix preprocessing)
 
 Correct (`relL2` 5.5e-7 uniform, 7e-7 clustered, 7e-8 sparse). Warm event timing, best
-query-bin size per workload:
+query-bin size and preprocessing per workload:
 
-| case | method 3 | prototype | ratio |
-|---|---:|---:|---:|
-| uniform `1e6` `64^3` (qb=1, reread 5.36) | 15.95 ms | 16.78 ms | 1.05x slower |
-| clustered `1e6` `64^3` (qb=4, nsplit=8) | 15.90 ms | 26.00 ms | 1.63x slower |
-| sparse `1e5` `128^3` (qb=4) | 2.82 ms | 2.08 ms | **1.36x faster** |
+| case | method 3 (spread / total) | prototype (spread / total) | spread ratio | total ratio |
+|---|---:|---:|---:|---:|
+| uniform `1e6` `64^3` (qb=1, radix) | 15.95 / 16.78 ms | 16.7 / 22.9 ms | 1.05x slower | 1.37x slower |
+| clustered `1e6` `64^3` (qb=4, counting, split 8) | 15.90 / 16.79 ms | 25.9 / 27.6 ms | 1.63x slower | 1.64x slower |
+| sparse `1e5` `128^3` (qb=4, radix) | 2.82 / 2.95 ms | 2.08 / 2.49 ms | **1.36x faster** | **1.18x faster** |
 
-The uniform spread is now at parity; the remaining blocker for the total-time gate is the
-Cartesian counting-sort preprocessing (11.4 ms at `qb=1` over 262k bins, 5.6 ms at `qb=4`).
-The clustered case is still 1.63x: the split fixed the scheduler starvation (active
-warps/scheduler 1.62 -> 4.26) but not the per-point work. Full trajectory and profiler
-evidence: [`profile-artifacts/expA-output-owned/README.md`](../../profile-artifacts/expA-output-owned/README.md)
+Radix vs counting preprocessing at `qb=1` uniform: 11.4 -> 6.2 ms (total 28.0 -> 22.9). At
+`qb=4` and clustered the counting sort is competitive (clustered: counting 1.7 ms, radix
+2.5 ms), so the best preprocessing is distribution-dependent.
+
+The spread gate (>=20% faster on both mandatory `N=1e6` cases) still fails: uniform is at
+parity, clustered is 1.63x slower (the split fixed scheduler starvation, but the per-point
+work remains). Even free preprocessing would only bring the uniform total to parity with
+method 3. Full trajectory and profiler evidence:
+[`profile-artifacts/expA-output-owned/README.md`](../../profile-artifacts/expA-output-owned/README.md)
 and the issue research note.
