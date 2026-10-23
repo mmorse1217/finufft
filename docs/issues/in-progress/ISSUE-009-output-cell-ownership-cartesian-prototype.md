@@ -11,6 +11,7 @@
 - ee88a2fc — v11as block-shared staging + measured dispatch
 - 92014e4b — v11at preprocessing rewrite (packed gather + GPU binstart)
 - 674ad159 — v11au three-point coefficient packing
+- ee278ffa — v11av three-point packing in block-shared staging
 
 **Dependencies:**
 - ISSUE-002
@@ -1289,3 +1290,25 @@ total warp instructions. The scan frame is dominated by 16-cell accumulation and
 placement, not by LDS stalls. Full table:
 `docs/issues/research/ISSUE-009-exp-a-results.md` and
 `profile-artifacts/expA-output-owned/opt-2026-10-22/v11au/scan_breakdown.txt`.
+
+## v11av addendum — block-shared three-point packing (2026-10-23)
+
+The block-shared clustered staging path now uses the same 9-lanes-per-point / 3-points-per-
+warp mapping as the per-warp path. Each warp stages its 14-point quarter in five 3-point
+iterations instead of fourteen one-point iterations; `k+3` comes from the shared KER6 copy.
+Block kernel: 94 registers, 12,760 B shared, 5 blocks/SM, no spills.
+
+| workload | v11au spread / total | v11av spread / total |
+|---|---:|---:|
+| uniform `1e6` `64^3` qb=1 radix | 12.59 / 16.12 ms | 12.58 / 16.10 ms |
+| clustered `1e6` `64^3` qb=4 counting | 14.03 / 15.62 ms | **13.71 / 15.31 ms** |
+| sparse `1e5` `128^3` qb=4 radix | 1.53 / 2.09 ms | 1.53 / 2.09 ms |
+
+Clustered staging is now only **4.7%** of the kernel (was 14.3%); the remaining ~0.99 ms
+gap to the 12.72 ms clustered spread gate is scan-side. Uniform gates still pass. Details
+and new flamegraphs:
+`docs/issues/research/ISSUE-009-exp-a-results.md` and
+`profile-artifacts/expA-output-owned/opt-2026-10-22/v11av/`.
+
+Committed as **ee278ffa**. Clustered spread is now 13.71 ms against the 12.72 ms gate;
+staging is only 4.7% of the kernel, so the remaining work is scan-side.

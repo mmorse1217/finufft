@@ -1404,3 +1404,30 @@ region tradeoff (halve per-point loads, double accumulator state, lower occupanc
 plausible but is not justified by an "LDS is everything" reading of the flamegraph.
 
 Artifact: `profile-artifacts/expA-output-owned/opt-2026-10-22/v11au/scan_breakdown.txt`.
+
+## Three-point packing in block-shared staging (v11av, 2026-10-23)
+
+Applied the same 9-lanes-per-point / 3-points-per-warp mapping to the block-shared staging
+path. `stage_block_quarter` now computes two coefficients per lane (`k` from registers,
+`k+3` from a shared KER6 copy), so each warp stages its 14-point quarter in five 3-point
+iterations instead of fourteen one-point iterations. Block-shared kernel remains 94
+registers, 12,760 B shared, 5 blocks/SM, no spills.
+
+Median results (3 process runs, 5 timed runs each):
+
+| workload | v11au pre | v11av pre | v11au spread | v11av spread | v11au total | v11av total |
+|---|---:|---:|---:|---:|---:|---:|
+| uniform `1e6` `64^3` qb=1 radix | 3.086 | 3.082 | 12.591 | 12.575 | 16.121 | 16.101 |
+| clustered `1e6` `64^3` qb=4 counting | 1.462 | 1.467 | 14.029 | **13.714** | 15.624 | **15.311** |
+| sparse `1e5` `128^3` qb=4 radix | 0.284 | 0.284 | 1.534 | 1.534 | 2.090 | 2.092 |
+
+Clustered source shares from the new flamegraph: scan body **76.0%**, `stage_block_quarter`
+**4.7%** (down from 14.3%), block setup/bin loop ~2.8%. The staging path is now small
+enough that software pipelining can hide at most ~4.7%, so the remaining clustered gap
+(~0.99 ms to 12.72 ms) is scan-side. The next serious lever is reducing block reread with
+a larger block tile (e.g. `16x16x16`, 8 warps/block, 16 scanner warps/SM) or changing the
+scan geometry; both trade work reduction against scanner occupancy.
+
+Committed as **ee278ffa**. Artifact:
+`profile-artifacts/expA-output-owned/opt-2026-10-22/v11av/` (source, ptxas, bench, ncu
+captures, flamegraphs, README).
