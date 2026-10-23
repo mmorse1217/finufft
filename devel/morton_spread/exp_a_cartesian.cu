@@ -52,16 +52,16 @@ static constexpr double PI = 3.141592653589793238462643383279502884;
 
 // Fixed prototype geometry (from ISSUE-008, plus the qbin refinement):
 //   tile 16x16x8, one CUDA threadblock per tile, 256 threads, 2x2x2 cells per thread.
-static constexpr int NS      = 6;  // kernel width, ns=6 for tol 1e-5 at sigma=2
-static constexpr int TILE_X  = 16;
-static constexpr int TILE_Y  = 16;
-static constexpr int TILE_Z  = 8;
-static constexpr int NTHREAD = 128;                 // 4 warps, 8x8x8 warp region
-static constexpr int NWARPS  = NTHREAD / 32;
-static constexpr int HALO    = (NS + 1) / 2;        // 3
-static constexpr int GSX     = 2;                   // cells per thread per dim
-static constexpr int GSY     = 2;
-static constexpr int GSZ     = 4;                   // 16 cells per thread
+static constexpr int SUPPORT_WIDTH      = 6;  // kernel width, ns=6 for tol 1e-5 at sigma=2
+static constexpr int OUTPUT_TILE_X  = 16;
+static constexpr int OUTPUT_TILE_Y  = 16;
+static constexpr int OUTPUT_TILE_Z  = 8;
+static constexpr int THREADS_PER_BLOCK = 128;                 // 4 warps, 8x8x8 warp region
+static constexpr int WARPS_PER_BLOCK  = THREADS_PER_BLOCK / 32;
+static constexpr int QUERY_BIN_HALO    = (SUPPORT_WIDTH + 1) / 2;        // 3
+static constexpr int GROUP_SIZE_X     = 2;                   // cells per thread per dim
+static constexpr int GROUP_SIZE_Y     = 2;
+static constexpr int GROUP_SIZE_Z     = 4;                   // 16 cells per thread
 
 __host__ __device__ __forceinline__ int floordiv(int a, int b) {
   // Truncating division + a mask correction: no predicate, no branch.
@@ -153,38 +153,67 @@ __global__ void kernel_visits(const int *__restrict__ binstart, int nqx, int nqy
                               int nf1, int nf2, int nf3, int qb, int tiles_x,
                               int tiles_y, unsigned long long *visits,
                               unsigned long long *active_warps) {
-  const int nwarps = tiles_x * tiles_y * ((nf3 + TILE_Z - 1) / TILE_Z) * NWARPS;
-  const int wid    = blockIdx.x * blockDim.x + threadIdx.x;
+  const int nwarps = tiles_x * tiles_y * ((nf3 + OUTPUT_TILE_Z - 1) / OUTPUT_TILE_Z) * WARPS_PER_BLOCK;
+  const int wid    = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane   = threadIdx.x & 31;
   if (wid >= nwarps) return;
-  const int warp = wid % NWARPS;
-  const int tile = wid / NWARPS;
+  const int warp = wid % WARPS_PER_BLOCK;
+  const int tile = wid / WARPS_PER_BLOCK;
   const int tz   = tile / (tiles_x * tiles_y);
   const int ty   = (tile / tiles_x) % tiles_y;
   const int tx   = tile % tiles_x;
-  const int X0   = tx * TILE_X + (warp & 1) * 8;
-  const int Y0   = ty * TILE_Y + ((warp >> 1) & 1) * 8;
-  const int Z0   = tz * TILE_Z + (warp >> 2) * 8;
-  const int bx0 = floordiv(X0 - HALO, qb), bx1 = (X0 + 7 + HALO) / qb;
-  const int by0 = floordiv(Y0 - HALO, qb), by1 = (Y0 + 7 + HALO) / qb;
-  const int bz0 = floordiv(Z0 - HALO, qb), bz1 = (Z0 + 7 + HALO) / qb;
+  const int X0   = tx * OUTPUT_TILE_X + (warp & 1) * 8;
+  const int Y0   = ty * OUTPUT_TILE_Y + ((warp >> 1) & 1) * 8;
+  const int Z0   = tz * OUTPUT_TILE_Z + (warp >> 2) * 8;
+  const int bx0 = floordiv(X0 - QUERY_BIN_HALO, qb), bx1 = (X0 + 7 + QUERY_BIN_HALO) / qb;
+  const int by0 = floordiv(Y0 - QUERY_BIN_HALO, qb), by1 = (Y0 + 7 + QUERY_BIN_HALO) / qb;
+  const int bz0 = floordiv(Z0 - QUERY_BIN_HALO, qb), bz1 = (Z0 + 7 + QUERY_BIN_HALO) / qb;
+
+  // One warp cooperates on one region. Flatten the bin cube and give each lane
+  // a strided subset; the original single-thread version left the GPU almost idle.
+  const int nx  = bx1 - bx0 + 1;
+  const int ny  = by1 - by0 + 1;
+  const int nz  = bz1 - bz0 + 1;
+  const int ynz = ny * nz;
+  const int total = nx * ynz;
   unsigned long long v = 0;
-  for (int ix = bx0; ix <= bx1; ix++) {
-    int wx = ix % nqx;
+  for (int idx = lane; idx < total; idx += 32) {
+    int t = idx;
+    const int ix = t / ynz;
+    t -= ix * ynz;
+    const int iy = t / nz;
+    const int iz = t - iy * nz;
+    int wx = (bx0 + ix) % nqx;
     wx += (wx >> 31) & nqx;
-    for (int iy = by0; iy <= by1; iy++) {
-      int wy = iy % nqy;
-      wy += (wy >> 31) & nqy;
-      for (int iz = bz0; iz <= bz1; iz++) {
-        int wz = iz % nqz;
-        wz += (wz >> 31) & nqz;
-        const int bin = wx + nqx * (wy + nqy * wz);
-        v += (unsigned long long)(binstart[bin + 1] - binstart[bin]);
-      }
-    }
+    int wy = (by0 + iy) % nqy;
+    wy += (wy >> 31) & nqy;
+    int wz = (bz0 + iz) % nqz;
+    wz += (wz >> 31) & nqz;
+    const int bin = wx + nqx * (wy + nqy * wz);
+    v += (unsigned long long)(binstart[bin + 1] - binstart[bin]);
   }
-  // No atomics, no shared reduction: one slot per warp, summed on the host.
-  visits[wid]       = v;
-  active_warps[wid] = (v != 0) ? 1ULL : 0ULL;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
+  if (lane == 0) {
+    visits[wid]       = v;
+    active_warps[wid] = (v != 0) ? 1ULL : 0ULL;
+  }
+}
+
+// Compact active tiles in tile order. Single-threaded on purpose: the tile count is
+// small (128 for 64^3, 1024 for 128^3) and this keeps the list deterministic without
+// atomics. The metadata cost is measured separately by the host.
+__global__ void kernel_compact_tiles(const unsigned long long *__restrict__ active_warps,
+                                     int ntiles, int *__restrict__ tile_ids,
+                                     int *__restrict__ tile_count) {
+  int n = 0;
+  for (int tile = 0; tile < ntiles; ++tile) {
+    unsigned long long active = 0;
+#pragma unroll
+    for (int w = 0; w < WARPS_PER_BLOCK; ++w) active |= active_warps[tile * WARPS_PER_BLOCK + w];
+    if (active) tile_ids[n++] = tile;
+  }
+  tile_count[0] = n;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,14 +221,14 @@ __global__ void kernel_visits(const int *__restrict__ binstart, int nqx, int nqy
 //
 // Block = 256 threads = 8 warps, one tile (16x16x8) per block.
 // Warp region = 8x8x4 cells; lane -> 2x2x2 group (lane grid 4x4x2).
-// The warp enumerates the query bins covering its region expanded by HALO and
+// The warp enumerates the query bins covering its region expanded by QUERY_BIN_HALO and
 // stages each point cooperatively: 18 lanes evaluate one Horner coefficient
 // each, one lane records the support start, one lane records the strength.
 // Staged points are in shared memory, so every lane reads the same bytes
 // (broadcast) and can index the kernel values dynamically at no local-memory
 // cost. Each lane accumulates its own 8 cells and writes them exactly once.
 // ---------------------------------------------------------------------------
-__device__ __constant__ float KER6[9][6] = {
+__device__ __constant__ float KERNEL_COEFFICIENT_TABLE[9][6] = {
     {2.0875119883113444E-03, 1.5741818314646622E-01, 8.2446837122968719E-01,
      8.2446837122968786E-01, 1.5741818314646619E-01, 2.0875119883208707E-03},
     {7.2383827471879060E-03, 2.0903648995439425E-01, 3.2052935784357611E-01,
@@ -219,221 +248,636 @@ __device__ __constant__ float KER6[9][6] = {
     {-1.5875418082722892E-06, 7.2147850129502829E-07, -7.0930078290747281E-08,
      -7.0930078325137639E-08, 7.2147850125572373E-07, -1.5875417996328233E-06}};
 
-static constexpr int BATCH = 16;
-static constexpr int STAGE = 24;  // 18 kernel + 3 coord/support + 2 strength + pad
+static constexpr int MAX_POINTS_PER_BATCH = 14;
+static constexpr int VALUES_PER_POINT = 28;  // 3 support starts + 2 strengths + 18 coefficients + 5 zero pads
+static constexpr int BLOCK_POINTS_PER_BATCH = 56;
 
-// Raw pass: lanes 0..cnt-1 issue all the global loads for the batch at once, so
-// the warp waits on one round of coalesced loads instead of ~cnt serialized ones.
-// Coordinates and strength land in slots 18..22 of each point's stage row.
-__device__ __forceinline__ void stage_raw(int q0, int cnt, int lane,
-                                          const float *__restrict__ x,
-                                          const float *__restrict__ y,
-                                          const float *__restrict__ z,
-                                          const float2 *__restrict__ cstr,
-                                          float *__restrict__ buf) {
-  if (lane < cnt) {
-    const int q      = q0 + lane;
-    float *const row = buf + lane * STAGE;
-    row[18]          = __ldg(x + q);
-    row[19]          = __ldg(y + q);
-    row[20]          = __ldg(z + q);
-    const float2 cp  = __ldg(cstr + q);
-    row[21]          = cp.x;
-    row[22]          = cp.y;
+// Raw pass: lanes 0..staged_point_count-1 issue all the global loads for the batch at once, so
+// the warp waits on one round of coalesced loads instead of ~staged_point_count serialized ones.
+// Coordinates and strength land in slots 0..4 of each staged point record.
+__device__ __forceinline__ void stage_raw_points(
+    int first_point_index, int staged_point_count, int lane_index,
+    const float *__restrict__ input_coordinate_x,
+    const float *__restrict__ input_coordinate_y,
+    const float *__restrict__ input_coordinate_z,
+    const float2 *__restrict__ input_strength_pairs,
+    float *__restrict__ destination_batch_values) {
+  if (lane_index < staged_point_count) {
+    const int point_index     = first_point_index + lane_index;
+    float *const staged_point = destination_batch_values + lane_index * VALUES_PER_POINT;
+    staged_point[0]           = __ldg(input_coordinate_x + point_index);
+    staged_point[1]           = __ldg(input_coordinate_y + point_index);
+    staged_point[2]           = __ldg(input_coordinate_z + point_index);
+    const float2 point_strength = __ldg(input_strength_pairs + point_index);
+    staged_point[3]           = point_strength.x;
+    staged_point[4]           = point_strength.y;
   }
 }
 
-// Coefficient pass for one staged point: lanes 0-17 evaluate one Horner coefficient
-// each (nine polynomial coefficients preloaded in registers); the six lanes of a
-// dimension fold the same broadcast coordinate in parallel, and the support start is
-// written by all six lanes of that dimension (same value, so no branch is needed).
-__device__ __forceinline__ void stage_coeff(float *__restrict__ row, int lane,
-                                            int nf1, int nf2, int nf3,
-                                            const float *__restrict__ coeff) {
+// Coefficient pass for one staged point: the 18 active lanes evaluate one Horner
+// coefficient each (nine polynomial coefficients preloaded in registers); the six
+// lanes of a dimension fold the same broadcast coordinate in parallel, and the
+// support start is written by all six lanes of that dimension (same value, so no
+// branch is needed). The lane geometry (fine_grid_size_dimension, support offset, coefficient offset) is
+// loop-invariant and supplied by the caller.
+__device__ __forceinline__ void prepare_point_coefficients(
+    float *__restrict__ staged_point, int fine_grid_size_dimension,
+    int support_start_slot, int coefficient_slot,
+    const float *__restrict__ kernel_coefficients) {
   using cufinufft::spreadinterp::fold_rescale;
-  if (lane < 18) {
-    const int d   = lane / 6;
-    const int nfd = (d == 0) ? nf1 : ((d == 1) ? nf2 : nf3);
-    const float r    = fold_rescale(row[18 + d], nfd);
-    const float sval = (float)((int)ceilf(r - (float)(NS / 2)));
-    const float zz   = __fmaf_rn(2.f, sval - r, (float)(NS - 1));
-    row[18 + d] = sval;
-    float v     = coeff[8];
+  const float folded_coordinate =
+      fold_rescale(staged_point[support_start_slot], fine_grid_size_dimension);
+  const float support_start_float =
+      ceilf(folded_coordinate - (float)(SUPPORT_WIDTH / 2));
+  const int support_start_int = (int)support_start_float;
+  const float horner_argument =
+      __fmaf_rn(2.f, support_start_float - folded_coordinate,
+                (float)(SUPPORT_WIDTH - 1));
+  reinterpret_cast<int *>(staged_point)[support_start_slot] = support_start_int;
+  float coefficient_value = kernel_coefficients[8];
 #pragma unroll
-    for (int t = 7; t >= 0; t--) v = __fmaf_rn(zz, v, coeff[t]);
-    row[lane] = v;
-  }
+  for (int horner_term = 7; horner_term >= 0; horner_term--)
+    coefficient_value = __fmaf_rn(horner_argument, coefficient_value,
+                                  kernel_coefficients[horner_term]);
+  staged_point[coefficient_slot] = coefficient_value;
 }
 
-// Support placement of a point in the frame of a GSIZE-cell group starting at g0.
-// Branchless: n = number of group cells covered (0,1,2); the covered cells are
-// contiguous, local cell l0+k gets kernel coefficient k[j0+k] for k < n.
-__device__ __forceinline__ void dim_support(int s, int nfd, int g0, int gs, int &n,
-                                            int &j0, int &l0) {
-  int d = s - g0;
-  d += nfd & (d >> 31);       // d < 0    -> d + nfd
-  d -= nfd & -(d >= nfd);     // d >= nfd -> d - nfd
-  // n/j0/l0 below are selects: ptxas lowers them to SEL/ISETP with no branch
+// Support placement of a point in the frame of a GROUP_SIZE-cell group starting at lane_group_start.
+// Branchless: group_cell_count = number of group cells covered (0,1,2); the covered cells are
+// contiguous, local cell local_cell_offset+k gets kernel coefficient k[support_coefficient_offset+k] for k < group_cell_count.
+__device__ __forceinline__ void place_support(int support_start, int fine_grid_size_dimension, int lane_group_start, int group_size, int &group_cell_count,
+                                            int &support_coefficient_offset, int &local_cell_offset) {
+  int relative_support_start = support_start - lane_group_start;
+  relative_support_start += fine_grid_size_dimension & (relative_support_start >> 31);       // relative_support_start < 0 -> relative_support_start + fine_grid_size_dimension; relative_support_start is now < fine_grid_size_dimension for lane_group_start >= 0,
+                              // so the former relative_support_start >= fine_grid_size_dimension correction cannot fire.
+  // group_cell_count/support_coefficient_offset/local_cell_offset below are selects: ptxas lowers them to SEL/ISETP with no branch
   // (SASS branch count is identical to an explicit mask form, which measured
   // 11-17% slower because it adds ~21 LOP3 per scan).
-  const bool low  = d < gs;
-  const bool high = d >= nfd - (NS - 1);
-  const int nh    = NS - (nfd - d);
-  n  = low ? (gs - d) : (high ? (nh < gs ? nh : gs) : 0);
-  j0 = low ? 0 : (high ? (nfd - d) : 0);
-  l0 = low ? d : 0;
+  const bool below_group  = relative_support_start < group_size;
+  const bool wraps_high = relative_support_start >= fine_grid_size_dimension - (SUPPORT_WIDTH - 1);
+  const int wrapped_cell_count    = SUPPORT_WIDTH - (fine_grid_size_dimension - relative_support_start);
+  group_cell_count  = below_group ? (group_size - relative_support_start) : (wraps_high ? (wrapped_cell_count < group_size ? wrapped_cell_count : group_size) : 0);
+  support_coefficient_offset = below_group ? 0 : (wraps_high ? (fine_grid_size_dimension - relative_support_start) : 0);
+  local_cell_offset = below_group ? relative_support_start : 0;
+}
+
+// Fast path for a support interval and a lane group that do not wrap around the
+// periodic fine-grid boundary. The overlap is a plain interval intersection, so
+// no modulo and no below_group/wraps_high predicates are needed.
+__device__ __forceinline__ void place_support_nowrap(int support_start, int lane_group_start, int group_size, int &group_cell_count,
+                                                   int &support_coefficient_offset, int &local_cell_offset) {
+  const int intersection_begin = max(support_start, lane_group_start);
+  const int intersection_end =
+      min(support_start + SUPPORT_WIDTH, lane_group_start + group_size);
+  group_cell_count = max(intersection_end - intersection_begin, 0);
+  support_coefficient_offset = intersection_begin - support_start;
+  local_cell_offset = intersection_begin - lane_group_start;
 }
 
 // One staged point: support placement, kernel values, 16-cell accumulation.
 // Pulled out of the loop so the scan can issue two points back to back (ILP).
-__device__ __forceinline__ void scan_point(const float *__restrict__ row, int nf1, int nf2,
-                                           int nf3, int gx0, int gy0, int gz0,
-                                           float2 (&acc)[16]) {
-  const float2 s01 = *reinterpret_cast<const float2 *>(row + 18);  // s x,y
-  const float2 sc  = *reinterpret_cast<const float2 *>(row + 20);  // s z, strength re
-  const int sx = (int)s01.x, sy = (int)s01.y, sz = (int)sc.x;
-  const float cx = sc.y, cy = row[22];
-  int nx, jx, lx, ny, jy, ly, nz, jz, lz;
-  dim_support(sx, nf1, gx0, GSX, nx, jx, lx);
-  dim_support(sy, nf2, gy0, GSY, ny, jy, ly);
-  dim_support(sz, nf3, gz0, GSZ, nz, jz, lz);
-  if (!(nx && ny && nz)) return;
-  const float kx0 = row[jx], kx1 = (nx >= 2) ? row[jx + 1] : 0.f;
-  const float ky0 = row[6 + jy], ky1 = (ny >= 2) ? row[7 + jy] : 0.f;
-  const float kz0 = row[12 + jz], kz1 = (nz >= 2) ? row[13 + jz] : 0.f;
-  const float kz2 = (nz >= 3) ? row[14 + jz] : 0.f;
-  const float kz3 = (nz >= 4) ? row[15 + jz] : 0.f;
-  const float vx[2] = {(lx == 0) ? kx0 : 0.f, (lx == 0) ? kx1 : kx0};
-  const float vy[2] = {(ly == 0) ? ky0 : 0.f, (ly == 0) ? ky1 : ky0};
-  const float vz[4] = {(lz == 0) ? kz0 : 0.f,
-                       (lz == 0) ? kz1 : ((lz == 1) ? kz0 : 0.f),
-                       (lz == 0) ? kz2 : ((lz == 1) ? kz1 : ((lz == 2) ? kz0 : 0.f)),
-                       (lz == 0) ? kz3 : ((lz == 1) ? kz2
-                                          : ((lz == 2) ? kz1 : ((lz == 3) ? kz0 : 0.f)))};
-  // Indexed by cx + 2*cy to match the accumulator layout.
-  const float wxy[4] = {vx[0] * vy[0], vx[1] * vy[0], vx[0] * vy[1], vx[1] * vy[1]};
+template <bool SUPPORTS_DO_NOT_WRAP>
+__device__ __forceinline__ void scan_one_staged_point(const float *__restrict__ staged_point, int fine_grid_size_x, int fine_grid_size_y,
+                                           int fine_grid_size_z, int lane_group_x_start, int lane_group_y_start, int lane_group_z_start,
+                                           float2 (&output_cell_accumulators)[16]) {
+  const int2 support_start_xy = *reinterpret_cast<const int2 *>(staged_point);  // support starts x,y as ints
+  const int support_start_z   = reinterpret_cast<const int *>(staged_point)[2];
+  const int support_start_x = support_start_xy.x, support_start_y = support_start_xy.y;
+  const float strength_real = staged_point[3], strength_imag = staged_point[4];
+  int group_cell_count_x, support_coefficient_offset_x, local_cell_offset_x, group_cell_count_y, support_coefficient_offset_y, local_cell_offset_y, group_cell_count_z, support_coefficient_offset_z, local_cell_offset_z;
+  if constexpr (SUPPORTS_DO_NOT_WRAP) {
+    place_support_nowrap(support_start_x, lane_group_x_start, GROUP_SIZE_X, group_cell_count_x, support_coefficient_offset_x, local_cell_offset_x);
+    place_support_nowrap(support_start_y, lane_group_y_start, GROUP_SIZE_Y, group_cell_count_y, support_coefficient_offset_y, local_cell_offset_y);
+    place_support_nowrap(support_start_z, lane_group_z_start, GROUP_SIZE_Z, group_cell_count_z, support_coefficient_offset_z, local_cell_offset_z);
+  } else {
+    place_support(support_start_x, fine_grid_size_x, lane_group_x_start, GROUP_SIZE_X, group_cell_count_x, support_coefficient_offset_x, local_cell_offset_x);
+    place_support(support_start_y, fine_grid_size_y, lane_group_y_start, GROUP_SIZE_Y, group_cell_count_y, support_coefficient_offset_y, local_cell_offset_y);
+    place_support(support_start_z, fine_grid_size_z, lane_group_z_start, GROUP_SIZE_Z, group_cell_count_z, support_coefficient_offset_z, local_cell_offset_z);
+  }
+  if (!(group_cell_count_x && group_cell_count_y && group_cell_count_z)) return;
+  // Padded coefficient rows: the slot just past a real coefficient is zero, so
+  // these loads never need the group_cell_count_x/group_cell_count_y/group_cell_count_z range selects.
+  const float x_kernel_value_0 = staged_point[5 + support_coefficient_offset_x], x_kernel_value_1 = staged_point[6 + support_coefficient_offset_x];
+  const float y_kernel_value_0 = staged_point[12 + support_coefficient_offset_y], y_kernel_value_1 = staged_point[13 + support_coefficient_offset_y];
+  const float z_kernel_value_0 = staged_point[19 + support_coefficient_offset_z], z_kernel_value_1 = staged_point[20 + support_coefficient_offset_z];
+  const float z_kernel_value_2 = staged_point[21 + support_coefficient_offset_z], z_kernel_value_3 = staged_point[22 + support_coefficient_offset_z];
+  const float x_kernel_values[2] = {(local_cell_offset_x == 0) ? x_kernel_value_0 : 0.f, (local_cell_offset_x == 0) ? x_kernel_value_1 : x_kernel_value_0};
+  const float y_kernel_values[2] = {(local_cell_offset_y == 0) ? y_kernel_value_0 : 0.f, (local_cell_offset_y == 0) ? y_kernel_value_1 : y_kernel_value_0};
+  const float z_kernel_values[4] = {(local_cell_offset_z == 0) ? z_kernel_value_0 : 0.f,
+                       (local_cell_offset_z == 0) ? z_kernel_value_1 : ((local_cell_offset_z == 1) ? z_kernel_value_0 : 0.f),
+                       (local_cell_offset_z == 0) ? z_kernel_value_2 : ((local_cell_offset_z == 1) ? z_kernel_value_1 : ((local_cell_offset_z == 2) ? z_kernel_value_0 : 0.f)),
+                       (local_cell_offset_z == 0) ? z_kernel_value_3 : ((local_cell_offset_z == 1) ? z_kernel_value_2
+                                          : ((local_cell_offset_z == 2) ? z_kernel_value_1 : ((local_cell_offset_z == 3) ? z_kernel_value_0 : 0.f)))};
+  // Indexed by local_x + 2*local_y to match the accumulator layout.
+  const float xy_weights[4] = {x_kernel_values[0] * y_kernel_values[0], x_kernel_values[1] * y_kernel_values[0], x_kernel_values[0] * y_kernel_values[1], x_kernel_values[1] * y_kernel_values[1]};
 #pragma unroll
-  for (int cz = 0; cz < 4; cz++) {
+  for (int local_z = 0; local_z < 4; local_z++) {
 #pragma unroll
-    for (int cy2 = 0; cy2 < 2; cy2++) {
+    for (int local_y = 0; local_y < 2; local_y++) {
 #pragma unroll
-      for (int cx2 = 0; cx2 < 2; cx2++) {
-        const int li    = cx2 + 2 * cy2 + 4 * cz;
-        const float wgt = wxy[cx2 + 2 * cy2] * vz[cz];
-        acc[li].x += cx * wgt;
-        acc[li].y += cy * wgt;
+      for (int local_x = 0; local_x < 2; local_x++) {
+        const int output_cell_index    = local_x + 2 * local_y + 4 * local_z;
+        const float weight = xy_weights[local_x + 2 * local_y] * z_kernel_values[local_z];
+        output_cell_accumulators[output_cell_index].x += strength_real * weight;
+        output_cell_accumulators[output_cell_index].y += strength_imag * weight;
       }
     }
   }
 }
 
 __global__ void spread_cartesian_owned(
-    const float *__restrict__ x, const float *__restrict__ y, const float *__restrict__ z,
-    const cuFloatComplex *__restrict__ c, const int *__restrict__ binstart,
-    cuFloatComplex *__restrict__ fw, int nf1, int nf2,
-    int nf3, int nqx, int nqy, int nqz, int qb, int tiles_x, int tiles_y, int nsplit) {
-  __shared__ __align__(16) float stage[NWARPS][2][BATCH][STAGE];
+    const float *__restrict__ input_coordinate_x,
+    const float *__restrict__ input_coordinate_y,
+    const float *__restrict__ input_coordinate_z,
+    const cuFloatComplex *__restrict__ input_strengths,
+    const int *__restrict__ query_bin_point_offsets,
+    cuFloatComplex *__restrict__ output_grid, int fine_grid_size_x, int fine_grid_size_y,
+    int fine_grid_size_z, int query_bin_count_x, int query_bin_count_y, int query_bin_count_z, int query_bin_size, int output_tile_count_x, int output_tile_count_y, int split_count,
+    const int *__restrict__ active_tile_indices) {
+  __shared__ __align__(16) float
+      staged_point_values[WARPS_PER_BLOCK][2][MAX_POINTS_PER_BATCH][VALUES_PER_POINT];
 
-  const int warp  = threadIdx.x >> 5;
-  const int lane  = threadIdx.x & 31;
-  const int tile  = blockIdx.x / nsplit;
-  const int split = blockIdx.x - tile * nsplit;
-  const int tz   = tile / (tiles_x * tiles_y);
-  const int ty   = (tile / tiles_x) % tiles_y;
-  const int tx   = tile % tiles_x;
-  const int X0   = tx * TILE_X + (warp & 1) * 8;
-  const int Y0   = ty * TILE_Y + ((warp >> 1) & 1) * 8;
-  const int Z0   = tz * TILE_Z + (warp >> 2) * 8;
-  const int gx0  = X0 + (lane & 3) * GSX;
-  const int gy0  = Y0 + ((lane >> 2) & 3) * GSY;
-  const int gz0  = Z0 + ((lane >> 4) & 1) * GSZ;
+  const int warp_index     = threadIdx.x >> 5;
+  const int lane_index     = threadIdx.x & 31;
+  const int active_tile_list_index = blockIdx.x / split_count;
+  const int output_tile_index     = active_tile_indices[active_tile_list_index];
+  const int split_index    = blockIdx.x - active_tile_list_index * split_count;
+  const int tile_z_index   = output_tile_index / (output_tile_count_x * output_tile_count_y);
+  const int tile_y_index   = (output_tile_index / output_tile_count_x) % output_tile_count_y;
+  const int tile_x_index   = output_tile_index % output_tile_count_x;
+  const int warp_region_x_start   = tile_x_index * OUTPUT_TILE_X + (warp_index & 1) * 8;
+  const int warp_region_y_start   = tile_y_index * OUTPUT_TILE_Y + ((warp_index >> 1) & 1) * 8;
+  const int warp_region_z_start   = tile_z_index * OUTPUT_TILE_Z + (warp_index >> 2) * 8;
+  const bool warp_region_inside_grid = (warp_region_x_start + 7 < fine_grid_size_x && warp_region_y_start + 7 < fine_grid_size_y && warp_region_z_start + 7 < fine_grid_size_z);
+  const int lane_group_x_start  = warp_region_x_start + (lane_index & 3) * GROUP_SIZE_X;
+  const int lane_group_y_start  = warp_region_y_start + ((lane_index >> 2) & 3) * GROUP_SIZE_Y;
+  const int lane_group_z_start  = warp_region_z_start + ((lane_index >> 4) & 1) * GROUP_SIZE_Z;
   // No early return: __syncwarp() must be executed by the whole warp. Groups
   // outside the grid (partial edge tiles) accumulate garbage but never store.
 
-  float2 acc[16];
+  float2 output_cell_accumulators[16];
 #pragma unroll
-  for (int i = 0; i < 16; i++) acc[i] = make_float2(0.f, 0.f);
+  for (int output_cell_index = 0; output_cell_index < 16; output_cell_index++)
+    output_cell_accumulators[output_cell_index] = make_float2(0.f, 0.f);
 
-  // The nine Horner coefficients for this lane's index are loop-invariant: load
-  // them once into registers instead of doing a divergent constant load per point.
-  float coeff[9] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  if (lane < 18) {
-    const int ci = lane % 6;
+  // The nine Horner coefficients and the staging geometry for this lane are
+  // loop-invariant: load/compute them once instead of per point.
+  float kernel_coefficients[9] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  const int dimension   = lane_index / 6;
+  const int kernel_coefficient_index   = lane_index % 6;
+  const int fine_grid_size_dimension  = (dimension == 0) ? fine_grid_size_x : ((dimension == 1) ? fine_grid_size_y : fine_grid_size_z);
+  const int support_start_slot = dimension;
+  const int coefficient_slot = 5 + dimension * 7 + kernel_coefficient_index;
+  if (lane_index < 18) {
 #pragma unroll
-    for (int t = 0; t < 9; t++) coeff[t] = KER6[t][ci];
+    for (int kernel_term = 0; kernel_term < 9; kernel_term++)
+      kernel_coefficients[kernel_term] =
+          KERNEL_COEFFICIENT_TABLE[kernel_term][kernel_coefficient_index];
   }
 
-  const int bx0 = floordiv(X0 - HALO, qb), bx1 = (X0 + 7 + HALO) / qb;
-  const int by0 = floordiv(Y0 - HALO, qb), by1 = (Y0 + 7 + HALO) / qb;
-  const int bz0 = floordiv(Z0 - HALO, qb), bz1 = (Z0 + 7 + HALO) / qb;
-  const float2 *const cf = reinterpret_cast<const float2 *>(c);
+  // Zero the padded coefficient slots once in both warp-private buffers. The
+  // padding is never written again; scan_one_staged_point relies on it staying zero.
+  for (int buffered_point_slot = lane_index;
+       buffered_point_slot < 2 * MAX_POINTS_PER_BATCH;
+       buffered_point_slot += 32) {
+    float *const padded_staged_point =
+        &staged_point_values[warp_index][0][0][0] +
+        buffered_point_slot * VALUES_PER_POINT;
+    padded_staged_point[11] = 0.f;
+    padded_staged_point[18] = 0.f;
+    padded_staged_point[25] = 0.f;
+    padded_staged_point[26] = 0.f;
+    padded_staged_point[27] = 0.f;
+  }
+  __syncwarp();
+
+  const int query_bin_min_x = floordiv(warp_region_x_start - QUERY_BIN_HALO, query_bin_size), query_bin_max_x = (warp_region_x_start + 7 + QUERY_BIN_HALO) / query_bin_size;
+  const int query_bin_min_y = floordiv(warp_region_y_start - QUERY_BIN_HALO, query_bin_size), query_bin_max_y = (warp_region_y_start + 7 + QUERY_BIN_HALO) / query_bin_size;
+  const int query_bin_min_z = floordiv(warp_region_z_start - QUERY_BIN_HALO, query_bin_size), query_bin_max_z = (warp_region_z_start + 7 + QUERY_BIN_HALO) / query_bin_size;
+  const float2 *const input_strength_pairs =
+      reinterpret_cast<const float2 *>(input_strengths);
 
   // Walk the warp's bin cube as contiguous x-runs. Bins along x are consecutive in the
   // sorted point table, so a whole x-run is one contiguous point range and can be batched
-  // in 16s regardless of the query-bin size (this is what makes qb=1, reread 5.36, usable).
-  const int nxbin = min(bx1 - bx0 + 1, nqx);
-  int wlo         = bx0 % nqx;
-  wlo += (wlo >> 31) & nqx;
-  const int wend = wlo + nxbin - 1;
-  for (int iy = by0; iy <= by1; iy++) {
-    int wy = iy % nqy;
-    wy += (wy >> 31) & nqy;
-    for (int iz = bz0; iz <= bz1; iz++) {
-      int wz = iz % nqz;
-      wz += (wz >> 31) & nqz;
-      const int base = nqx * (wy + nqy * wz);
-      for (int seg = 0; seg < 2; ++seg) {
+  // in 16s regardless of the query-bin size (this is what makes query_bin_size=1, reread 5.36, usable).
+  const int warp_query_bin_count_x = min(query_bin_max_x - query_bin_min_x + 1, query_bin_count_x);
+  int wrapped_first_query_bin_x         = query_bin_min_x % query_bin_count_x;
+  wrapped_first_query_bin_x += (wrapped_first_query_bin_x >> 31) & query_bin_count_x;
+  const int wrapped_last_query_bin_x = wrapped_first_query_bin_x + warp_query_bin_count_x - 1;
+  for (int query_bin_y = query_bin_min_y; query_bin_y <= query_bin_max_y; query_bin_y++) {
+    int wrapped_query_bin_y = query_bin_y % query_bin_count_y;
+    wrapped_query_bin_y += (wrapped_query_bin_y >> 31) & query_bin_count_y;
+    for (int query_bin_z = query_bin_min_z; query_bin_z <= query_bin_max_z; query_bin_z++) {
+      int wrapped_query_bin_z = query_bin_z % query_bin_count_z;
+      wrapped_query_bin_z += (wrapped_query_bin_z >> 31) & query_bin_count_z;
+      const int query_bin_base_index = query_bin_count_x * (wrapped_query_bin_y + query_bin_count_y * wrapped_query_bin_z);
+      for (int x_segment_index = 0; x_segment_index < 2; ++x_segment_index) {
         // The x-run can wrap around the periodic boundary: two contiguous segments.
-        const int x0 = (seg == 0) ? wlo : 0;
-        const int x1 = (seg == 0) ? min(wend, nqx - 1) : (wend - nqx);
-        if (x1 < x0) continue;
-        const int qlo  = binstart[base + x0];
-        const int qhi  = binstart[base + x1 + 1];
-        const int step = nsplit * BATCH;
-        int q0         = qlo + split * BATCH;
-        if (q0 < qhi) {
-          int cnt    = min(BATCH, qhi - q0);
-          float *cur = &stage[warp][0][0][0];
-          float *nxt = &stage[warp][1][0][0];
-          stage_raw(q0, cnt, lane, x, y, z, cf, cur);
+        const int segment_first_bin_x = (x_segment_index == 0) ? wrapped_first_query_bin_x : 0;
+        const int segment_last_bin_x = (x_segment_index == 0) ? min(wrapped_last_query_bin_x, query_bin_count_x - 1) : (wrapped_last_query_bin_x - query_bin_count_x);
+        if (segment_last_bin_x < segment_first_bin_x) continue;
+        const int point_range_begin  = query_bin_point_offsets[query_bin_base_index + segment_first_bin_x];
+        const int point_range_end  = query_bin_point_offsets[query_bin_base_index + segment_last_bin_x + 1];
+        const int point_batch_stride = split_count * MAX_POINTS_PER_BATCH;
+        int first_point_index         = point_range_begin + split_index * MAX_POINTS_PER_BATCH;
+        if (first_point_index < point_range_end) {
+          int staged_point_count    = min(MAX_POINTS_PER_BATCH, point_range_end - first_point_index);
+          float *current_batch_values = &staged_point_values[warp_index][0][0][0];
+          float *next_batch_values = &staged_point_values[warp_index][1][0][0];
+          stage_raw_points(first_point_index, staged_point_count, lane_index,
+                            input_coordinate_x, input_coordinate_y, input_coordinate_z,
+                            input_strength_pairs, current_batch_values);
           __syncwarp();
           for (;;) {
-            for (int b = 0; b < cnt; b++)
-              stage_coeff(cur + b * STAGE, lane, nf1, nf2, nf3, coeff);
-            __syncwarp();
-            const int qn   = q0 + step;
-            const int cntn = (qn < qhi) ? min(BATCH, qhi - qn) : 0;
-            if (cntn) stage_raw(qn, cntn, lane, x, y, z, cf, nxt);
-            int b = 0;
-            for (; b + 1 < cnt; b += 2) {
-              scan_point(cur + b * STAGE, nf1, nf2, nf3, gx0, gy0, gz0, acc);
-              scan_point(cur + (b + 1) * STAGE, nf1, nf2, nf3, gx0, gy0, gz0, acc);
+            // Hoist the lane_index predicate out of the per-point coefficient loop: the
+            // 18 staging lanes run the whole batch, then all lanes meet at the sync.
+            if (lane_index < 18) {
+              float *staged_point = current_batch_values;
+              for (int staged_point_slot = 0; staged_point_slot < staged_point_count; staged_point_slot++, staged_point += VALUES_PER_POINT)
+                prepare_point_coefficients(staged_point, fine_grid_size_dimension, support_start_slot, coefficient_slot, kernel_coefficients);
             }
-            if (b < cnt) scan_point(cur + b * STAGE, nf1, nf2, nf3, gx0, gy0, gz0, acc);
             __syncwarp();
-            if (!cntn) break;
-            q0  = qn;
-            cnt = cntn;
-            float *tmp = cur;
-            cur        = nxt;
-            nxt        = tmp;
+            const int next_first_point_index   = first_point_index + point_batch_stride;
+            const int next_staged_point_count = (next_first_point_index < point_range_end) ? min(MAX_POINTS_PER_BATCH, point_range_end - next_first_point_index) : 0;
+            if (next_staged_point_count)
+              stage_raw_points(next_first_point_index, next_staged_point_count, lane_index,
+                              input_coordinate_x, input_coordinate_y, input_coordinate_z,
+                              input_strength_pairs, next_batch_values);
+
+            // One warp-wide decision per batch: if every staged point has a
+            // non-wrapping support and the warp region is interior, the whole
+            // batch uses the branch-free min/max support path. Otherwise the
+            // batch uses the general periodic path.
+            bool support_inside_grid = true;
+            if (lane_index < staged_point_count) {
+              const int *const support_start_bits = reinterpret_cast<const int *>(
+                  current_batch_values + lane_index * VALUES_PER_POINT);
+              const int support_start_x = support_start_bits[0];
+              const int support_start_y = support_start_bits[1];
+              const int support_start_z = support_start_bits[2];
+              support_inside_grid = support_start_x >= 0 && support_start_y >= 0 && support_start_z >= 0 &&
+                             support_start_x + SUPPORT_WIDTH <= fine_grid_size_x && support_start_y + SUPPORT_WIDTH <= fine_grid_size_y && support_start_z + SUPPORT_WIDTH <= fine_grid_size_z;
+            }
+            const bool whole_batch_nonwrapping = warp_region_inside_grid && __all_sync(0xffffffff, support_inside_grid);
+
+            int staged_point_slot = 0;
+            if (whole_batch_nonwrapping) {
+              for (; staged_point_slot + 1 < staged_point_count; staged_point_slot += 2) {
+                scan_one_staged_point<true>(current_batch_values + staged_point_slot * VALUES_PER_POINT, fine_grid_size_x, fine_grid_size_y, fine_grid_size_z, lane_group_x_start, lane_group_y_start, lane_group_z_start, output_cell_accumulators);
+                scan_one_staged_point<true>(current_batch_values + (staged_point_slot + 1) * VALUES_PER_POINT, fine_grid_size_x, fine_grid_size_y, fine_grid_size_z, lane_group_x_start, lane_group_y_start, lane_group_z_start, output_cell_accumulators);
+              }
+              if (staged_point_slot < staged_point_count)
+                scan_one_staged_point<true>(current_batch_values + staged_point_slot * VALUES_PER_POINT, fine_grid_size_x, fine_grid_size_y, fine_grid_size_z, lane_group_x_start, lane_group_y_start, lane_group_z_start, output_cell_accumulators);
+            } else {
+              for (; staged_point_slot + 1 < staged_point_count; staged_point_slot += 2) {
+                scan_one_staged_point<false>(current_batch_values + staged_point_slot * VALUES_PER_POINT, fine_grid_size_x, fine_grid_size_y, fine_grid_size_z, lane_group_x_start, lane_group_y_start, lane_group_z_start, output_cell_accumulators);
+                scan_one_staged_point<false>(current_batch_values + (staged_point_slot + 1) * VALUES_PER_POINT, fine_grid_size_x, fine_grid_size_y, fine_grid_size_z, lane_group_x_start, lane_group_y_start, lane_group_z_start, output_cell_accumulators);
+              }
+              if (staged_point_slot < staged_point_count)
+                scan_one_staged_point<false>(current_batch_values + staged_point_slot * VALUES_PER_POINT, fine_grid_size_x, fine_grid_size_y, fine_grid_size_z, lane_group_x_start, lane_group_y_start, lane_group_z_start, output_cell_accumulators);
+            }
+            __syncwarp();
+            if (!next_staged_point_count) break;
+            first_point_index  = next_first_point_index;
+            staged_point_count = next_staged_point_count;
+            float *temporary_batch_values = current_batch_values;
+            current_batch_values        = next_batch_values;
+            next_batch_values        = temporary_batch_values;
           }
         }
       }
     }
   }
 
-  // Unique, non-atomic store into this split's slice (split 0 only when nsplit==1).
-  const long long nf_total = (long long)nf1 * nf2 * nf3;
-  cuFloatComplex *const fw_out = fw + (long long)split * nf_total;
+  // Unique, non-atomic store into this split's slice (split_index 0 only when split_count==1).
+  const long long total_fine_grid_cells = (long long)fine_grid_size_x * fine_grid_size_y * fine_grid_size_z;
+  cuFloatComplex *const split_output_grid = output_grid + (long long)split_index * total_fine_grid_cells;
 #pragma unroll
-  for (int i = 0; i < 16; i++) {
-    const int lx = i & 1, ly = (i >> 1) & 1, lz = (i >> 2) & 3;
-    const long long gx = gx0 + lx, gy = gy0 + ly, gz = gz0 + lz;
-    if (gx < nf1 && gy < nf2 && gz < nf3) {
-      const long long idx = gx + (long long)nf1 * (gy + (long long)nf2 * gz);
-      fw_out[idx]         = make_cuFloatComplex(acc[i].x, acc[i].y);
+  for (int output_cell_index = 0; output_cell_index < 16; output_cell_index++) {
+    const int local_cell_offset_x = output_cell_index & 1;
+    const int local_cell_offset_y = (output_cell_index >> 1) & 1;
+    const int local_cell_offset_z = (output_cell_index >> 2) & 3;
+    const long long global_cell_x = lane_group_x_start + local_cell_offset_x;
+    const long long global_cell_y = lane_group_y_start + local_cell_offset_y;
+    const long long global_cell_z = lane_group_z_start + local_cell_offset_z;
+    if (global_cell_x < fine_grid_size_x &&
+        global_cell_y < fine_grid_size_y &&
+        global_cell_z < fine_grid_size_z) {
+      const long long flat_output_index =
+          global_cell_x + (long long)fine_grid_size_x *
+                              (global_cell_y +
+                               (long long)fine_grid_size_y * global_cell_z);
+      split_output_grid[flat_output_index] =
+          make_cuFloatComplex(output_cell_accumulators[output_cell_index].x,
+                              output_cell_accumulators[output_cell_index].y);
     }
+  }
+}
+
+
+// Block-wide shared staging for the split (clustered) path. Each of the four warps
+// stages a contiguous quarter of the block batch; the block then scans the whole batch
+// once per warp. The next batch is staged before scanning the current one, so the
+// coefficient work is amortized across all four warp regions without a separate phase.
+__device__ __forceinline__ void stage_block_quarter(
+    int first_point_index, int staged_point_count, int warp_index, int lane_index,
+    const float *__restrict__ input_coordinate_x,
+    const float *__restrict__ input_coordinate_y,
+    const float *__restrict__ input_coordinate_z,
+    const float2 *__restrict__ input_strength_pairs,
+    float *__restrict__ destination_batch_values, int fine_grid_size_dimension,
+    int support_start_slot, int coefficient_slot,
+    const float *__restrict__ kernel_coefficients) {
+  const int begin = (staged_point_count * warp_index) / WARPS_PER_BLOCK;
+  const int end = (staged_point_count * (warp_index + 1)) / WARPS_PER_BLOCK;
+  const int count = end - begin;
+  if (count <= 0) return;
+  stage_raw_points(first_point_index + begin, count, lane_index, input_coordinate_x,
+                   input_coordinate_y, input_coordinate_z, input_strength_pairs,
+                   destination_batch_values + begin * VALUES_PER_POINT);
+  __syncwarp();
+  if (lane_index < 18) {
+    float *staged_point = destination_batch_values + begin * VALUES_PER_POINT;
+    for (int i = 0; i < count; i++, staged_point += VALUES_PER_POINT)
+      prepare_point_coefficients(staged_point, fine_grid_size_dimension, support_start_slot,
+                                 coefficient_slot, kernel_coefficients);
+  }
+  __syncwarp();
+}
+
+// Block-shared variant: one 16x16x8 tile per block, four warp regions, one shared
+// double-buffered batch. All warps scan the block's union point stream, so the scan
+// work matches the per-warp variant when the block reread is 4x the warp reread
+// (the clustered case), while stage_coeff/stage_raw are computed once per block point.
+__global__ void spread_cartesian_owned_block_shared(
+    const float *__restrict__ input_coordinate_x,
+    const float *__restrict__ input_coordinate_y,
+    const float *__restrict__ input_coordinate_z,
+    const cuFloatComplex *__restrict__ input_strengths,
+    const int *__restrict__ query_bin_point_offsets,
+    cuFloatComplex *__restrict__ output_grid, int fine_grid_size_x, int fine_grid_size_y,
+    int fine_grid_size_z, int query_bin_count_x, int query_bin_count_y,
+    int query_bin_count_z, int query_bin_size, int output_tile_count_x,
+    int output_tile_count_y, int split_count,
+    const int *__restrict__ active_tile_indices) {
+  __shared__ __align__(16) float
+      staged_point_values[2][BLOCK_POINTS_PER_BATCH][VALUES_PER_POINT];
+
+  const int warp_index = threadIdx.x >> 5;
+  const int lane_index = threadIdx.x & 31;
+  const int active_tile_list_index = blockIdx.x / split_count;
+  const int output_tile_index = active_tile_indices[active_tile_list_index];
+  const int split_index = blockIdx.x - active_tile_list_index * split_count;
+  const int tile_z_index = output_tile_index / (output_tile_count_x * output_tile_count_y);
+  const int tile_y_index = (output_tile_index / output_tile_count_x) % output_tile_count_y;
+  const int tile_x_index = output_tile_index % output_tile_count_x;
+  const int block_x_start = tile_x_index * OUTPUT_TILE_X;
+  const int block_y_start = tile_y_index * OUTPUT_TILE_Y;
+  const int block_z_start = tile_z_index * OUTPUT_TILE_Z;
+  const int warp_region_x_start = block_x_start + (warp_index & 1) * 8;
+  const int warp_region_y_start = block_y_start + ((warp_index >> 1) & 1) * 8;
+  const int warp_region_z_start = block_z_start;
+  const bool warp_region_inside_grid =
+      (warp_region_x_start + 7 < fine_grid_size_x &&
+       warp_region_y_start + 7 < fine_grid_size_y &&
+       warp_region_z_start + 7 < fine_grid_size_z);
+  const int lane_group_x_start = warp_region_x_start + (lane_index & 3) * GROUP_SIZE_X;
+  const int lane_group_y_start = warp_region_y_start + ((lane_index >> 2) & 3) * GROUP_SIZE_Y;
+  const int lane_group_z_start = warp_region_z_start + ((lane_index >> 4) & 1) * GROUP_SIZE_Z;
+
+  float2 output_cell_accumulators[16];
+#pragma unroll
+  for (int output_cell_index = 0; output_cell_index < 16; output_cell_index++)
+    output_cell_accumulators[output_cell_index] = make_float2(0.f, 0.f);
+
+  float kernel_coefficients[9] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  const int dimension = lane_index / 6;
+  const int kernel_coefficient_index = lane_index % 6;
+  const int fine_grid_size_dimension =
+      (dimension == 0) ? fine_grid_size_x : ((dimension == 1) ? fine_grid_size_y : fine_grid_size_z);
+  const int support_start_slot = dimension;
+  const int coefficient_slot = 5 + dimension * 7 + kernel_coefficient_index;
+  if (lane_index < 18) {
+#pragma unroll
+    for (int kernel_term = 0; kernel_term < 9; kernel_term++)
+      kernel_coefficients[kernel_term] =
+          KERNEL_COEFFICIENT_TABLE[kernel_term][kernel_coefficient_index];
+  }
+
+  // Zero the pads in both shared buffers once. The block, not an individual warp,
+  // owns these buffers, so all threads cooperatively initialize them.
+  for (int buffered_point_slot = threadIdx.x;
+       buffered_point_slot < 2 * BLOCK_POINTS_PER_BATCH;
+       buffered_point_slot += blockDim.x) {
+    const int buffer = buffered_point_slot / BLOCK_POINTS_PER_BATCH;
+    const int point_slot = buffered_point_slot % BLOCK_POINTS_PER_BATCH;
+    float *const padded_staged_point = &staged_point_values[buffer][point_slot][0];
+    padded_staged_point[11] = 0.f;
+    padded_staged_point[18] = 0.f;
+    padded_staged_point[25] = 0.f;
+    padded_staged_point[26] = 0.f;
+    padded_staged_point[27] = 0.f;
+  }
+  __syncthreads();
+
+  const int query_bin_min_x =
+      floordiv(block_x_start - QUERY_BIN_HALO, query_bin_size);
+  const int query_bin_max_x =
+      (block_x_start + OUTPUT_TILE_X - 1 + QUERY_BIN_HALO) / query_bin_size;
+  const int query_bin_min_y =
+      floordiv(block_y_start - QUERY_BIN_HALO, query_bin_size);
+  const int query_bin_max_y =
+      (block_y_start + OUTPUT_TILE_Y - 1 + QUERY_BIN_HALO) / query_bin_size;
+  const int query_bin_min_z =
+      floordiv(block_z_start - QUERY_BIN_HALO, query_bin_size);
+  const int query_bin_max_z =
+      (block_z_start + OUTPUT_TILE_Z - 1 + QUERY_BIN_HALO) / query_bin_size;
+  const float2 *const input_strength_pairs =
+      reinterpret_cast<const float2 *>(input_strengths);
+
+  const int warp_query_bin_count_x =
+      min(query_bin_max_x - query_bin_min_x + 1, query_bin_count_x);
+  int wrapped_first_query_bin_x = query_bin_min_x % query_bin_count_x;
+  wrapped_first_query_bin_x += (wrapped_first_query_bin_x >> 31) & query_bin_count_x;
+  const int wrapped_last_query_bin_x =
+      wrapped_first_query_bin_x + warp_query_bin_count_x - 1;
+  for (int query_bin_y = query_bin_min_y; query_bin_y <= query_bin_max_y; query_bin_y++) {
+    int wrapped_query_bin_y = query_bin_y % query_bin_count_y;
+    wrapped_query_bin_y += (wrapped_query_bin_y >> 31) & query_bin_count_y;
+    for (int query_bin_z = query_bin_min_z; query_bin_z <= query_bin_max_z; query_bin_z++) {
+      int wrapped_query_bin_z = query_bin_z % query_bin_count_z;
+      wrapped_query_bin_z += (wrapped_query_bin_z >> 31) & query_bin_count_z;
+      const int query_bin_base_index =
+          query_bin_count_x * (wrapped_query_bin_y + query_bin_count_y * wrapped_query_bin_z);
+      for (int x_segment_index = 0; x_segment_index < 2; ++x_segment_index) {
+        const int segment_first_bin_x =
+            (x_segment_index == 0) ? wrapped_first_query_bin_x : 0;
+        const int segment_last_bin_x =
+            (x_segment_index == 0)
+                ? min(wrapped_last_query_bin_x, query_bin_count_x - 1)
+                : (wrapped_last_query_bin_x - query_bin_count_x);
+        if (segment_last_bin_x < segment_first_bin_x) continue;
+        const int point_range_begin =
+            query_bin_point_offsets[query_bin_base_index + segment_first_bin_x];
+        const int point_range_end =
+            query_bin_point_offsets[query_bin_base_index + segment_last_bin_x + 1];
+        const int point_batch_stride = split_count * BLOCK_POINTS_PER_BATCH;
+        int first_point_index = point_range_begin + split_index * BLOCK_POINTS_PER_BATCH;
+        if (first_point_index >= point_range_end) continue;
+
+        int staged_point_count =
+            min(BLOCK_POINTS_PER_BATCH, point_range_end - first_point_index);
+        float *current_batch_values = &staged_point_values[0][0][0];
+        float *next_batch_values = &staged_point_values[1][0][0];
+        stage_block_quarter(first_point_index, staged_point_count, warp_index, lane_index,
+                            input_coordinate_x, input_coordinate_y, input_coordinate_z,
+                            input_strength_pairs, current_batch_values,
+                            fine_grid_size_dimension, support_start_slot, coefficient_slot,
+                            kernel_coefficients);
+        __syncthreads();
+
+        for (;;) {
+          const int next_first_point_index = first_point_index + point_batch_stride;
+          const int next_staged_point_count =
+              (next_first_point_index < point_range_end)
+                  ? min(BLOCK_POINTS_PER_BATCH, point_range_end - next_first_point_index)
+                  : 0;
+          if (next_staged_point_count)
+            stage_block_quarter(next_first_point_index, next_staged_point_count, warp_index,
+                                lane_index, input_coordinate_x, input_coordinate_y,
+                                input_coordinate_z, input_strength_pairs,
+                                next_batch_values, fine_grid_size_dimension,
+                                support_start_slot, coefficient_slot,
+                                kernel_coefficients);
+
+          bool support_inside_grid = true;
+          if (lane_index < staged_point_count) {
+            const int *const support_start_bits =
+                reinterpret_cast<const int *>(current_batch_values) +
+                lane_index * VALUES_PER_POINT;
+            const int support_start_x = support_start_bits[0];
+            const int support_start_y = support_start_bits[1];
+            const int support_start_z = support_start_bits[2];
+            support_inside_grid =
+                support_start_x >= 0 && support_start_y >= 0 && support_start_z >= 0 &&
+                support_start_x + SUPPORT_WIDTH <= fine_grid_size_x &&
+                support_start_y + SUPPORT_WIDTH <= fine_grid_size_y &&
+                support_start_z + SUPPORT_WIDTH <= fine_grid_size_z;
+          }
+          const bool whole_batch_nonwrapping =
+              warp_region_inside_grid && __all_sync(0xffffffff, support_inside_grid);
+
+          int staged_point_slot = 0;
+          if (whole_batch_nonwrapping) {
+            for (; staged_point_slot + 1 < staged_point_count; staged_point_slot += 2) {
+              scan_one_staged_point<true>(
+                  current_batch_values + staged_point_slot * VALUES_PER_POINT,
+                  fine_grid_size_x, fine_grid_size_y, fine_grid_size_z,
+                  lane_group_x_start, lane_group_y_start, lane_group_z_start,
+                  output_cell_accumulators);
+              scan_one_staged_point<true>(
+                  current_batch_values + (staged_point_slot + 1) * VALUES_PER_POINT,
+                  fine_grid_size_x, fine_grid_size_y, fine_grid_size_z,
+                  lane_group_x_start, lane_group_y_start, lane_group_z_start,
+                  output_cell_accumulators);
+            }
+            if (staged_point_slot < staged_point_count)
+              scan_one_staged_point<true>(
+                  current_batch_values + staged_point_slot * VALUES_PER_POINT,
+                  fine_grid_size_x, fine_grid_size_y, fine_grid_size_z,
+                  lane_group_x_start, lane_group_y_start, lane_group_z_start,
+                  output_cell_accumulators);
+          } else {
+            for (; staged_point_slot + 1 < staged_point_count; staged_point_slot += 2) {
+              scan_one_staged_point<false>(
+                  current_batch_values + staged_point_slot * VALUES_PER_POINT,
+                  fine_grid_size_x, fine_grid_size_y, fine_grid_size_z,
+                  lane_group_x_start, lane_group_y_start, lane_group_z_start,
+                  output_cell_accumulators);
+              scan_one_staged_point<false>(
+                  current_batch_values + (staged_point_slot + 1) * VALUES_PER_POINT,
+                  fine_grid_size_x, fine_grid_size_y, fine_grid_size_z,
+                  lane_group_x_start, lane_group_y_start, lane_group_z_start,
+                  output_cell_accumulators);
+            }
+            if (staged_point_slot < staged_point_count)
+              scan_one_staged_point<false>(
+                  current_batch_values + staged_point_slot * VALUES_PER_POINT,
+                  fine_grid_size_x, fine_grid_size_y, fine_grid_size_z,
+                  lane_group_x_start, lane_group_y_start, lane_group_z_start,
+                  output_cell_accumulators);
+          }
+
+          __syncthreads();
+          if (!next_staged_point_count) break;
+          first_point_index = next_first_point_index;
+          staged_point_count = next_staged_point_count;
+          float *temporary_batch_values = current_batch_values;
+          current_batch_values = next_batch_values;
+          next_batch_values = temporary_batch_values;
+        }
+      }
+    }
+  }
+
+  const long long total_fine_grid_cells =
+      (long long)fine_grid_size_x * fine_grid_size_y * fine_grid_size_z;
+  cuFloatComplex *const split_output_grid =
+      output_grid + (long long)split_index * total_fine_grid_cells;
+#pragma unroll
+  for (int output_cell_index = 0; output_cell_index < 16; output_cell_index++) {
+    const int local_cell_offset_x = output_cell_index & 1;
+    const int local_cell_offset_y = (output_cell_index >> 1) & 1;
+    const int local_cell_offset_z = (output_cell_index >> 2) & 3;
+    const long long global_cell_x = lane_group_x_start + local_cell_offset_x;
+    const long long global_cell_y = lane_group_y_start + local_cell_offset_y;
+    const long long global_cell_z = lane_group_z_start + local_cell_offset_z;
+    if (global_cell_x < fine_grid_size_x && global_cell_y < fine_grid_size_y &&
+        global_cell_z < fine_grid_size_z) {
+      const long long flat_output_index =
+          global_cell_x + (long long)fine_grid_size_x *
+                              (global_cell_y + (long long)fine_grid_size_y * global_cell_z);
+      split_output_grid[flat_output_index] =
+          make_cuFloatComplex(output_cell_accumulators[output_cell_index].x,
+                              output_cell_accumulators[output_cell_index].y);
+    }
+  }
+}
+
+
+// Sum only the cells of active tiles. Inactive tiles are zeroed once by the host.
+// This cuts the split-reduction traffic for clustered inputs from nsplit*full-grid
+// to nsplit*active-tile-cells (16/128 tiles in the mandatory clustered case).
+__global__ void kernel_sum_splits_active(
+    const cuFloatComplex *__restrict__ part, int nsplit, long long nf,
+    cuFloatComplex *__restrict__ fw, const int *__restrict__ tile_ids, int tile_count,
+    int tiles_x, int tiles_y, int nf1, int nf2, int nf3) {
+  const int cells_per_tile = OUTPUT_TILE_X * OUTPUT_TILE_Y * OUTPUT_TILE_Z;
+  const long long total_cells = (long long)tile_count * cells_per_tile;
+  for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total_cells;
+       i += (long long)blockDim.x * gridDim.x) {
+    const int tile_slot = (int)(i / cells_per_tile);
+    const int local_cell = (int)(i - (long long)tile_slot * cells_per_tile);
+    const int tile = tile_ids[tile_slot];
+    const int tz = tile / (tiles_x * tiles_y);
+    const int ty = (tile / tiles_x) % tiles_y;
+    const int tx = tile % tiles_x;
+    const int local_x = local_cell % OUTPUT_TILE_X;
+    const int local_y = (local_cell / OUTPUT_TILE_X) % OUTPUT_TILE_Y;
+    const int local_z = local_cell / (OUTPUT_TILE_X * OUTPUT_TILE_Y);
+    const int gx = tx * OUTPUT_TILE_X + local_x;
+    const int gy = ty * OUTPUT_TILE_Y + local_y;
+    const int gz = tz * OUTPUT_TILE_Z + local_z;
+    if (gx >= nf1 || gy >= nf2 || gz >= nf3) continue;
+    const long long idx = (long long)gx + (long long)nf1 * (gy + (long long)nf2 * gz);
+    const float2 *const p = reinterpret_cast<const float2 *>(part);
+    float2 acc = p[idx];
+    for (int k = 1; k < nsplit; ++k) {
+      const float2 v = p[(long long)k * nf + idx];
+      acc.x += v.x;
+      acc.y += v.y;
+    }
+    fw[idx] = make_cuFloatComplex(acc.x, acc.y);
   }
 }
 
@@ -451,6 +895,59 @@ __global__ void kernel_sum_splits(const cuFloatComplex *__restrict__ part, int n
     }
     fw[i] = make_cuFloatComplex(acc.x, acc.y);
   }
+}
+
+
+// Block-level candidate-read count for the active tile list. One warp per active tile;
+// the bin enumeration mirrors the block-shared spread kernel's x-run walk, so the sum
+// is exactly the number of point stages a block-shared launch would perform.
+__global__ void kernel_block_visits(
+    const int *__restrict__ binstart, int nqx, int nqy, int nqz, int qb,
+    int tiles_x, int tiles_y, const int *__restrict__ tile_ids, int tile_count,
+    unsigned long long *__restrict__ block_visits) {
+  const int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (wid >= tile_count) return;
+  const int tile = tile_ids[wid];
+  const int tz = tile / (tiles_x * tiles_y);
+  const int ty = (tile / tiles_x) % tiles_y;
+  const int tx = tile % tiles_x;
+  const int block_x_start = tx * OUTPUT_TILE_X;
+  const int block_y_start = ty * OUTPUT_TILE_Y;
+  const int block_z_start = tz * OUTPUT_TILE_Z;
+  const int bx0 = floordiv(block_x_start - QUERY_BIN_HALO, qb);
+  const int bx1 = (block_x_start + OUTPUT_TILE_X - 1 + QUERY_BIN_HALO) / qb;
+  const int by0 = floordiv(block_y_start - QUERY_BIN_HALO, qb);
+  const int by1 = (block_y_start + OUTPUT_TILE_Y - 1 + QUERY_BIN_HALO) / qb;
+  const int bz0 = floordiv(block_z_start - QUERY_BIN_HALO, qb);
+  const int bz1 = (block_z_start + OUTPUT_TILE_Z - 1 + QUERY_BIN_HALO) / qb;
+  const int nx = min(bx1 - bx0 + 1, nqx);
+  int wlo = bx0 % nqx;
+  wlo += (wlo >> 31) & nqx;
+  const int wend = wlo + nx - 1;
+  const int ny = by1 - by0 + 1;
+  const int nz = bz1 - bz0 + 1;
+  const int ynz = ny * nz;
+  unsigned long long v = 0;
+  for (int idx = lane; idx < ynz; idx += 32) {
+    int t = idx;
+    const int iy = t / nz;
+    const int iz = t - iy * nz;
+    int wy = (by0 + iy) % nqy;
+    wy += (wy >> 31) & nqy;
+    int wz = (bz0 + iz) % nqz;
+    wz += (wz >> 31) & nqz;
+    const int base = nqx * (wy + nqy * wz);
+    const int x0 = wlo;
+    const int x1 = min(wend, nqx - 1);
+    if (x1 >= x0) v += (unsigned long long)(binstart[base + x1 + 1] - binstart[base + x0]);
+    const int x2 = 0;
+    const int x3 = wend - nqx;
+    if (x3 >= x2) v += (unsigned long long)(binstart[base + x3 + 1] - binstart[base + x2]);
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
+  if (lane == 0) block_visits[wid] = v;
 }
 
 // ---------------------------------------------------------------------------
@@ -667,18 +1164,57 @@ int main(int argc, char **argv) {
   const double preprocess_ms = pre_ms[pre_ms.size() / 2];
 
   // ---- new spread kernel ----
-  const int tiles_x = (N1 + TILE_X - 1) / TILE_X;
-  const int tiles_y = (N2 + TILE_Y - 1) / TILE_Y;
-  const int tiles_z = (N3 + TILE_Z - 1) / TILE_Z;
+  const int tiles_x = (N1 + OUTPUT_TILE_X - 1) / OUTPUT_TILE_X;
+  const int tiles_y = (N2 + OUTPUT_TILE_Y - 1) / OUTPUT_TILE_Y;
+  const int tiles_z = (N3 + OUTPUT_TILE_Z - 1) / OUTPUT_TILE_Z;
   const int ntiles  = tiles_x * tiles_y * tiles_z;
 
-  // ---- candidate visits / active warps (untimed) and split decision ----
-  const int nwarps_total = ntiles * NWARPS;
-  unsigned long long *d_visits, *d_active;
+  // ---- metadata: visits, active warps, active tile list, split decision ----
+  // Timed separately as meta_ms; not part of the spread kernel's CUDA-event interval.
+  const auto meta_t0 = std::chrono::steady_clock::now();
+  const int nwarps_total = ntiles * WARPS_PER_BLOCK;
+  unsigned long long *d_visits, *d_active, *d_block_visits;
+  int *d_tile_ids = nullptr, *d_tile_count = nullptr;
   CU(cudaMalloc(&d_visits, nwarps_total * sizeof(unsigned long long)));
   CU(cudaMalloc(&d_active, nwarps_total * sizeof(unsigned long long)));
-  kernel_visits<<<(nwarps_total + 255) / 256, 256>>>(d_binstart, nqx, nqy, nqz, N1, N2, N3,
-                                                     qb, tiles_x, tiles_y, d_visits, d_active);
+  CU(cudaMalloc(&d_block_visits, ntiles * sizeof(unsigned long long)));
+  CU(cudaMalloc(&d_tile_ids, ntiles * sizeof(int)));
+  CU(cudaMalloc(&d_tile_count, sizeof(int)));
+  cudaEvent_t mv0, mv1, mv2, bv0, bv1;
+  CU(cudaEventCreate(&mv0));
+  CU(cudaEventCreate(&mv1));
+  CU(cudaEventCreate(&mv2));
+  CU(cudaEventCreate(&bv0));
+  CU(cudaEventCreate(&bv1));
+  CU(cudaEventRecord(mv0));
+  nvtxRangePushA("kernel_visits");
+  kernel_visits<<<(nwarps_total + 7) / 8, 256>>>(d_binstart, nqx, nqy, nqz, N1, N2, N3,
+                                                 qb, tiles_x, tiles_y, d_visits, d_active);
+  nvtxRangePop();
+  CU(cudaEventRecord(mv1));
+  nvtxRangePushA("kernel_compact_tiles");
+  kernel_compact_tiles<<<1, 1>>>(d_active, ntiles, d_tile_ids, d_tile_count);
+  nvtxRangePop();
+  CU(cudaEventRecord(mv2));
+  int h_tile_count = 0;
+  CU(cudaMemcpy(&h_tile_count, d_tile_count, sizeof(int), cudaMemcpyDeviceToHost));
+  unsigned long long h_block_visits = 0;
+  float blockvisits_ms = 0.f;
+  if (h_tile_count > 0) {
+    CU(cudaEventRecord(bv0));
+    nvtxRangePushA("kernel_block_visits");
+    kernel_block_visits<<<(h_tile_count + 7) / 8, 256>>>(
+        d_binstart, nqx, nqy, nqz, qb, tiles_x, tiles_y, d_tile_ids, h_tile_count,
+        d_block_visits);
+    nvtxRangePop();
+    CU(cudaEventRecord(bv1));
+    std::vector<unsigned long long> hb_block_visits(h_tile_count);
+    CU(cudaMemcpy(hb_block_visits.data(), d_block_visits,
+                  h_tile_count * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    for (int tile_slot = 0; tile_slot < h_tile_count; tile_slot++)
+      h_block_visits += hb_block_visits[tile_slot];
+    CU(cudaEventElapsedTime(&blockvisits_ms, bv0, bv1));
+  }
   std::vector<unsigned long long> hb_visits(nwarps_total), hb_active(nwarps_total);
   CU(cudaMemcpy(hb_visits.data(), d_visits, nwarps_total * sizeof(unsigned long long),
                 cudaMemcpyDeviceToHost));
@@ -689,11 +1225,40 @@ int main(int argc, char **argv) {
     h_visits += hb_visits[b];
     h_active += hb_active[b];
   }
+  float visits_ms = 0.f, compact_ms = 0.f;
+  CU(cudaEventElapsedTime(&visits_ms, mv0, mv1));
+  CU(cudaEventElapsedTime(&compact_ms, mv1, mv2));
+  CU(cudaEventDestroy(mv0));
+  CU(cudaEventDestroy(mv1));
+  CU(cudaEventDestroy(mv2));
+  CU(cudaEventDestroy(bv0));
+  CU(cudaEventDestroy(bv1));
   // Split only when few warp regions are active (clustered input): raise the number of
   // work items until ~256 warps are in flight. Each split owns a subset of the bins and
   // writes its own partial grid; the reduction sums them.
+  // The original target stops clustered at 8 splits (64 active tile-warps * 8 = 512).
+  // For low-occupancy clustered inputs, use a higher target so the active tiles are
+  // split further; leave uniform/sparse at their existing single-split configuration.
+  const long long split_target = (h_active < 512) ? 2048 : 512;
   int nsplit = 1;
-  while (nsplit < 8 && (long long)h_active * nsplit < 512) nsplit <<= 1;
+  while (nsplit < 32 && (long long)h_active * nsplit < split_target) nsplit <<= 1;
+  const char *block_share_env = std::getenv("EXP_A_BLOCK_SHARED");
+  // Block sharing is selected from measured candidate reads, not from nsplit or the
+  // distribution name: four warps scan each block point, so it is safe only when
+  // 4 * block_visits <= warp_visits (5% margin for noise). This enables clustered
+  // (8.0M vs 8.0M) and disables uniform (13.2M vs 5.4M) / sparse (18.0M vs 8.0M).
+  const bool auto_block_shared =
+      h_tile_count > 0 &&
+      (unsigned long long)WARPS_PER_BLOCK * h_block_visits * 100 <=
+          h_visits * 105;
+  const bool use_block_shared =
+      block_share_env ? (std::atoi(block_share_env) != 0) : auto_block_shared;
+  // nsplit remains only a performance knob. Block-shared staging halves the per-split
+  // stage cost, so its measured knee is 56; uniform/sparse remain at nsplit=1.
+  if (use_block_shared && nsplit > 1) nsplit = 56;
+  const double meta_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - meta_t0)
+                             .count();
   cuFloatComplex *dfk_part = nullptr;
   if (nsplit > 1) CU(cudaMalloc(&dfk_part, (long long)nsplit * nf * sizeof(cuFloatComplex)));
 
@@ -704,11 +1269,30 @@ int main(int argc, char **argv) {
   for (int r = -2; r < nrun; r++) {
     CU(cudaEventRecord(e0));
     nvtxRangePushA(nsplit > 1 ? "spread_cartesian_owned_split" : "spread_cartesian_owned");
-    spread_cartesian_owned<<<ntiles * nsplit, NTHREAD>>>(
-        d_sx, d_sy, d_sz, d_sc, d_binstart, nsplit > 1 ? dfk_part : dfk_new, N1, N2, N3, nqx,
-        nqy, nqz, qb, tiles_x, tiles_y, nsplit);
-    if (nsplit > 1)
-      kernel_sum_splits<<<(int)((nf + 255) / 256), 256>>>(dfk_part, nsplit, nf, dfk_new);
+    if (use_block_shared) {
+      spread_cartesian_owned_block_shared<<<h_tile_count * nsplit, THREADS_PER_BLOCK>>>(
+          d_sx, d_sy, d_sz, d_sc, d_binstart, nsplit > 1 ? dfk_part : dfk_new, N1, N2, N3,
+          nqx, nqy, nqz, qb, tiles_x, tiles_y, nsplit, d_tile_ids);
+    } else {
+      spread_cartesian_owned<<<h_tile_count * nsplit, THREADS_PER_BLOCK>>>(
+          d_sx, d_sy, d_sz, d_sc, d_binstart, nsplit > 1 ? dfk_part : dfk_new, N1, N2, N3, nqx,
+          nqy, nqz, qb, tiles_x, tiles_y, nsplit, d_tile_ids);
+    }
+    if (nsplit > 1) {
+      const char *active_reduce_env = std::getenv("EXP_A_ACTIVE_REDUCE");
+      const bool active_reduce = active_reduce_env ? (std::atoi(active_reduce_env) != 0) : true;
+      if (active_reduce) {
+        CU(cudaMemsetAsync(dfk_new, 0, (size_t)nf * sizeof(cuFloatComplex)));
+        const long long active_cells = (long long)h_tile_count * OUTPUT_TILE_X *
+                                       OUTPUT_TILE_Y * OUTPUT_TILE_Z;
+        if (active_cells > 0)
+          kernel_sum_splits_active<<<(int)((active_cells + 255) / 256), 256>>>(
+              dfk_part, nsplit, nf, dfk_new, d_tile_ids, h_tile_count, tiles_x, tiles_y,
+              N1, N2, N3);
+      } else {
+        kernel_sum_splits<<<(int)((nf + 255) / 256), 256>>>(dfk_part, nsplit, nf, dfk_new);
+      }
+    }
     nvtxRangePop();
     CU(cudaEventRecord(e1));
     CU(cudaEventSynchronize(e1));
@@ -737,10 +1321,16 @@ int main(int argc, char **argv) {
   const double relL2 = std::sqrt(num / den);
   // ---- kernel attributes ----
   cudaFuncAttributes attr;
-  CU(cudaFuncGetAttributes(&attr, spread_cartesian_owned));
   int blocks_per_sm = 0;
-  CU(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, spread_cartesian_owned,
-                                                   NTHREAD, 0));
+  if (use_block_shared) {
+    CU(cudaFuncGetAttributes(&attr, spread_cartesian_owned_block_shared));
+    CU(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, spread_cartesian_owned_block_shared, THREADS_PER_BLOCK, 0));
+  } else {
+    CU(cudaFuncGetAttributes(&attr, spread_cartesian_owned));
+    CU(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, spread_cartesian_owned,
+                                                     THREADS_PER_BLOCK, 0));
+  }
 
   std::printf("case=M%d nf=%dx%dx%d cluster=%d qb=%d\n", M, N1, N2, N3, cluster, qb);
   std::printf("ref   method=3 setpts=%.3f ms exec=%.3f ms total=%.3f ms\n", t3.setpts_ms,
@@ -749,14 +1339,17 @@ int main(int argc, char **argv) {
               t4.exec_ms, t4.total_ms);
   std::printf("ctx   method=1 setpts=%.3f ms exec=%.3f ms total=%.3f ms\n", t1.setpts_ms,
               t1.exec_ms, t1.total_ms);
-  std::printf("new   qbins=%d^3 bins=%d prep=%s preprocess=%.3f ms spread=%.3f ms total=%.3f ms nsplit=%d\n",
-              nqx, nbins, prep == 0 ? "count" : "radix", preprocess_ms, new_ms_med,
-              preprocess_ms + new_ms_med, nsplit);
+  std::printf("new   qbins=%d^3 bins=%d prep=%s preprocess=%.3f ms visits=%.3f ms compact=%.3f ms blockvisits=%.3f ms meta=%.3f ms setup=%.3f ms spread=%.3f ms total=%.3f ms nsplit=%d tiles=%d/%d block_share=%d\n",
+              nqx, nbins, prep == 0 ? "count" : "radix", preprocess_ms, visits_ms,
+              compact_ms, blockvisits_ms, meta_ms, preprocess_ms + meta_ms, new_ms_med,
+              preprocess_ms + meta_ms + new_ms_med, nsplit, h_tile_count, ntiles,
+              (int)use_block_shared);
   std::printf("new   speedup_vs_m3_spread=%.2fx spread_ratio=%.3f total_ratio=%.3f\n",
               t3.exec_ms / new_ms_med, new_ms_med / t3.exec_ms,
-              (preprocess_ms + new_ms_med) / t3.total_ms);
-  std::printf("new   relL2=%.3e maxabs=%.3e visits=%llu reread_factor=%.2f active_warps=%llu/%d regs=%d smem=%zu occ_blocks_per_sm=%d\n",
-              relL2, maxabs, h_visits, (double)h_visits / (double)M, h_active, nwarps_total,
+              (preprocess_ms + meta_ms + new_ms_med) / t3.total_ms);
+  std::printf("new   relL2=%.3e maxabs=%.3e visits=%llu reread_factor=%.2f block_visits=%llu block_reread=%.2f active_warps=%llu/%d regs=%d smem=%zu occ_blocks_per_sm=%d\n",
+              relL2, maxabs, h_visits, (double)h_visits / (double)M, h_block_visits,
+              (double)h_block_visits / (double)M, h_active, nwarps_total,
               attr.numRegs, attr.sharedSizeBytes, blocks_per_sm);
   return 0;
 }

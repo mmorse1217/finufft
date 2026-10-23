@@ -4,26 +4,33 @@
     ncu --import spread_ncu.ncu-rep --page source --print-source cuda,sass --csv \
         > spread_ncu_source_cuda_sass.csv
     python3 ncu_samples_to_chrome.py spread_ncu_source_cuda_sass.csv out.json \
-        --kernel-us 21650
+        --kernel-us 16590 [--text out.txt]
 
-The trace is a three/four-level stack that mirrors the real (inlined) call structure:
+Important: Nsight Compute PC sampling is *flat*. It attributes samples to a SASS
+instruction and, with `-lineinfo`, to a source line. It does not record a device call
+stack, and the kernel's device functions are inlined, so there is no runtime stack to
+recover. `.nsys-rep` is a timeline (kernel/API events), not a call-stack trace either.
+
+What this script does is apply the **static call graph from the source** to the flat
+sample attribution. The resulting hierarchy is:
 
     spread_cartesian_owned                     kernel
-      stage_raw                                inlined device function
-        <source line>
-      stage_coeff                              inlined device function
-        fold_rescale / cudaFMA                 helper inlined into stage_coeff
-          <source line>
-        <source line>
-      dim_support                              inlined device function
-        <source line>
-      kernel body: <phase>                     inline code, grouped (not a function)
-        <source line>
+      kernel body: batch loop + scan calls     inline code
+        stage_raw_points                       inlined device function
+          __ldg                                intrinsic inlined into stage_raw_points
+        prepare_point_coefficients             inlined device function
+          fold_rescale                         helper inlined into prepare_point_coefficients
+            cudaFMA                            helper inlined into fold_rescale
+        scan_one_staged_point                  inlined device function
+          place_support                        helper inlined into scan_one_staged_point
+        __syncwarp                             intrinsic inlined into the batch loop
+      kernel body: x-run bin loop              inline code
+      kernel body: final store                 inline code
 
-Widths are PC-sampling samples rescaled so the root is the measured kernel duration. It
-is an attribution view (children partition their parent's samples), not a wall-clock
-timeline; the stack levels *are* the real call structure, but the widths are samples, not
-self time. `kernel body: ...` groups are inline code, labelled as such.
+A parent's width is its own samples plus all descendants' samples, so `scan_point`
+includes `dim_support`. This is an attribution view, not a wall-clock timeline; the
+stack levels are the source call structure, while widths are PC samples scaled to the
+measured kernel duration. `kernel body: ...` frames are inline code, not functions.
 """
 
 import csv
@@ -31,76 +38,126 @@ import json
 import sys
 from collections import defaultdict
 
-# Function ranges in devel/morton_spread/exp_a_cartesian.cu (current kernel).
-# Function ranges in devel/morton_spread/exp_a_cartesian.cu (current kernel).
+# Leaf frames in devel/morton_spread/exp_a_cartesian.cu (current refactored v11ab kernel).
+# These are the source ranges whose samples belong to that function/group.
 FUNC_RANGES = [
-    (198, 214, "stage_raw"),
-    (220, 236, "stage_coeff"),
-    (241, 255, "dim_support"),
-    (259, 297, "scan_point"),
-    (328, 335, "kernel body: coefficient preload"),
-    (341, 352, "kernel body: bin loop"),
-    (353, 359, "kernel body: batch staging"),
-    (360, 365, "kernel body: scan calls"),
-    (366, 366, "kernel body: syncwarp"),
-    (372, 383, "kernel body: final store"),
+    (258, 275, "stage_raw_points"),
+    (283, 303, "prepare_point_coefficients"),
+    (308, 322, "place_support"),
+    (327, 334, "place_support_nowrap"),
+    (339, 386, "scan_one_staged_point"),
+    # Per-warp kernel body (spread_cartesian_owned).
+    (423, 436, "kernel body: coefficient preload"),
+    (438, 479, "kernel body: x-run bin loop"),
+    (480, 550, "kernel body: batch loop + scan calls"),
+    (552, 575, "kernel body: final store"),
+    # Block-shared clustered kernel body (spread_cartesian_owned_block_shared).
+    (582, 606, "stage_block_quarter"),
+    (623, 681, "kernel body: block setup/preload"),
+    (683, 731, "kernel body: block x-run bin loop"),
+    (732, 818, "kernel body: block batch loop + scan calls"),
+    (823, 845, "kernel body: block final store"),
 ]
 
-# Header files: (function they are inlined into, helper name)
-HEADER_FUNCS = {
-    "spreadinterp.hpp": ("stage_coeff", "fold_rescale"),
-    "sm_30_intrinsics.hpp": ("kernel body: syncwarp", "__syncwarp"),
-    "sm_32_intrinsics.hpp": ("stage_raw", "__ldg"),
+# Static source call graph. The values are children in source/call order. Frames
+# not listed as children of anything are top-level kernel-body groups.
+CHILDREN = {
+    "spread_cartesian_owned": [
+        "kernel body: coefficient preload",
+        "kernel body: x-run bin loop",
+        "kernel body: batch loop + scan calls",
+        "kernel body: final store",
+        "kernel body: other",
+    ],
+    "spread_cartesian_owned_block_shared": [
+        "kernel body: block setup/preload",
+        "kernel body: block x-run bin loop",
+        "kernel body: block batch loop + scan calls",
+        "kernel body: block final store",
+        "kernel body: other",
+    ],
+    "kernel body: batch loop + scan calls": [
+        "stage_raw_points",
+        "prepare_point_coefficients",
+        "scan_one_staged_point",
+        "__syncwarp",
+    ],
+    "kernel body: block batch loop + scan calls": [
+        "stage_block_quarter",
+        "scan_one_staged_point",
+        "__syncthreads",
+    ],
+    "stage_block_quarter": [
+        "stage_raw_points",
+        "prepare_point_coefficients",
+        "__syncwarp",
+    ],
+    "stage_raw_points": ["__ldg"],
+    "prepare_point_coefficients": ["fold_rescale"],
+    "fold_rescale": ["cudaFMA"],
+    "scan_one_staged_point": ["place_support", "place_support_nowrap"],
 }
+
+# Header-file leaves. These files are inlined into the kernel; the CSV has no
+# inlined call stack, only the header source line (sometimes no line at all).
+def header_leaf(file, line, src=""):
+    if file == "spreadinterp.hpp":
+        # cudaFMA body is one line; fold_rescale is the surrounding helper.
+        if line == 47:
+            return "cudaFMA"
+        return "fold_rescale"
+    if file == "sm_30_intrinsics.hpp":
+        if "__syncthreads" in src:
+            return "__syncthreads"
+        return "__syncwarp"
+    if file == "sm_32_intrinsics.hpp":
+        return "__ldg"
+    return "kernel body: other"
+
 
 # Source-line labels (fall back to the source text).
 SHORT_LABEL = {
-    198: "stage_raw()",
-    207: "load x/y/z/strength",
-    220: "stage_coeff()",
-    227: "fold_rescale",
-    228: "support start ceil",
-    229: "zz rescale",
-    230: "write support start",
-    233: "8x Horner (register coeffs)",
-    234: "write kernel coefficient",
-    241: "dim_support()",
-    244: "wrap d<0",
-    245: "wrap d>=nf",
-    249: "low test",
-    252: "n select",
-    253: "j0 select",
-    254: "l0 select",
-    259: "scan_point()",
-    262: "load s (float4) + strength",
-    269: "early-out",
-    282: "wxy product",
-    287: "weight product",
-    288: "acc x",
-    293: "acc y",
-    328: "coeff preload",
-    332: "load 9 coefficients",
-    341: "bin loop ix",
-    344: "bin loop iy",
-    347: "bin loop iz",
-    349: "bin index",
-    350: "binstart loads",
-    353: "batch loop (split stride)",
-    355: "stage_raw call",
-    357: "coeff pass",
-    358: "stage_coeff call",
-    360: "scan call loop",
-    362: "scan_point(b)",
-    363: "scan_point(b+1)",
-    365: "scan_point(tail)",
-    366: "syncwarp",
-    376: "final store loop",
-    379: "store guard",
-    381: "store",
+    268: "stage x (ldg + shared store)",
+    269: "stage y (shared store)",
+    270: "stage z (shared store)",
+    271: "load strength (float2)",
+    272: "stage strength re",
+    273: "stage strength im",
+    289: "fold_rescale",
+    291: "support start ceil (float)",
+    292: "support start int",
+    294: "horner argument",
+    296: "write support start",
+    300: "8x Horner",
+    302: "write kernel coeff",
+    310: "relative support start",
+    311: "wrap relative start",
+    316: "below_group test",
+    317: "wraps_high test",
+    318: "wrapped cell count",
+    319: "group cell count select",
+    320: "coefficient offset select",
+    321: "local cell offset select",
+    329: "intersection begin",
+    330: "intersection end",
+    331: "group cell count",
+    332: "coefficient offset",
+    333: "local cell offset",
+    591: "quarter begin",
+    592: "quarter end",
+    595: "stage raw quarter",
+    602: "prepare coefficients",
+    605: "quarter syncwarp",
+    681: "initial block sync",
+    732: "stage current batch",
+    737: "publish current batch",
+    746: "stage next batch",
+    811: "publish next batch / end scan",
 }
 
 
 def parse(path):
+    """Return {(file, line): {src, samples, inst, stalls}} from an ncu source CSV."""
     rows = list(csv.reader(open(path, newline="")))
     file = None
     line = None
@@ -149,16 +206,62 @@ def parse(path):
     return per
 
 
-def func_of(file, line):
+def leaf_of(file, line, src=""):
+    """Classify one source line into the leaf frame it belongs to."""
     if file == "exp_a_cartesian.cu":
         for lo, hi, name in FUNC_RANGES:
             if line is not None and lo <= line <= hi:
-                return name, None
-        return "kernel body: other", None
-    if file in HEADER_FUNCS:
-        func, helper = HEADER_FUNCS[file]
-        return func, helper
-    return "other", None
+                return name
+        return "kernel body: other"
+    return header_leaf(file, line, src)
+
+
+def build_tree(per_line, root):
+    """Return (self_samples, total_samples, lines) for one kernel root.
+
+    `lines[leaf]` holds the source rows that belong directly to that frame;
+    samples from descendants are aggregated into `total_samples` through the
+    static call graph rooted at `root`, never duplicated into `self_samples`.
+    Shared leaf names (stage_raw_points, prepare_point_coefficients, ...) are
+    attached to different parents depending on the selected kernel.
+    """
+    reachable = set()
+    def visit(frame):
+        if frame in reachable:
+            return
+        reachable.add(frame)
+        for kid in CHILDREN.get(frame, []):
+            visit(kid)
+    visit(root)
+
+    self_samples = defaultdict(int)
+    lines = defaultdict(list)
+    for (file, line), rec in per_line.items():
+        leaf = leaf_of(file, line, rec.get("src", ""))
+        if leaf not in reachable:
+            continue
+        self_samples[leaf] += rec["samples"]
+        lines[leaf].append((file, line, rec))
+
+    # Include zero-sample frames so the hierarchy stays visible.
+    for frame in reachable:
+        self_samples.setdefault(frame, 0)
+
+    total = dict(self_samples)
+    changed = True
+    while changed:  # Tree is shallow; simple fixed-point aggregation.
+        changed = False
+        for parent in reachable:
+            kids = CHILDREN.get(parent, [])
+            candidate = self_samples[parent] + sum(total.get(k, 0) for k in kids
+                                                    if k in reachable)
+            if candidate != total.get(parent, 0):
+                total[parent] = candidate
+                changed = True
+
+    for leaf in lines:
+        lines[leaf].sort(key=lambda e: (e[0], e[1] if e[1] is not None else -1))
+    return self_samples, total, lines
 
 
 def main() -> None:
@@ -169,24 +272,26 @@ def main() -> None:
     kernel_us = 21650.0
     if "--kernel-us" in sys.argv:
         kernel_us = float(sys.argv[sys.argv.index("--kernel-us") + 1])
+    text_out = None
+    if "--text" in sys.argv:
+        text_out = sys.argv[sys.argv.index("--text") + 1]
+    root = "spread_cartesian_owned"
+    if "--root" in sys.argv:
+        root = sys.argv[sys.argv.index("--root") + 1]
 
     per_line = parse(src)
-    total = sum(v["samples"] for v in per_line.values())
-    if not total:
+    total_samples = sum(v["samples"] for v in per_line.values())
+    if not total_samples:
         sys.exit("no samples in the source CSV")
-    us_per_sample = kernel_us / total
+    us_per_sample = kernel_us / total_samples
 
-    # func -> helper -> [(line, rec)]
-    tree = defaultdict(lambda: defaultdict(list))
-    for (file, line), rec in per_line.items():
-        func, helper = func_of(file, line)
-        tree[func][helper].append((file, line, rec))
+    self_samples, total, lines = build_tree(per_line, root)
 
     events = [
         {"ph": "M", "name": "process_name", "pid": 1,
-         "args": {"name": "spread_cartesian_owned (PC-sample attribution, call tree)"}},
+         "args": {"name": f"{root} (PC-sample attribution, source call tree)"}},
         {"ph": "M", "name": "thread_name", "pid": 1, "tid": 1,
-         "args": {"name": "kernel -> inlined function -> helper -> source line"}},
+         "args": {"name": "kernel -> source call hierarchy -> source line"}},
         {"ph": "M", "name": "process_name", "pid": 2,
          "args": {"name": "GPU timeline (measured)"}},
         {"ph": "M", "name": "thread_name", "pid": 2, "tid": 1,
@@ -205,70 +310,77 @@ def main() -> None:
     def end(pid, tid, b):
         events.append({"ph": "E", "pid": pid, "tid": tid, "ts": T(b)})
 
+    def line_args(file, line, rec):
+        return {"file": file, "line": line, "samples": rec["samples"],
+                "warp_inst": rec["inst"],
+                "stalls": {k: v for k, v in rec["stalls"].items() if v}}
 
-    begin(1, 1, 0, "spread_cartesian_owned", "kernel", {"samples": total,
-                                                       "measured_ms": kernel_us / 1000.0})
-    offset = 0
-    # Keep a stable, readable order: real functions first, then inline groups.
-    order = ["stage_raw", "stage_coeff", "dim_support"] + \
-            sorted(f for f in tree if f.startswith("kernel body")) + \
-            [f for f in tree if f not in ("stage_raw", "stage_coeff", "dim_support")
-             and not f.startswith("kernel body")]
-    for func in order:
-        if func not in tree:
-            continue
-        func_samples = sum(rec["samples"] for entries in tree[func].values()
-                           for _, _, rec in entries)
-        begin(1, 1, offset, func, "function" if not func.startswith("kernel body")
-              else "inline", {"samples": func_samples})
-        foff = offset
-        # Real helper frames first (they are callees), then this function's own lines.
-        helpers = sorted(h for h in tree[func] if h is not None)
-        for helper in helpers:
-            entries = sorted(tree[func][helper], key=lambda e: (e[0], e[1] if e[1] is not None else -1))
-            hs = sum(rec["samples"] for _, _, rec in entries)
-            begin(1, 1, foff, helper, "helper", {"samples": hs})
-            hoff = foff
-            for file, line, rec in entries:
-                label = SHORT_LABEL.get(line, rec["src"][:60])
-                begin(1, 1, hoff, f"{file}:L{line} {label}", "line",
-                      {"file": file, "line": line, "samples": rec["samples"],
-                       "warp_inst": rec["inst"],
-                       "stalls": {k: v for k, v in rec["stalls"].items() if v}})
-                hoff += rec["samples"]
-                end(1, 1, hoff)
-            end(1, 1, foff + hs)
-            foff += hs
-        entries = sorted(tree[func].get(None, []),
-                         key=lambda e: (e[0], e[1] if e[1] is not None else -1))
-        for file, line, rec in entries:
+    def render(frame, offset, depth):
+        """Emit a frame, its own source lines, then its callees."""
+        width = total.get(frame, 0)
+        if width == 0:
+            return
+        cat = "function" if not frame.startswith("kernel body") else "inline"
+        begin(1, 1, offset, frame, cat,
+              {"samples": width, "self_samples": self_samples.get(frame, 0)})
+        cursor = offset
+        # Own source lines first (source order), then nested callees.
+        for file, line, rec in lines.get(frame, []):
             label = SHORT_LABEL.get(line, rec["src"][:60])
-            begin(1, 1, foff, f"L{line} {label}", "line",
-                  {"file": file, "line": line, "samples": rec["samples"],
-                   "warp_inst": rec["inst"],
-                   "stalls": {k: v for k, v in rec["stalls"].items() if v}})
-            foff += rec["samples"]
-            end(1, 1, foff)
-        end(1, 1, offset + func_samples)
-        offset += func_samples
-    end(1, 1, total)
+            name = f"{file}:L{line} {label}" if line is not None else f"{file} {label}"
+            begin(1, 1, cursor, name, "line", line_args(file, line, rec))
+            cursor += rec["samples"]
+            end(1, 1, cursor)
+        for kid in CHILDREN.get(frame, []):
+            render(kid, cursor, depth + 1)
+            cursor += total.get(kid, 0)
+        end(1, 1, offset + width)
 
-    begin(2, 1, 0, "spread_cartesian_owned (measured)", "kernel",
+    render(root, 0, 0)
+
+    begin(2, 1, 0, f"{root} (measured)", "kernel",
           {"duration_ms": kernel_us / 1000.0})
-    end(2, 1, total)
+    end(2, 1, total_samples)
 
     trace = {"traceEvents": events, "displayTimeUnit": "ms",
-             "otherData": {"source": src, "total_samples": total, "kernel_us": kernel_us,
-                           "note": "PC-sample attribution over the real inlined call tree; "
-                                   "width is samples, not self time"}}
+             "otherData": {
+                 "source": src,
+                 "total_samples": total_samples,
+                 "kernel_us": kernel_us,
+                 "note": ("Flat ncu PC samples attributed through the static source call "
+                          "graph; parent width = own samples + descendants. Widths are "
+                          "samples, not wall-clock self time. Inlined functions have no "
+                          "runtime call stack."),
+             }}
     json.dump(trace, open(out, "w"))
-    print(f"wrote {out}: {len(events)} events, {total:,} samples, root {kernel_us/1000:.2f} ms")
-    print(f"{'frame':40s} {'samples':>9s} {'share':>7s}")
-    for func in order:
-        if func not in tree:
-            continue
-        s = sum(rec["samples"] for entries in tree[func].values() for _, _, rec in entries)
-        print(f"{func:40s} {s:9,d} {100*s/total:6.1f}%")
+
+    # Text rendering of the same hierarchy (handy for review and diffs).
+    text = []
+
+    def text_render(frame, depth):
+        width = total.get(frame, 0)
+        if width == 0:
+            return
+        share = 100.0 * width / total_samples
+        text.append(f"{'  ' * depth}{frame}  [{width:,} samples = {share:.1f}%]")
+        for file, line, rec in lines.get(frame, []):
+            label = SHORT_LABEL.get(line, rec["src"][:60])
+            where = f"{file}:L{line}" if line is not None else file
+            lshare = 100.0 * rec["samples"] / total_samples
+            text.append(f"{'  ' * (depth + 1)}{where} {label}  "
+                        f"[{rec['samples']:,} = {lshare:.1f}%]")
+        for kid in CHILDREN.get(frame, []):
+            text_render(kid, depth + 1)
+
+    text_render(root, 0)
+    text = "\n".join(text) + "\n"
+    if text_out:
+        open(text_out, "w").write(text)
+    print(text, end="")
+
+    print(f"\nwrote {out}: {len(events)} events, {total_samples:,} samples, "
+          f"root {kernel_us/1000:.2f} ms")
+    print(f"note: hierarchy is the source call graph; PC samples are flat.")
 
 
 if __name__ == "__main__":
