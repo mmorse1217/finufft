@@ -634,8 +634,9 @@ __device__ __forceinline__ void stage_block_quarter(
     const float *__restrict__ input_coordinate_z,
     const float2 *__restrict__ input_strength_pairs,
     float *__restrict__ destination_batch_values, int fine_grid_size_dimension,
-    int support_start_slot, int coefficient_slot,
-    const float *__restrict__ kernel_coefficients) {
+    int support_start_slot, int coefficient_slot, int second_coefficient_index,
+    const float *__restrict__ kernel_coefficients,
+    const float (*__restrict__ second_kernel_coefficients)[6]) {
   const int begin = (staged_point_count * warp_index) / WARPS_PER_BLOCK;
   const int end = (staged_point_count * (warp_index + 1)) / WARPS_PER_BLOCK;
   const int count = end - begin;
@@ -644,11 +645,14 @@ __device__ __forceinline__ void stage_block_quarter(
                    input_coordinate_y, input_coordinate_z, input_strength_pairs,
                    destination_batch_values + begin * VALUES_PER_POINT);
   __syncwarp();
-  if (lane_index < 18) {
-    float *staged_point = destination_batch_values + begin * VALUES_PER_POINT;
-    for (int i = 0; i < count; i++, staged_point += VALUES_PER_POINT)
-      prepare_point_coefficients(staged_point, fine_grid_size_dimension, support_start_slot,
-                                 coefficient_slot, kernel_coefficients);
+  if (lane_index < 27) {
+    const int point_slot = lane_index / 9;
+    float *staged_point =
+        destination_batch_values + begin * VALUES_PER_POINT + point_slot * VALUES_PER_POINT;
+    for (int i = point_slot; i < count; i += 3, staged_point += 3 * VALUES_PER_POINT)
+      prepare_two_coefficients(staged_point, fine_grid_size_dimension, support_start_slot,
+                               coefficient_slot, second_coefficient_index,
+                               kernel_coefficients, second_kernel_coefficients);
   }
   __syncwarp();
 }
@@ -670,6 +674,7 @@ __global__ void spread_cartesian_owned_block_shared(
     const int *__restrict__ active_tile_indices) {
   __shared__ __align__(16) float
       staged_point_values[2][BLOCK_POINTS_PER_BATCH][VALUES_PER_POINT];
+  __shared__ float second_kernel_coefficients[9][6];
 
   const int warp_index = threadIdx.x >> 5;
   const int lane_index = threadIdx.x & 31;
@@ -699,18 +704,22 @@ __global__ void spread_cartesian_owned_block_shared(
     output_cell_accumulators[output_cell_index] = make_float2(0.f, 0.f);
 
   float kernel_coefficients[9] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  const int dimension = lane_index / 6;
-  const int kernel_coefficient_index = lane_index % 6;
+  const int coefficient_lane = lane_index % 9;
+  const int dimension = coefficient_lane / 3;
+  const int kernel_coefficient_index = coefficient_lane % 3;
   const int fine_grid_size_dimension =
       (dimension == 0) ? fine_grid_size_x : ((dimension == 1) ? fine_grid_size_y : fine_grid_size_z);
   const int support_start_slot = dimension;
   const int coefficient_slot = 5 + dimension * 7 + kernel_coefficient_index;
-  if (lane_index < 18) {
+  if (lane_index < 27) {
 #pragma unroll
     for (int kernel_term = 0; kernel_term < 9; kernel_term++)
       kernel_coefficients[kernel_term] =
           KERNEL_COEFFICIENT_TABLE[kernel_term][kernel_coefficient_index];
   }
+  for (int table_entry = threadIdx.x; table_entry < 54; table_entry += blockDim.x)
+    second_kernel_coefficients[table_entry / 6][table_entry % 6] =
+        KERNEL_COEFFICIENT_TABLE[table_entry / 6][table_entry % 6];
 
   // Zero the pads in both shared buffers once. The block, not an individual warp,
   // owns these buffers, so all threads cooperatively initialize them.
@@ -781,7 +790,8 @@ __global__ void spread_cartesian_owned_block_shared(
                             input_coordinate_x, input_coordinate_y, input_coordinate_z,
                             input_strength_pairs, current_batch_values,
                             fine_grid_size_dimension, support_start_slot, coefficient_slot,
-                            kernel_coefficients);
+                            kernel_coefficient_index + 3, kernel_coefficients,
+                            second_kernel_coefficients);
         __syncthreads();
 
         for (;;) {
@@ -796,7 +806,8 @@ __global__ void spread_cartesian_owned_block_shared(
                                 input_coordinate_z, input_strength_pairs,
                                 next_batch_values, fine_grid_size_dimension,
                                 support_start_slot, coefficient_slot,
-                                kernel_coefficients);
+                                kernel_coefficient_index + 3, kernel_coefficients,
+                                second_kernel_coefficients);
 
           bool support_inside_grid = true;
           if (lane_index < staged_point_count) {

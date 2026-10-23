@@ -53,11 +53,11 @@ FUNC_RANGES = [
     (525, 594, "kernel body: batch loop + scan calls"),
     (600, 623, "kernel body: final store"),
     # Block-shared clustered kernel body (spread_cartesian_owned_block_shared).
-    (630, 654, "stage_block_quarter"),
-    (671, 729, "kernel body: block setup/preload"),
-    (731, 778, "kernel body: block x-run bin loop"),
-    (779, 866, "kernel body: block batch loop + scan calls"),
-    (871, 893, "kernel body: block final store"),
+    (630, 658, "stage_block_quarter"),
+    (675, 738, "kernel body: block setup/preload"),
+    (740, 788, "kernel body: block x-run bin loop"),
+    (789, 879, "kernel body: block batch loop + scan calls"),
+    (882, 904, "kernel body: block final store"),
 ]
 
 # Static source call graph. The values are children in source/call order. Frames
@@ -154,16 +154,16 @@ SHORT_LABEL = {
     329: "write coefficient k",
     333: "8x Horner (index k+3, shared)",
     337: "write coefficient k+3",
-    639: "quarter begin",
-    640: "quarter end",
-    643: "stage raw quarter",
-    650: "prepare coefficients",
-    653: "quarter syncwarp",
-    729: "initial block sync",
-    780: "stage current batch",
-    785: "publish current batch",
-    794: "stage next batch",
-    859: "publish next batch / end scan",
+    640: "quarter begin",
+    641: "quarter end",
+    644: "stage raw quarter",
+    653: "prepare coefficients (3-point)",
+    657: "quarter syncwarp",
+    738: "initial block sync",
+    789: "stage current batch",
+    795: "publish current batch",
+    804: "stage next batch",
+    870: "publish next batch / end scan",
 }
 
 

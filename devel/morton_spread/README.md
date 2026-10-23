@@ -151,18 +151,18 @@ reconstructed from the **static source call graph** (`dim_support` under `scan_p
 `fold_rescale`/`cudaFMA` under `stage_coeff`); ncu PC sampling is flat and inlined functions
 have no runtime call stack. Stall reasons are event args, not frames. The complete captures
 (v1, v3, v5, v6, v7, v8, v10, `reopen-2026-10-22/`, and `opt-2026-10-22/`) are under
-`profile-artifacts/expA-output-owned/`; `opt-2026-10-22/v11au/` is the current version and
-carries the three-point packing on top of the v11at preprocessing and block-shared path.
+`profile-artifacts/expA-output-owned/`; `opt-2026-10-22/v11av/` is the current version and
+carries three-point packing in both the per-warp and block-shared staging paths.
 
-## Verdict (current: v11au three-point packing + v11at preprocessing + v11as block-shared staging)
+## Verdict (current: v11av three-point packing in both staging paths)
 
-**v11au** keeps the v11at preprocessing and v11as block-shared clustered path, and changes
-the per-warp coefficient staging to process three points per warp iteration (9 lanes per
-point, two coefficients per lane; the second KER6 set comes from shared). Uniform spread
-falls **13.86 -> 12.59 ms**, passing the strict 12.76 ms gate; uniform total is **16.11 ms**
-and passes the 17.62 ms total gate. Sparse spread is 1.536 ms. Clustered is unchanged at
-14.03 ms spread / 15.62 ms total. Details:
-`profile-artifacts/expA-output-owned/opt-2026-10-22/v11au/`.
+**v11av** applies the v11au three-point packing to the block-shared clustered staging path
+too. Clustered spread falls **14.03 -> 13.71 ms** and total **15.62 -> 15.31 ms**; uniform
+and sparse are unchanged at 12.58 / 1.534 ms spread. Clustered staging is now only 4.7% of
+the kernel, so the remaining ~0.99 ms gap to the 12.72 ms spread gate is scan-side.
+Details: `profile-artifacts/expA-output-owned/opt-2026-10-22/v11av/`.
+
+**v11au** introduced three-point coefficient packing:
 
 **v11at** rewrote preprocessing: fused qbin+pack, a
 32-byte packed payload gather, and GPU binstart construction (radix: mark-starts + reverse
