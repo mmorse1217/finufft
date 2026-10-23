@@ -1,16 +1,22 @@
 # ISSUE-009 Experiment A: output-cell ownership with Cartesian bins — results
 
-**Ticket:** [ISSUE-009](../in-progress/ISSUE-009-output-cell-ownership-cartesian-prototype.md)
+**Ticket:** [ISSUE-009](../done/ISSUE-009-output-cell-ownership-cartesian-prototype.md)
 (map: [cuFINUFFT Morton output-owned spread go/no-go](../todo/ISSUE-001-cufinufft-morton-spread-go-no-go.md))
-**Date:** 2026-10-22 (v10 revision)
-**Revision:** `e3c48641` plus the uncommitted prototype under `devel/morton_spread/`
+**Date:** 2026-10-23 (v11av final)
+**Revision:** `ee278ffa` (v11av)
 **Device:** Quadro T1000, sm_75, 4 GB, driver 580.178.04
 **Toolkit:** CUDA 12.8 at `~/cuda-12.8` (`nvcc` 12.8.61)
 **Scope:** 3D type 1, FP32, `ns=6`, `sigma=2`, `gpu_spreadinterponly=1`, `gpu_kerevalmeth=1`,
-tile `16x16x8`, 256 threads/block, `2x2x2` cells per thread.
+tile `16x16x8`, 128 threads/block, `2x2x4` cells per thread (16 cells).
 
 Prototype source, build command, and design: [`devel/morton_spread/`](../../../devel/morton_spread/).
 This note is the evidence; it does not modify the library.
+
+> **Final outcome (2026-10-23): Experiment A succeeded with v11av.** Uniform passes both
+> gates, clustered total is 8.8% faster than method 3 with spread 13.7% faster, sparse is
+> substantially ahead, and no mandatory workload regressed. The original 20% clustered
+> spread stretch is the remaining performance headroom, not a blocker. See the final
+> outcome section at the end.
 
 ## v10 revision (current)
 
@@ -1453,3 +1459,27 @@ The staging path was already only 4.7% of the kernel. Same-warp interleaving can
 staging and scan concurrently; it only fills stalls. The added schedule/control and shared
 store traffic disrupted the scan more than it hid staging. Rejected; v11av remains current.
 Artifact: `profile-artifacts/expA-output-owned/opt-2026-10-22/v11aw/`.
+
+
+## Final outcome — success (2026-10-23)
+
+Experiment A is successful. Final implementation: **v11av** (`ee278ffa`).
+
+| workload | v11av spread | v11av total | method 3 spread / total |
+|---|---:|---:|---:|
+| uniform `1e6` `64^3` qb=1 radix | **12.575 ms** | **16.101 ms** | 15.95 / 16.78 ms |
+| clustered `1e6` `64^3` qb=4 counting | **13.714 ms** | **15.311 ms** | 15.90 / 16.79 ms |
+| sparse `1e5` `128^3` qb=4 radix | **1.534 ms** | **2.092 ms** | 2.82 / 2.95 ms |
+
+- Uniform: **21.2% faster spread**, **4.0% faster total** — both gates pass.
+- Clustered: **8.8% faster total**, **13.7% faster spread**. The 20% clustered-spread
+  stretch was not fully reached, but total is comfortably ahead and every mandatory
+  workload improved; this is performance headroom, not a failure.
+- Sparse: substantially faster on both spread and total.
+- No mandatory workload regressed.
+- `relL2`: 5.49e-7 uniform, 2.0-2.3e-7 clustered, 6.76e-8 sparse.
+
+The experiment validates output-cell ownership with Cartesian bins: correctness holds,
+spread atomics are gone, the mandatory totals beat method 3, and the uniform spread gate
+passes. Experiment B (Morton ordering) is unblocked. The remaining clustered-spread
+headroom is a follow-up performance target.

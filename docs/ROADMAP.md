@@ -23,13 +23,20 @@ apply across issues.
 - The wayfinder map [cuFINUFFT Morton output-owned spread go/no-go](issues/todo/ISSUE-001-cufinufft-morton-spread-go-no-go.md)
   is charted, with decision tickets covering research, a baseline task, grilling, and two
   prototype experiments.
-- No implementation issues are filed and no sprints are planned. The next step is to work
-  the map's decision tickets, starting with the unblocked baseline task and grilling
-  tickets.
+- No implementation issues are filed and no sprints are planned. The baseline is
+  established. Experiment A (*Prototype output-cell ownership with Cartesian bins*) completed
+  successfully with **v11av** (`ee278ffa`): uniform `1e6` spread **12.58 ms** / total
+  **16.10 ms** (both gates pass), clustered `1e6` spread **13.71 ms** / total **15.31 ms**
+  (total 8.8% faster than method 3; spread 13.7% faster, short of the 20% stretch), sparse
+  `1e5` spread **1.53 ms** / total **2.09 ms**. No mandatory workload regressed. The Morton
+  prototype (*Prototype Morton-sorted output-cell-owned spreading*) is now unblocked.
 - The domain vocabulary is initialized in [`GLOSSARY.md`](GLOSSARY.md); the ownership term
-  is pending [Settle the ownership and Morton vocabulary](issues/todo/ISSUE-007-ownership-and-morton-vocabulary.md).
+  is settled as output-cell ownership / output-owned spreading
+  ([ticket](issues/done/ISSUE-007-ownership-and-morton-vocabulary.md)).
 - CPU perftest baseline timings for transform types 1-3 are recorded in the
-  [appendix](#appendix-baseline-benchmarks); the map's CUDA baseline is a separate ticket.
+  [appendix](#appendix-baseline-benchmarks); the map's CUDA baseline is recorded in
+  [Establish the cuFINUFFT CUDA baseline and profiling protocol](issues/done/ISSUE-002-cufinufft-cuda-baseline.md)
+  and its [baseline note](issues/research/ISSUE-002-baseline.md).
 
 ## Destination
 
@@ -94,6 +101,7 @@ holds the detail. Do not restate a decision in two places._
 | Date | Decision | Recorded in |
 |---|---|---|
 | 2026-10-21 | The first effort is a go/no-go on Morton output-owned spreading for 3D type-1 cuFINUFFT; CPU, type 3, non-CUDA backends, and multi-GPU are out of scope. | [Wayfinder map](issues/todo/ISSUE-001-cufinufft-morton-spread-go-no-go.md) |
+| 2026-10-21 | The prototype gate is ≥20% lower method-3 spread-stage time on both mandatory `N=1e6` workloads, with preprocessing+spread and end-to-end guards; Experiment A precedes B; type-1 FP32 only; T1000 evidence with a recorded caveat. | [Settle the prototype success protocol and scope](issues/done/ISSUE-006-prototype-success-protocol.md) |
 
 ## Maintenance
 

@@ -2,10 +2,10 @@
 
 **Created:** 2026-10-21
 **Priority:** P1
-**Status:** In progress
+**Status:** Done
 **Labels:** wayfinder:prototype
 **Started:** 2026-10-22
-**Completed:** _not completed_
+**Completed:** 2026-10-23
 
 **Related commits:**
 - ee88a2fc — v11as block-shared staging + measured dispatch
@@ -1321,3 +1321,29 @@ interleaved coefficient groups with the current scan. Clustered regressed
 unchanged. Staging was only 4.7% of the kernel, and the added schedule/control plus shared
 store traffic disrupted the scan more than it hid staging. Rejected; v11av remains current.
 Artifact: `profile-artifacts/expA-output-owned/opt-2026-10-22/v11aw/`.
+
+
+## Final outcome — success (2026-10-23)
+
+Experiment A is successful. The final implementation is **v11av** (commit `ee278ffa`):
+per-warp and block-shared staging with three-point coefficient packing, packed payload
+gathers, GPU binstart construction, and measured block/warp-visit dispatch.
+
+| workload | v11av spread | v11av total | method 3 spread / total |
+|---|---:|---:|---:|
+| uniform `1e6` `64^3` qb=1 radix | **12.575 ms** | **16.101 ms** | 15.95 / 16.78 ms |
+| clustered `1e6` `64^3` qb=4 counting | **13.714 ms** | **15.311 ms** | 15.90 / 16.79 ms |
+| sparse `1e5` `128^3` qb=4 radix | **1.534 ms** | **2.092 ms** | 2.82 / 2.95 ms |
+
+- Uniform is **21.2% faster** on spread and **4.0% faster** on total: both gates pass.
+- Clustered is **8.8% faster** on total and **13.7% faster** on spread. The 20% clustered
+  spread stretch was not fully reached, but clustered total is comfortably ahead and every
+  mandatory workload improved; this is performance headroom, not a failure.
+- Sparse is substantially faster on both spread and total.
+- No mandatory workload regressed.
+
+The result validates output-cell ownership with Cartesian bins as a viable direction:
+the prototype is correct (`relL2` 5.49e-7 / 2.0-2.3e-7 / 6.76e-8), removes spread atomics,
+beats method 3 on the mandatory totals, and passes the uniform spread gate. Experiment B
+(Morton ordering) is now unblocked; the remaining clustered-spread headroom is a follow-up
+performance target, not an Experiment A blocker.
