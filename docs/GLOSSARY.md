@@ -123,6 +123,12 @@ The number of fine-grid points spanned by the spreading kernel in each dimension
 $n_s$; a larger width allows higher accuracy at higher cost.
 _Avoid_: support size, stencil width
 
+**kernel support**:
+The $n_s$ fine-grid cells to which one source point contributes during spreading, from
+$\lceil r - n_s/2 \rceil$ through $\lceil r - n_s/2 \rceil + n_s - 1$, where $r$ is the
+point's rescaled fine-grid coordinate; its width is the kernel width.
+_Avoid_: halo, footprint, stencil
+
 **PSWF kernel**:
 The prolate spheroidal wavefunction kernel used by the CPU library, chosen for near-optimal
 aliasing error at a given kernel width.
@@ -143,10 +149,59 @@ The Fourier transform of the spreading kernel, evaluated on the fine grid or mod
 used by deconvolution.
 _Avoid_: kernel FT, window transform
 
+**bin**:
+Point grouping: a box of fine-grid cells used to group nonuniform points for spreading and
+interpolation; its width in fine-grid cells is the `binsize` (`gpu_binsize*`).
+_Avoid_: source bin, point bin, input bin, output bin
+
 **bin sort**:
-A spatial reordering of nonuniform points, stored as a permutation, that improves cache
-locality during spreading and interpolation.
-_Avoid_: sort, reorder, bucketing
+A spatial reordering of nonuniform points by the bin each point falls into, stored as a
+permutation, that improves cache locality during spreading and interpolation; distinct
+from Morton sort.
+_Avoid_: sort, reorder, bucketing, using it for Morton ordering
+
+**tile**:
+The output region a CUDA threadblock works on; its size may differ from the bin size.
+_Avoid_: output tile, destination tile, subgrid
+
+**local subgrid**:
+The shared-memory buffer holding a tile; in the output-driven method its per-dimension
+size is `binsize + padding`.
+_Avoid_: shared tile, output block, destination buffer
+
+**padding**:
+The extra fine-grid cells added to a bin's local subgrid to hold the kernel support
+overhang; `2*ceil(ns/2)` total, `ceil(ns/2)` per side.
+_Avoid_: halo, footprint, stencil
+
+**Morton code**:
+The bit-interleaved integer key formed from a bin's integer coordinates, ordering bins
+along a Z-order curve.
+_Avoid_: Z-key, Morton index, hash
+
+**Morton sort**:
+A spatial reordering of nonuniform points by the Morton code of their bin, so that points
+in the same bin are contiguous.
+_Avoid_: bin sort (reserve that for the Cartesian bin scheme), Z-sort
+
+**active tile**:
+A tile that receives contributions from at least one nonuniform point.
+_Avoid_: nonempty tile, hot tile
+
+**point reread factor**:
+The average number of tiles that read a given nonuniform point because its kernel support
+crosses tile boundaries.
+_Avoid_: replication factor, duplication factor
+
+**output-cell ownership**:
+The rule that each fine-grid cell has exactly one writer, so its accumulated value is
+stored without a global reduction across writers.
+_Avoid_: destination ownership, unique ownership, one-writer rule
+
+**Morton-sorted output-owned spreading**:
+A spreading strategy that orders nonuniform points by the Morton code of their bin and
+accumulates each fine-grid cell under output-cell ownership.
+_Avoid_: destination-owned spreading, Morton NUFFT, Morton bin sort
 
 **requested tolerance**:
 The relative accuracy requested through `tol` or `eps`; FINUFFT uses it to choose kernel
@@ -183,6 +238,11 @@ _Avoid_: load points, bind points
 The plan call that performs the planned transform; `execute_adjoint` performs its adjoint
 instead.
 _Avoid_: run, apply, compute
+
+**CUDA threadblock**:
+The group of threads launched together that share shared memory and barriers; one
+CUDA threadblock owns one tile.
+_Avoid_: block (unqualified), output block, workgroup
 
 **transform stack**:
 The `ntr` transforms sharing a plan and nonuniform points but using separate strength or

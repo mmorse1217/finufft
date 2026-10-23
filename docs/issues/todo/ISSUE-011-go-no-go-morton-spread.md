@@ -21,7 +21,7 @@ Review the Experiment A and Experiment B evidence and decide whether to integrat
 spread path into cuFINUFFT. With the human:
 
 - compare the measured spread-stage and total times against the success protocol in
-  [Settle the prototype success protocol and scope](ISSUE-006-prototype-success-protocol.md);
+  [Settle the prototype success protocol and scope](../done/ISSUE-006-prototype-success-protocol.md);
 - weigh the preprocessing cost, point reread factor, memory footprint, occupancy, and
   correctness against the atomic-elimination benefit;
 - identify any workload that is a pathological regression and decide whether it is a
