@@ -151,16 +151,39 @@ reconstructed from the **static source call graph** (`dim_support` under `scan_p
 `fold_rescale`/`cudaFMA` under `stage_coeff`); ncu PC sampling is flat and inlined functions
 have no runtime call stack. Stall reasons are event args, not frames. The complete captures
 (v1, v3, v5, v6, v7, v8, v10, `reopen-2026-10-22/`, and `opt-2026-10-22/`) are under
-`profile-artifacts/expA-output-owned/`; `opt-2026-10-22/v11av/` is the current version and
-carries three-point packing in both the per-warp and block-shared staging paths.
+`profile-artifacts/expA-output-owned/`; `opt-2026-10-22/v11ay/` is the current version and
+carries the contiguous coefficient rows and strength-scaled accumulation.
 
-## Verdict (current: v11av three-point packing in both staging paths)
+## Verdict (current: v11ay contiguous coefficient rows + strength-scaled accumulation)
 
-**v11av** applies the v11au three-point packing to the block-shared clustered staging path
-too. Clustered spread falls **14.03 -> 13.71 ms** and total **15.62 -> 15.31 ms**; uniform
-and sparse are unchanged at 12.58 / 1.534 ms spread. Clustered staging is now only 4.7% of
-the kernel, so the remaining ~0.99 ms gap to the 12.72 ms spread gate is scan-side.
-Details: `profile-artifacts/expA-output-owned/opt-2026-10-22/v11av/`.
+**v11ay** targets the scan's 16-cell body, which the v11av profile analysis showed was the
+real cost (not shared-memory bandwidth): ~6.4 uniform / 4.1 clustered lanes per
+accumulation instruction and one `xy*z` multiply plus two FFMAs per cell. Two source
+changes:
+
+1. the z row gets three zero pre-pads and uses a contiguous base
+   `21 + support_coefficient_offset_z - local_cell_offset_z`, removing the nested
+   `local_cell_offset_z` `FSEL` chain; the existing x post-pad doubles as the y pre-pad,
+   so y becomes contiguous at no extra shared-memory cost;
+2. the scan forms four real and four imaginary `strength*z` factors once per lane group,
+   then does one FMA per cell: 8 inner `FMUL`s instead of 16, 40 rather than 48
+   weight/accumulate instructions per point.
+
+`VALUES_PER_POINT` is 30, so the 5-block batches are 13 (per-warp) / 53 (block-shared).
+Measured medians (4 process runs, 5 timed runs): spread **10.91 / 11.23 / 1.393 ms**,
+total **14.45 / 12.83 / 1.956 ms** uniform / clustered / sparse. Both mandatory `1e6`
+spread gates now pass: uniform is **31.6%** and clustered **29.4%** faster than method 3;
+totals are 13.9% and 23.6% faster. `relL2` is unchanged within the FP32 noise floor
+(5.64e-7 / 2.26e-7 / 7.34e-8). Resources: 96 registers (per-warp) / 95 (block-shared),
+12,696 / 12,936 B shared, 5 blocks/SM, no spills. ncu warp instructions fall
+671.9M -> **560.7M** uniform and 868.6M -> **686.1M** clustered. Details:
+`profile-artifacts/expA-output-owned/opt-2026-10-22/v11ay/`.
+
+**v11av** applied the v11au three-point packing to the block-shared clustered staging path
+too. Clustered spread fell **14.03 -> 13.71 ms** and total **15.62 -> 15.31 ms**; uniform
+and sparse were unchanged at 12.58 / 1.534 ms spread. It remains the base for the
+v11ax/v11ay experiments. Details:
+`profile-artifacts/expA-output-owned/opt-2026-10-22/v11av/`.
 
 **v11au** introduced three-point coefficient packing:
 

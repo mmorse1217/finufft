@@ -248,9 +248,13 @@ __device__ __constant__ float KERNEL_COEFFICIENT_TABLE[9][6] = {
     {-1.5875418082722892E-06, 7.2147850129502829E-07, -7.0930078290747281E-08,
      -7.0930078325137639E-08, 7.2147850125572373E-07, -1.5875417996328233E-06}};
 
-static constexpr int MAX_POINTS_PER_BATCH = 14;
-static constexpr int VALUES_PER_POINT = 28;  // 3 support starts + 2 strengths + 18 coefficients + 5 zero pads
-static constexpr int BLOCK_POINTS_PER_BATCH = 56;
+static constexpr int MAX_POINTS_PER_BATCH = 13;
+// 3 support starts + 2 strengths + 18 coefficients + 7 zero pads.
+// The three slots before the z row (18,19,20) and the three after it (27,28,29)
+// let the scan load the four z kernel values for a lane group as four contiguous
+// slots indexed by support_coefficient_offset_z - local_cell_offset_z.
+static constexpr int VALUES_PER_POINT = 30;
+static constexpr int BLOCK_POINTS_PER_BATCH = 53;
 
 // Raw pass: lanes 0..staged_point_count-1 issue all the global loads for the batch at once, so
 // the warp waits on one round of coalesced loads instead of ~staged_point_count serialized ones.
@@ -391,20 +395,28 @@ __device__ __forceinline__ void scan_one_staged_point(const float *__restrict__ 
   }
   if (!(group_cell_count_x && group_cell_count_y && group_cell_count_z)) return;
   // Padded coefficient rows: the slot just past a real coefficient is zero, so
-  // these loads never need the group_cell_count_x/group_cell_count_y/group_cell_count_z range selects.
+  // these loads never need the group_cell_count_x/group_cell_count_y range selects.
   const float x_kernel_value_0 = staged_point[5 + support_coefficient_offset_x], x_kernel_value_1 = staged_point[6 + support_coefficient_offset_x];
-  const float y_kernel_value_0 = staged_point[12 + support_coefficient_offset_y], y_kernel_value_1 = staged_point[13 + support_coefficient_offset_y];
-  const float z_kernel_value_0 = staged_point[19 + support_coefficient_offset_z], z_kernel_value_1 = staged_point[20 + support_coefficient_offset_z];
-  const float z_kernel_value_2 = staged_point[21 + support_coefficient_offset_z], z_kernel_value_3 = staged_point[22 + support_coefficient_offset_z];
   const float x_kernel_values[2] = {(local_cell_offset_x == 0) ? x_kernel_value_0 : 0.f, (local_cell_offset_x == 0) ? x_kernel_value_1 : x_kernel_value_0};
-  const float y_kernel_values[2] = {(local_cell_offset_y == 0) ? y_kernel_value_0 : 0.f, (local_cell_offset_y == 0) ? y_kernel_value_1 : y_kernel_value_0};
-  const float z_kernel_values[4] = {(local_cell_offset_z == 0) ? z_kernel_value_0 : 0.f,
-                       (local_cell_offset_z == 0) ? z_kernel_value_1 : ((local_cell_offset_z == 1) ? z_kernel_value_0 : 0.f),
-                       (local_cell_offset_z == 0) ? z_kernel_value_2 : ((local_cell_offset_z == 1) ? z_kernel_value_1 : ((local_cell_offset_z == 2) ? z_kernel_value_0 : 0.f)),
-                       (local_cell_offset_z == 0) ? z_kernel_value_3 : ((local_cell_offset_z == 1) ? z_kernel_value_2
-                                          : ((local_cell_offset_z == 2) ? z_kernel_value_1 : ((local_cell_offset_z == 3) ? z_kernel_value_0 : 0.f)))};
+  // The single x post-pad at 11 is also the y pre-pad, so the y row can use the
+  // same contiguous-load trick as z without any extra shared memory.
+  const int y_coefficient_base = 12 + support_coefficient_offset_y - local_cell_offset_y;
+  const float y_kernel_values[2] = {staged_point[y_coefficient_base], staged_point[y_coefficient_base + 1]};
+  // The z row has three zero pre-pads and three zero post-pads. The coefficient
+  // for group cell local_z is simply the slot at
+  // 21 + support_coefficient_offset_z - local_cell_offset_z + local_z, so the
+  // lane-group shift needs no per-value selects.
+  const int z_coefficient_base = 21 + support_coefficient_offset_z - local_cell_offset_z;
+  const float z_kernel_values[4] = {staged_point[z_coefficient_base], staged_point[z_coefficient_base + 1],
+                                    staged_point[z_coefficient_base + 2], staged_point[z_coefficient_base + 3]};
   // Indexed by local_x + 2*local_y to match the accumulator layout.
   const float xy_weights[4] = {x_kernel_values[0] * y_kernel_values[0], x_kernel_values[1] * y_kernel_values[0], x_kernel_values[0] * y_kernel_values[1], x_kernel_values[1] * y_kernel_values[1]};
+  // Scale z by the point strength once per lane group. Each cell update is then
+  // a single FMA, saving the sixteen per-cell strength*xy*z multiplies.
+  const float2 strength_scaled_z[4] = {make_float2(strength_real * z_kernel_values[0], strength_imag * z_kernel_values[0]),
+                                       make_float2(strength_real * z_kernel_values[1], strength_imag * z_kernel_values[1]),
+                                       make_float2(strength_real * z_kernel_values[2], strength_imag * z_kernel_values[2]),
+                                       make_float2(strength_real * z_kernel_values[3], strength_imag * z_kernel_values[3])};
 #pragma unroll
   for (int local_z = 0; local_z < 4; local_z++) {
 #pragma unroll
@@ -412,9 +424,9 @@ __device__ __forceinline__ void scan_one_staged_point(const float *__restrict__ 
 #pragma unroll
       for (int local_x = 0; local_x < 2; local_x++) {
         const int output_cell_index    = local_x + 2 * local_y + 4 * local_z;
-        const float weight = xy_weights[local_x + 2 * local_y] * z_kernel_values[local_z];
-        output_cell_accumulators[output_cell_index].x += strength_real * weight;
-        output_cell_accumulators[output_cell_index].y += strength_imag * weight;
+        const float xy_weight = xy_weights[local_x + 2 * local_y];
+        output_cell_accumulators[output_cell_index].x += xy_weight * strength_scaled_z[local_z].x;
+        output_cell_accumulators[output_cell_index].y += xy_weight * strength_scaled_z[local_z].y;
       }
     }
   }
@@ -464,7 +476,9 @@ __global__ void spread_cartesian_owned(
   const int kernel_coefficient_index   = coefficient_lane % 3;
   const int fine_grid_size_dimension  = (dimension == 0) ? fine_grid_size_x : ((dimension == 1) ? fine_grid_size_y : fine_grid_size_z);
   const int support_start_slot = dimension;
-  const int coefficient_slot = 5 + dimension * 7 + kernel_coefficient_index;
+  const int coefficient_slot = (dimension == 0) ? (5 + kernel_coefficient_index)
+                               : (dimension == 1) ? (12 + kernel_coefficient_index)
+                                                  : (21 + kernel_coefficient_index);
   if (lane_index < 27) {
 #pragma unroll
     for (int kernel_term = 0; kernel_term < 9; kernel_term++)
@@ -486,9 +500,11 @@ __global__ void spread_cartesian_owned(
         buffered_point_slot * VALUES_PER_POINT;
     padded_staged_point[11] = 0.f;
     padded_staged_point[18] = 0.f;
-    padded_staged_point[25] = 0.f;
-    padded_staged_point[26] = 0.f;
+    padded_staged_point[19] = 0.f;
+    padded_staged_point[20] = 0.f;
     padded_staged_point[27] = 0.f;
+    padded_staged_point[28] = 0.f;
+    padded_staged_point[29] = 0.f;
   }
   __syncwarp();
 
@@ -710,7 +726,9 @@ __global__ void spread_cartesian_owned_block_shared(
   const int fine_grid_size_dimension =
       (dimension == 0) ? fine_grid_size_x : ((dimension == 1) ? fine_grid_size_y : fine_grid_size_z);
   const int support_start_slot = dimension;
-  const int coefficient_slot = 5 + dimension * 7 + kernel_coefficient_index;
+  const int coefficient_slot = (dimension == 0) ? (5 + kernel_coefficient_index)
+                               : (dimension == 1) ? (12 + kernel_coefficient_index)
+                                                  : (21 + kernel_coefficient_index);
   if (lane_index < 27) {
 #pragma unroll
     for (int kernel_term = 0; kernel_term < 9; kernel_term++)
@@ -731,9 +749,11 @@ __global__ void spread_cartesian_owned_block_shared(
     float *const padded_staged_point = &staged_point_values[buffer][point_slot][0];
     padded_staged_point[11] = 0.f;
     padded_staged_point[18] = 0.f;
-    padded_staged_point[25] = 0.f;
-    padded_staged_point[26] = 0.f;
+    padded_staged_point[19] = 0.f;
+    padded_staged_point[20] = 0.f;
     padded_staged_point[27] = 0.f;
+    padded_staged_point[28] = 0.f;
+    padded_staged_point[29] = 0.f;
   }
   __syncthreads();
 
