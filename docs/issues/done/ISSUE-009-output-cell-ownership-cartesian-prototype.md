@@ -14,6 +14,8 @@
 - ee278ffa — v11av three-point packing in block-shared staging
 - d1c5fc7a — v11ay contiguous coefficient rows + strength-scaled scan
 - fd5fb705 — docs: record the v11ay result and the updated acceptance evidence
+- f4922aaa — docs(issues): update the final result and acceptance gate
+- 0f16054c — docs(issues): add the v11ay next-step performance review
 
 **Dependencies:**
 - ISSUE-002
@@ -89,7 +91,8 @@ medians of 4 process runs with 5 timed runs each:
   `1000000 64 64 64 1 4 5 0`; sparse `100000 128 128 128 0 4 5`).
 - [x] ptxas resource evidence: `v11ay/ptxas.txt` shows 96 registers / 12,696 B shared for
   `spread_cartesian_owned` and 95 registers / 12,936 B shared for
-  `spread_cartesian_owned_block_shared`, 5 blocks/SM, 0 spill stores/loads.
+  `spread_cartesian_owned_block_shared`, with 0 spill stores/loads; the benchmark reports
+  5 blocks/SM for both.
 - [x] ncu evidence: `v11ay/uniform_qb1_ncu.ncu-rep` and
   `v11ay/clustered_qb4_ncu.ncu-rep` with details/source CSVs; warp instructions
   560.7M uniform / 686.1M clustered, down from 671.9M / 868.6M at v11av.
