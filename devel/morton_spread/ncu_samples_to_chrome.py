@@ -1,408 +1,384 @@
 #!/usr/bin/env python3
-"""Build a nested Chrome trace from an Nsight Compute source-page CSV.
+"""Build a source-attribution flamegraph from an Nsight Compute CUDA/SASS CSV.
 
     ncu --import spread_ncu.ncu-rep --page source --print-source cuda,sass --csv \
-        > spread_ncu_source_cuda_sass.csv
-    python3 ncu_samples_to_chrome.py spread_ncu_source_cuda_sass.csv out.json \
-        --kernel-us 16590 [--text out.txt]
+        > spread_source.csv
+    python3 ncu_samples_to_chrome.py spread_source.csv out.json \
+        --kernel-us 12600 [--text out.txt] [--cuda-source exp_a_cartesian.cu]
 
-Important: Nsight Compute PC sampling is *flat*. It attributes samples to a SASS
-instruction and, with `-lineinfo`, to a source line. It does not record a device call
-stack, and the kernel's device functions are inlined, so there is no runtime stack to
-recover. `.nsys-rep` is a timeline (kernel/API events), not a call-stack trace either.
+PC sampling is flat: there is no device call stack or per-line elapsed time.
+Each (kernel, SASS PC) is counted once, using its first source correlation.
+The hierarchy is reconstructed from the matching prototype source snapshot;
+shared inline callees with ambiguous parents are placed directly under the root.
 
-What this script does is apply the **static call graph from the source** to the flat
-sample attribution. The resulting hierarchy is:
-
-    spread_cartesian_owned                     kernel
-      kernel body: batch loop + scan calls     inline code
-        stage_raw_points                       inlined device function
-          __ldg                                intrinsic inlined into stage_raw_points
-        prepare_point_coefficients             inlined device function
-          fold_rescale                         helper inlined into prepare_point_coefficients
-            cudaFMA                            helper inlined into fold_rescale
-        scan_one_staged_point                  inlined device function
-          place_support                        helper inlined into scan_one_staged_point
-        __syncwarp                             intrinsic inlined into the batch loop
-      kernel body: x-run bin loop              inline code
-      kernel body: final store                 inline code
-
-A parent's width is its own samples plus all descendants' samples, so `scan_point`
-includes `dim_support`. This is an attribution view, not a wall-clock timeline; the
-stack levels are the source call structure, while widths are PC samples scaled to the
-measured kernel duration. `kernel body: ...` frames are inline code, not functions.
+Widths are sample counts. Chrome's time coordinates are only a synthetic layout
+scaled to --kernel-us (the duration of the SAME profiled launch, not a benchmark
+median). Neither the flamegraph nor its duration reference is a GPU timeline.
 """
 
+import argparse
 import csv
-import json
-import sys
 from collections import defaultdict
-
-# Leaf frames in devel/morton_spread/exp_a_cartesian.cu (current v11ay kernel).
-# These are the source ranges whose samples belong to that function/group.
-FUNC_RANGES = [
-    (262, 279, "stage_raw_points"),
-    (287, 307, "prepare_point_coefficients"),
-    (312, 342, "prepare_two_coefficients"),
-    (347, 361, "place_support"),
-    (366, 374, "place_support_nowrap"),
-    (379, 431, "scan_one_staged_point"),
-    # Per-warp kernel body (spread_cartesian_owned).
-    (460, 516, "kernel body: coefficient preload"),
-    (517, 539, "kernel body: x-run bin loop"),
-    (540, 615, "kernel body: batch loop + scan calls"),
-    (616, 634, "kernel body: final store"),
-    # Block-shared clustered kernel body (spread_cartesian_owned_block_shared).
-    (646, 673, "stage_block_quarter"),
-    (690, 769, "kernel body: block setup/preload"),
-    (770, 802, "kernel body: block x-run bin loop"),
-    (803, 901, "kernel body: block batch loop + scan calls"),
-    (902, 923, "kernel body: block final store"),
-]
-
-# Static source call graph. The values are children in source/call order. Frames
-# not listed as children of anything are top-level kernel-body groups.
-CHILDREN = {
-    "spread_cartesian_owned": [
-        "kernel body: coefficient preload",
-        "kernel body: x-run bin loop",
-        "kernel body: batch loop + scan calls",
-        "kernel body: final store",
-        "kernel body: other",
-    ],
-    "spread_cartesian_owned_block_shared": [
-        "kernel body: block setup/preload",
-        "kernel body: block x-run bin loop",
-        "kernel body: block batch loop + scan calls",
-        "kernel body: block final store",
-        "kernel body: other",
-    ],
-    "kernel body: batch loop + scan calls": [
-        "stage_raw_points",
-        "prepare_two_coefficients",
-        "scan_one_staged_point",
-        "__syncwarp",
-    ],
-    "kernel body: block batch loop + scan calls": [
-        "stage_block_quarter",
-        "scan_one_staged_point",
-        "__syncthreads",
-    ],
-    "stage_block_quarter": [
-        "stage_raw_points",
-        "prepare_two_coefficients",
-        "__syncwarp",
-    ],
-    "stage_raw_points": ["__ldg"],
-    "prepare_point_coefficients": ["fold_rescale"],
-    "prepare_two_coefficients": ["fold_rescale"],
-    "fold_rescale": ["cudaFMA"],
-    "scan_one_staged_point": ["place_support", "place_support_nowrap"],
-}
-
-# Header-file leaves. These files are inlined into the kernel; the CSV has no
-# inlined call stack, only the header source line (sometimes no line at all).
-def header_leaf(file, line, src=""):
-    if file == "spreadinterp.hpp":
-        # cudaFMA body is one line; fold_rescale is the surrounding helper.
-        if line == 47:
-            return "cudaFMA"
-        return "fold_rescale"
-    if file == "sm_30_intrinsics.hpp":
-        if "__syncthreads" in src:
-            return "__syncthreads"
-        return "__syncwarp"
-    if file == "sm_32_intrinsics.hpp":
-        return "__ldg"
-    return "kernel body: other"
+from dataclasses import dataclass
+import json
+import math
+from pathlib import Path
+import re
+import sys
 
 
-# Source-line labels (fall back to the source text).
-SHORT_LABEL = {
-    266: "stage x (ldg + shared store)",
-    267: "stage y (shared store)",
-    268: "stage z (shared store)",
-    269: "load strength (float2)",
-    270: "stage strength re",
-    271: "stage strength im",
-    318: "fold_rescale",
-    320: "support start ceil (float)",
-    322: "support start int",
-    323: "horner argument",
-    326: "write support start",
-    328: "8x Horner (index k)",
-    333: "write coefficient k",
-    335: "8x Horner (index k+3, shared)",
-    341: "write coefficient k+3",
-    347: "relative support start",
-    348: "wrap relative start",
-    353: "below_group test",
-    354: "wraps_high test",
-    355: "wrapped cell count",
-    356: "group cell count select",
-    357: "coefficient offset select",
-    358: "local cell offset select",
-    368: "intersection begin",
-    370: "intersection end",
-    371: "group cell count",
-    372: "coefficient offset",
-    373: "local cell offset",
-    382: "metadata LDS (int2 + z + strength)",
-    388: "support placement x",
-    389: "support placement y",
-    390: "support placement z",
-    396: "early-out",
-    399: "x coefficient load",
-    400: "x lane-group shift select",
-    403: "y coefficient base",
-    404: "y coefficient load (contiguous)",
-    409: "z coefficient base",
-    410: "z coefficient load (contiguous)",
-    413: "xy weight products",
-    416: "strength*z real/imag (z0)",
-    417: "strength*z real/imag (z1)",
-    418: "strength*z real/imag (z2)",
-    419: "strength*z real/imag (z3)",
-    428: "cell accumulation x",
-    429: "cell accumulation y",
-    656: "quarter begin",
-    657: "quarter end",
-    660: "stage raw quarter",
-    669: "prepare coefficients (3-point)",
-    672: "quarter syncwarp",
-    756: "initial block sync",
-    809: "stage current batch",
-    815: "publish current batch",
-    824: "stage next batch",
-    890: "publish next batch / end scan",
-}
+@dataclass
+class Profile:
+    lines: dict
+    unique_pcs: int
+    duplicate_pc_rows: int
+    kernel_name: str
+
+    @property
+    def total_samples(self):
+        return sum(rec["samples"] for rec in self.lines.values())
+
+    @property
+    def total_instructions(self):
+        return sum(rec["inst"] for rec in self.lines.values())
 
 
-def parse(path):
-    """Return {(file, line): {src, samples, inst, stalls}} from an ncu source CSV."""
-    rows = list(csv.reader(open(path, newline="")))
+def parse(path, root="spread_cartesian_owned"):
+    """Select one kernel and deduplicate PCs before aggregating source lines.
+
+    Nsight repeats a PC's counters at inline definitions AND call sites. These
+    are correlations, not independent executions. Keep the first correlation;
+    reject conflicting counters rather than silently combining captures.
+    CUDA aggregate rows and SASS '...' placeholders are never counted.
+    """
     file = None
     line = None
-    hdr = None
-    idx = None
-    per = {}
-    for r in rows:
-        if not r:
-            continue
-        if r[0] == "File Path":
-            file = r[1].split("/")[-1]
-            line = None
-            continue
-        if r[0] == "Line No":
-            hdr = r
-            idx = {h: i for i, h in enumerate(hdr)}
-            continue
-        if r[0] == "Function Name" or hdr is None or len(r) != len(hdr):
-            continue
-        v = r[0].strip()
-        if v and v != "-":
-            try:
-                line = int(v)
-            except ValueError:
+    source = ""
+    kernel = None
+    columns = None
+    row_width = 0
+    seen = {}
+    per_line = {}
+    duplicates = 0
+
+    def number(row, name):
+        value = row[columns[name]].strip() if name in columns else ""
+        return 0 if value in ("", "-") else int(value.replace(",", ""))
+
+    with open(path, newline="") as input_file:
+        for row in csv.reader(input_file):
+            if not row:
                 continue
-        if r[idx["Address"]] == "-":
-            continue
-        try:
-            samples = int(r[idx["Warp Stall Sampling (All Samples)"]] or 0)
-        except ValueError:
-            samples = 0
-        try:
-            inst = int(r[idx["Instructions Executed"]] or 0)
-        except ValueError:
-            inst = 0
-        rec = per.setdefault((file, line), {"src": r[1].strip(), "samples": 0, "inst": 0,
-                                            "stalls": defaultdict(int)})
-        rec["samples"] += samples
-        rec["inst"] += inst
-        for k, i in idx.items():
-            if k.startswith("stall_") and "Not Issued" not in k:
-                try:
-                    rec["stalls"][k.replace("stall_", "")] += int(r[i] or 0)
-                except ValueError:
-                    pass
-    return per
+            if row[0] == "File Path":
+                file = Path(row[1]).name
+                line, source = None, ""
+                continue
+            if row[0] == "Function Name":
+                kernel = row[1]
+                line, source = None, ""
+                continue
+            if row[0] == "Line No":
+                columns = {name: i for i, name in enumerate(row)}
+                row_width = len(row)
+                continue
+            if columns is None or len(row) != row_width:
+                continue
+            if kernel is None or kernel.split("(", 1)[0].strip() != root:
+                continue
+            if row[0].strip():
+                line = None if row[0].strip() == "-" else int(row[0])
+                source = row[1].strip()
+            address = row[columns["Address"]].strip()
+            if not re.fullmatch(r"0x[0-9a-fA-F]+", address):
+                continue
+
+            stalls = {}
+            not_issued_stalls = {}
+            for name in columns:
+                if name.startswith("stall_"):
+                    target = not_issued_stalls if " (Not Issued)" in name else stalls
+                    target[name.removeprefix("stall_").removesuffix(" (Not Issued)")] = number(row, name)
+            metrics = {
+                "samples": number(row, "Warp Stall Sampling (All Samples)"),
+                "not_issued_samples": number(row, "Warp Stall Sampling (Not-issued Samples)"),
+                "inst": number(row, "Instructions Executed"),
+                "thread_inst": number(row, "Thread Instructions Executed"),
+                "predicated_thread_inst": number(row, "Predicated-On Thread Instructions Executed"),
+                "stalls": stalls,
+                "not_issued_stalls": not_issued_stalls,
+            }
+            key = (kernel, int(address, 16))
+            if key in seen:
+                if seen[key] != metrics:
+                    raise ValueError(f"conflicting counters for {kernel} PC {address}; export one launch")
+                duplicates += 1
+                continue
+            seen[key] = metrics
+            rec = per_line.setdefault((file, line), {
+                "src": source or row[columns["Source"]].strip(),
+                "samples": 0, "not_issued_samples": 0, "inst": 0,
+                "thread_inst": 0, "predicated_thread_inst": 0,
+                "stalls": defaultdict(int), "not_issued_stalls": defaultdict(int),
+            })
+            for name, value in metrics.items():
+                if isinstance(value, dict):
+                    for reason, count in value.items():
+                        rec[name][reason] += count
+                else:
+                    rec[name] += value
+
+    kernels = {key[0] for key in seen}
+    if not kernels:
+        raise ValueError(f"no SASS rows for kernel {root}")
+    if len(kernels) != 1:
+        raise ValueError(f"multiple signatures for {root}; export one kernel")
+    return Profile(per_line, len(seen), duplicates, kernels.pop())
 
 
-def leaf_of(file, line, src=""):
-    """Classify one source line into the leaf frame it belongs to."""
-    if file == "exp_a_cartesian.cu":
-        for lo, hi, name in FUNC_RANGES:
-            if line is not None and lo <= line <= hi:
-                return name
-        return "kernel body: other"
-    return header_leaf(file, line, src)
+def header_leaf(file, line, source):
+    """Known inlined headers; unknown correlations remain explicitly unmapped."""
+    if file == "spreadinterp.hpp":
+        return "cudaFMA" if line == 47 else "fold_rescale"
+    if file == "sm_32_intrinsics.hpp":
+        return "__ldg"
+    if file == "sm_30_intrinsics.hpp":
+        if "vote_all_sync" in source:
+            return "__all_sync"
+        if "bar_warp_sync" in source:
+            return "__syncwarp"
+        if "__syncthreads" in source:
+            return "__syncthreads"
+    return "unmapped source"
 
 
-def build_tree(per_line, root):
-    """Return (self_samples, total_samples, lines) for one kernel root.
+class SourceLayout:
+    """Source spans and static calls for this prototype's free CUDA functions.
 
-    `lines[leaf]` holds the source rows that belong directly to that frame;
-    samples from descendants are aggregated into `total_samples` through the
-    static call graph rooted at `root`, never duplicated into `self_samples`.
-    Shared leaf names (stage_raw_points, prepare_point_coefficients, ...) are
-    attached to different parents depending on the selected kernel.
+    Read the archived .cu next to the CSV, not hard-coded line ranges from the
+    latest kernel. This is intentionally not a general-purpose C++ parser.
+    Strip comments/strings before matching definitions, braces and calls.
     """
-    reachable = set()
-    def visit(frame):
-        if frame in reachable:
-            return
-        reachable.add(frame)
-        for kid in CHILDREN.get(frame, []):
-            visit(kid)
-    visit(root)
 
+    def __init__(self, path, root):
+        self.path = Path(path)
+        self.root = root
+        text = self.path.read_text()
+        self.source_lines = text.splitlines()
+        ignored = r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
+        code = re.sub(ignored, lambda m: re.sub(r"[^\n]", " ", m[0]), text)
+        definition = re.compile(
+            r"(?m)^(?:(?:__host__|__device__|__global__|__forceinline__)\s+)+"
+            r"(?:void|int|float)\s+(\w+)\s*\("
+        )
+        self.ranges = []
+        bodies = {}
+        for match in definition.finditer(code):
+            start = code.index("{", match.end())
+            depth = 1
+            end = start
+            while depth and end + 1 < len(code):
+                end += 1
+                depth += (code[end] == "{") - (code[end] == "}")
+            if depth:
+                raise ValueError(f"unclosed CUDA function {match[1]} in {path}")
+            self.ranges.append((code.count("\n", 0, match.start()) + 1,
+                                code.count("\n", 0, end) + 1, match[1]))
+            bodies[match[1]] = code[start + 1:end]
+        if root not in bodies:
+            raise ValueError(f"kernel {root} not found in source snapshot {path}")
+
+        header_calls = {"fold_rescale", "cudaFMA", "__ldg", "__syncwarp",
+                        "__all_sync", "__syncthreads"}
+        names = set(bodies) | header_calls
+        call = re.compile(r"\b(" + "|".join(sorted(names)) + r")\s*(?:<[^;{}()]*>)?\s*\(")
+        graph = {name: list(dict.fromkeys(m[1] for m in call.finditer(body)))
+                 for name, body in bodies.items()}
+        graph["fold_rescale"] = ["cudaFMA"]
+        self.reachable = set()
+
+        def visit(frame, ancestors):
+            if frame in ancestors:
+                raise ValueError(f"recursive source call graph at {frame}")
+            if frame not in self.reachable:
+                self.reachable.add(frame)
+                for child in graph.get(frame, []):
+                    visit(child, ancestors | {frame})
+
+        visit(root, set())
+        self.children = {name: list(graph.get(name, [])) for name in self.reachable}
+        parents = defaultdict(set)
+        for parent, children in self.children.items():
+            for child in children:
+                parents[child].add(parent)
+        # PC correlations cannot distinguish multiple inline callers. Do not
+        # duplicate the shared callee's samples under every possible parent.
+        self.ambiguous_callers = {
+            child: sorted(callers) for child, callers in parents.items() if len(callers) > 1
+        }
+        for child, callers in sorted(self.ambiguous_callers.items()):
+            for parent in callers:
+                self.children[parent].remove(child)
+            self.children[root].append(child)
+        self.reachable.add("unmapped source")
+        self.children[root].append("unmapped source")
+
+    def leaf_of(self, file, line, source):
+        if file in (self.path.name, "exp_a_cartesian.cu"):
+            if line is not None:
+                if not 1 <= line <= len(self.source_lines) or self.source_lines[line - 1].strip() != source:
+                    raise ValueError(f"source snapshot mismatch at {file}:{line}; use --cuda-source from the capture")
+                for lo, hi, name in self.ranges:
+                    if lo <= line <= hi:
+                        return name
+            return "unmapped source"
+        return header_leaf(file, line, source)
+
+
+def build_tree(profile, layout):
+    """Account for every deduplicated sample once, including unknown source."""
     self_samples = defaultdict(int)
     lines = defaultdict(list)
-    for (file, line), rec in per_line.items():
-        leaf = leaf_of(file, line, rec.get("src", ""))
-        if leaf not in reachable:
-            continue
+    for (file, line), rec in profile.lines.items():
+        leaf = layout.leaf_of(file, line, rec["src"])
+        if leaf not in layout.reachable:
+            leaf = "unmapped source"
         self_samples[leaf] += rec["samples"]
         lines[leaf].append((file, line, rec))
+    totals = {}
 
-    # Include zero-sample frames so the hierarchy stays visible.
-    for frame in reachable:
-        self_samples.setdefault(frame, 0)
+    def total(frame):
+        totals[frame] = self_samples[frame] + sum(total(child) for child in layout.children.get(frame, []))
+        return totals[frame]
 
-    total = dict(self_samples)
-    changed = True
-    while changed:  # Tree is shallow; simple fixed-point aggregation.
-        changed = False
-        for parent in reachable:
-            kids = CHILDREN.get(parent, [])
-            candidate = self_samples[parent] + sum(total.get(k, 0) for k in kids
-                                                    if k in reachable)
-            if candidate != total.get(parent, 0):
-                total[parent] = candidate
-                changed = True
-
+    if total(layout.root) != profile.total_samples:
+        raise ValueError("source tree does not account for all PC samples")
     for leaf in lines:
-        lines[leaf].sort(key=lambda e: (e[0], e[1] if e[1] is not None else -1))
-    return self_samples, total, lines
+        lines[leaf].sort(key=lambda item: (item[0] or "", item[1] if item[1] is not None else -1))
+    return self_samples, totals, lines
 
 
-def main() -> None:
-    if len(sys.argv) < 3:
-        print(__doc__)
-        sys.exit(1)
-    src, out = sys.argv[1], sys.argv[2]
-    kernel_us = 21650.0
-    if "--kernel-us" in sys.argv:
-        kernel_us = float(sys.argv[sys.argv.index("--kernel-us") + 1])
-    text_out = None
-    if "--text" in sys.argv:
-        text_out = sys.argv[sys.argv.index("--text") + 1]
-    root = "spread_cartesian_owned"
-    if "--root" in sys.argv:
-        root = sys.argv[sys.argv.index("--root") + 1]
+def positive_duration(value):
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("duration must be finite and positive")
+    return value
 
-    per_line = parse(src)
-    total_samples = sum(v["samples"] for v in per_line.values())
-    if not total_samples:
-        sys.exit("no samples in the source CSV")
-    us_per_sample = kernel_us / total_samples
 
-    self_samples, total, lines = build_tree(per_line, root)
-
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("csv", type=Path)
+    parser.add_argument("out", type=Path)
+    parser.add_argument("--kernel-us", type=positive_duration, required=True,
+                        help="duration of the same ncu launch; used only to scale the sample layout")
+    parser.add_argument("--text", type=Path)
+    parser.add_argument("--root", default="spread_cartesian_owned")
+    parser.add_argument("--cuda-source", type=Path,
+                        help="matching source snapshot (default: exp_a_cartesian.cu next to CSV, then current source)")
+    args = parser.parse_args()
+    source = args.cuda_source
+    if source is None:
+        source = args.csv.with_name("exp_a_cartesian.cu")
+        if not source.is_file():
+            source = Path(__file__).with_name("exp_a_cartesian.cu")
+    try:
+        profile = parse(args.csv, args.root)
+        layout = SourceLayout(source, args.root)
+        self_samples, totals, lines = build_tree(profile, layout)
+        if not profile.total_samples:
+            raise ValueError("no PC samples for the selected kernel")
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    total_samples = profile.total_samples
+    us_per_sample = args.kernel_us / total_samples
+    note = (
+        "Flat ncu PC samples, deduplicated by (kernel, PC); first source correlation wins. "
+        "Static source hierarchy, not a captured device call stack. Widths are samples, "
+        "not wall-clock self time. Time coordinates are a synthetic sample layout scaled "
+        "to the supplied kernel duration, not a GPU timeline. Short-scoreboard samples "
+        "describe waiting consumers, not necessarily the source of the load."
+    )
     events = [
         {"ph": "M", "name": "process_name", "pid": 1,
-         "args": {"name": f"{root} (PC-sample attribution, source call tree)"}},
+         "args": {"name": f"{args.root} (PC-sample attribution, NOT a timeline)"}},
         {"ph": "M", "name": "thread_name", "pid": 1, "tid": 1,
-         "args": {"name": "kernel -> source call hierarchy -> source line"}},
+         "args": {"name": "synthetic source hierarchy; widths = samples"}},
         {"ph": "M", "name": "process_name", "pid": 2,
-         "args": {"name": "GPU timeline (measured)"}},
+         "args": {"name": "Kernel duration reference (not a timeline)"}},
         {"ph": "M", "name": "thread_name", "pid": 2, "tid": 1,
-         "args": {"name": "one ncu launch"}},
+         "args": {"name": "supplied duration of the same profiled launch"}},
     ]
 
-    def T(offset):
-        return offset * us_per_sample
+    def begin(pid, offset, name, category, details):
+        events.append({"ph": "B", "pid": pid, "tid": 1, "ts": offset * us_per_sample,
+                       "name": name, "cat": category, "args": details})
 
-    def begin(pid, tid, a, name, cat, args=None):
-        e = {"ph": "B", "pid": pid, "tid": tid, "ts": T(a), "name": name, "cat": cat}
-        if args:
-            e["args"] = args
-        events.append(e)
+    def end(pid, offset):
+        events.append({"ph": "E", "pid": pid, "tid": 1, "ts": offset * us_per_sample})
 
-    def end(pid, tid, b):
-        events.append({"ph": "E", "pid": pid, "tid": tid, "ts": T(b)})
-
-    def line_args(file, line, rec):
-        return {"file": file, "line": line, "samples": rec["samples"],
-                "warp_inst": rec["inst"],
-                "stalls": {k: v for k, v in rec["stalls"].items() if v}}
-
-    def render(frame, offset, depth):
-        """Emit a frame, its own source lines, then its callees."""
-        width = total.get(frame, 0)
-        if width == 0:
-            return
-        cat = "function" if not frame.startswith("kernel body") else "inline"
-        begin(1, 1, offset, frame, cat,
-              {"samples": width, "self_samples": self_samples.get(frame, 0)})
-        cursor = offset
-        # Own source lines first (source order), then nested callees.
-        for file, line, rec in lines.get(frame, []):
-            label = SHORT_LABEL.get(line, rec["src"][:60])
-            name = f"{file}:L{line} {label}" if line is not None else f"{file} {label}"
-            begin(1, 1, cursor, name, "line", line_args(file, line, rec))
-            cursor += rec["samples"]
-            end(1, 1, cursor)
-        for kid in CHILDREN.get(frame, []):
-            render(kid, cursor, depth + 1)
-            cursor += total.get(kid, 0)
-        end(1, 1, offset + width)
-
-    render(root, 0, 0)
-
-    begin(2, 1, 0, f"{root} (measured)", "kernel",
-          {"duration_ms": kernel_us / 1000.0})
-    end(2, 1, total_samples)
-
-    trace = {"traceEvents": events, "displayTimeUnit": "ms",
-             "otherData": {
-                 "source": src,
-                 "total_samples": total_samples,
-                 "kernel_us": kernel_us,
-                 "note": ("Flat ncu PC samples attributed through the static source call "
-                          "graph; parent width = own samples + descendants. Widths are "
-                          "samples, not wall-clock self time. Inlined functions have no "
-                          "runtime call stack."),
-             }}
-    json.dump(trace, open(out, "w"))
-
-    # Text rendering of the same hierarchy (handy for review and diffs).
     text = []
 
-    def text_render(frame, depth):
-        width = total.get(frame, 0)
-        if width == 0:
+    def render(frame, offset, depth):
+        width = totals[frame]
+        if not width:
             return
-        share = 100.0 * width / total_samples
+        share = 100 * width / total_samples
+        begin(1, offset, frame, "source attribution",
+              {"samples": width, "sample_share_percent": share, "self_samples": self_samples[frame]})
         text.append(f"{'  ' * depth}{frame}  [{width:,} samples = {share:.1f}%]")
-        for file, line, rec in lines.get(frame, []):
-            label = SHORT_LABEL.get(line, rec["src"][:60])
-            where = f"{file}:L{line}" if line is not None else file
-            lshare = 100.0 * rec["samples"] / total_samples
-            text.append(f"{'  ' * (depth + 1)}{where} {label}  "
-                        f"[{rec['samples']:,} = {lshare:.1f}%]")
-        for kid in CHILDREN.get(frame, []):
-            text_render(kid, depth + 1)
+        cursor = offset
+        for file, line, rec in lines[frame]:
+            if not rec["samples"]:
+                continue
+            where = f"{file}:L{line}" if line is not None else (file or "unknown source")
+            label = f"{where} {rec['src'][:100]}".rstrip()
+            details = {
+                "file": file, "line": line, "source": rec["src"],
+                "samples": rec["samples"], "not_issued_samples": rec["not_issued_samples"],
+                "warp_inst": rec["inst"], "thread_inst": rec["thread_inst"],
+                "predicated_thread_inst": rec["predicated_thread_inst"],
+                "stalls": {key: value for key, value in rec["stalls"].items() if value},
+                "not_issued_stalls": {key: value for key, value in rec["not_issued_stalls"].items() if value},
+            }
+            begin(1, cursor, label, "source line", details)
+            cursor += rec["samples"]
+            end(1, cursor)
+            text.append(f"{'  ' * (depth + 1)}{label}  "
+                        f"[{rec['samples']:,} = {100 * rec['samples'] / total_samples:.1f}%]")
+        for child in layout.children.get(frame, []):
+            render(child, cursor, depth + 1)
+            cursor += totals[child]
+        if cursor != offset + width:
+            raise ValueError(f"incomplete rendering of {frame}")
+        end(1, cursor)
 
-    text_render(root, 0)
-    text = "\n".join(text) + "\n"
-    if text_out:
-        open(text_out, "w").write(text)
-    print(text, end="")
-
-    print(f"\nwrote {out}: {len(events)} events, {total_samples:,} samples, "
-          f"root {kernel_us/1000:.2f} ms")
-    print(f"note: hierarchy is the source call graph; PC samples are flat.")
+    render(args.root, 0, 0)
+    begin(2, 0, f"{args.root} (duration reference)", "duration reference",
+          {"duration_ms": args.kernel_us / 1000})
+    end(2, total_samples)
+    trace = {
+        "traceEvents": events, "displayTimeUnit": "ms",
+        "otherData": {
+            "source": str(args.csv), "cuda_source": str(source),
+            "kernel": profile.kernel_name, "total_samples": total_samples,
+            "total_warp_instructions": profile.total_instructions,
+            "unique_pcs": profile.unique_pcs, "duplicate_pc_rows": profile.duplicate_pc_rows,
+            "unmapped_samples": totals["unmapped source"],
+            "ambiguous_callers": layout.ambiguous_callers,
+            "kernel_us": args.kernel_us, "note": note,
+        },
+    }
+    args.out.write_text(json.dumps(trace, allow_nan=False) + "\n")
+    text_output = "\n".join(text) + "\n\n" + note + "\n"
+    if args.text:
+        args.text.write_text(text_output)
+    print(text_output, end="")
+    print(f"\nwrote {args.out}: {total_samples:,} samples, {profile.total_instructions:,} warp instructions, "
+          f"{profile.unique_pcs:,} PCs ({profile.duplicate_pc_rows} duplicate rows removed)")
+    if totals["unmapped source"]:
+        print(f"warning: {totals['unmapped source']:,} samples retained under 'unmapped source'", file=sys.stderr)
+    if layout.ambiguous_callers:
+        print("note: shared inline callees with ambiguous parents are attached to the root: "
+              + ", ".join(sorted(layout.ambiguous_callers)), file=sys.stderr)
 
 
 if __name__ == "__main__":

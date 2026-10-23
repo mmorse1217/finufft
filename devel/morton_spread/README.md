@@ -146,10 +146,28 @@ For the clustered block-shared kernel add
 default root. v11as uniform/clustered captures and flamegraphs are in
 `profile-artifacts/expA-output-owned/opt-2026-10-22/v11as/`.
 
-Widths are PC-sample shares rescaled to the measured kernel time. The hierarchy is
-reconstructed from the **static source call graph** (`dim_support` under `scan_point`,
-`fold_rescale`/`cudaFMA` under `stage_coeff`); ncu PC sampling is flat and inlined functions
-have no runtime call stack. Stall reasons are event args, not frames. The complete captures
+`--kernel-us` is required: use the duration of the **same ncu launch**, not a benchmark
+median (21650 above is an example). Widths are deduplicated **PC-sample shares**, not
+wall-clock self time; Chrome's time coordinates are only a synthetic layout scaled to
+that duration. The duration-reference track is not a GPU timeline.
+
+The converter counts each `(kernel, PC)` once, keeping its first source correlation, and
+reconstructs the **static source call graph** from `exp_a_cartesian.cu` beside the CSV.
+Use `--cuda-source <snapshot.cu>` if the matching source lives elsewhere. Source-line
+mismatches fail rather than silently applying current line numbers to older captures.
+Unknown source remains visible under `unmapped source`; ambiguous shared callees attach
+to the root instead of being counted under multiple callers. Flat ncu samples contain
+no device call stack. Stall reasons and instruction counts are event args; short-scoreboard
+samples describe waiting consumers, not necessarily the triggering loads.
+
+The v11av and v11ay uniform/clustered `*_flamegraph_chrome.json` and `*_calltree.txt`
+files have been regenerated with these fixes. CPU-only regression tests:
+
+```bash
+python3 -m unittest discover -s devel/morton_spread -p 'test_ncu_samples_to_chrome.py'
+```
+
+The complete captures
 (v1, v3, v5, v6, v7, v8, v10, `reopen-2026-10-22/`, and `opt-2026-10-22/`) are under
 `profile-artifacts/expA-output-owned/`; `opt-2026-10-22/v11ay/` is the current version and
 carries the contiguous coefficient rows and strength-scaled accumulation.

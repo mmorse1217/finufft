@@ -1,5 +1,13 @@
 # ISSUE-009: interpreting the v11av profile
 
+**Converter update (2026-10-23):** The duplicate-PC counting, stale source ranges/call
+mapping, and dropped samples described below are fixed in
+`devel/morton_spread/ncu_samples_to_chrome.py`. The v11av/v11ay uniform and clustered
+flamegraphs/call trees were regenerated offline using their matching source snapshots
+and actual ncu launch durations. Both roots now account for 100% of deduplicated CSV
+samples; 14 CPU-only regression tests cover the fix. Bug descriptions and converter
+line references below describe the pre-fix tool and graphs.
+
 **Scope:** offline analysis of existing artifacts; no GPU execution, build, or kernel changes.
 **Conclusion:** the shared-load-dominated reading is misleading. There are also two concrete
 flamegraph-converter errors: repeated PCs are counted repeatedly, and the clustered tree
