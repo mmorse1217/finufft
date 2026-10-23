@@ -278,6 +278,19 @@ medians of 4 process runs with 5 timed runs each:
   (A/B log, ptxas, ncu captures, flamegraphs, call trees, README). Commits `d1c5fc7a`,
   `fd5fb705`. Experiment A is now complete at v11ay; Experiment B remains unblocked.
 
+- 2026-10-23 17:32 — Committed-source verification. Rebuilt
+  `devel/morton_spread/exp_a_cartesian.cu` (worktree and `HEAD:` hash both
+  `446b0345f28dd7d41b37f8392f725344de9df46d`) into
+  `build/gpu/exp_a_cartesian_verify` with the documented `nvcc` command and reran the
+  4-process-run / 5-timed-run matrix. Medians: uniform pre/spread/total
+  **3.089 / 10.917 / 14.476 ms**; clustered **1.461 / 11.234 / 12.827 ms**; sparse
+  **0.284 / 1.396 / 1.972 ms**. Spread reproduces within 0.2% of the reported
+  10.912 / 11.232 / 1.393 ms; totals within 0.8% (sparse metadata-timing variance).
+  `relL2` and resources also reproduce (uniform 5.634e-7 / 96 regs / 12,696 B / 5 blocks;
+  clustered 2.1-2.6e-7 / 95 regs / 12,936 B / 5 blocks; sparse 7.34e-8 / 96 regs /
+  12,696 B / 5 blocks). Raw log:
+  `profile-artifacts/expA-output-owned/opt-2026-10-22/v11ay/verify_committed_bench.txt`.
+
 
 ## Session log — 2026-10-22 (comprehensive)
 
