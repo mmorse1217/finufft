@@ -25,11 +25,12 @@ apply across issues.
   prototype experiments.
 - No implementation issues are filed and no sprints are planned. The baseline is
   established. Experiment A (*Prototype output-cell ownership with Cartesian bins*) completed
-  successfully with **v11av** (`ee278ffa`): uniform `1e6` spread **12.58 ms** / total
-  **16.10 ms** (both gates pass), clustered `1e6` spread **13.71 ms** / total **15.31 ms**
-  (total 8.8% faster than method 3; spread 13.7% faster, short of the 20% stretch), sparse
-  `1e5` spread **1.53 ms** / total **2.09 ms**. No mandatory workload regressed. The Morton
-  prototype (*Prototype Morton-sorted output-cell-owned spreading*) is now unblocked.
+  successfully with **v11ay** (`d1c5fc7a`): uniform `1e6` spread **10.91 ms** / total
+  **14.45 ms**, clustered `1e6` spread **11.23 ms** / total **12.83 ms**, sparse `1e5`
+  spread **1.39 ms** / total **1.96 ms**. Both mandatory `1e6` spread gates pass (uniform
+  31.6%, clustered 29.4% faster than method 3), both totals are faster than method 3, and no
+  mandatory workload regressed. The Morton prototype (*Prototype Morton-sorted
+  output-cell-owned spreading*) is now unblocked.
 - The domain vocabulary is initialized in [`GLOSSARY.md`](GLOSSARY.md); the ownership term
   is settled as output-cell ownership / output-owned spreading
   ([ticket](issues/done/ISSUE-007-ownership-and-morton-vocabulary.md)).

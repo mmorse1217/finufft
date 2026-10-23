@@ -12,6 +12,8 @@
 - 92014e4b — v11at preprocessing rewrite (packed gather + GPU binstart)
 - 674ad159 — v11au three-point coefficient packing
 - ee278ffa — v11av three-point packing in block-shared staging
+- d1c5fc7a — v11ay contiguous coefficient rows + strength-scaled scan
+- fd5fb705 — docs: record the v11ay result and the updated acceptance evidence
 
 **Dependencies:**
 - ISSUE-002
@@ -49,6 +51,50 @@ The prototype should:
   whether Morton ordering is still worth testing.
 
 Link the prototype artifact, commands, results, and recommendation from `## Answer`.
+
+## Acceptance criteria
+
+The acceptance bar is the settled ISSUE-006 gate. Final result at **v11ay** (2026-10-23),
+medians of 4 process runs with 5 timed runs each:
+
+- [x] **Correctness.** Fine-grid spread output matches pinned method 3 within the
+  reordering-calibrated FP32 noise floor. `relL2` = 5.64e-7 uniform, 2.26e-7 clustered,
+  7.34e-8 sparse.
+- [x] **Uniform spread gate.** At least 20% faster than method 3 on `1e6` `64^3`
+  uniform (`qb=1`, radix): **10.912 ms vs 15.95 ms = 31.6% faster**.
+- [x] **Clustered spread gate.** At least 20% faster than method 3 on `1e6` `64^3`
+  clustered (`qb=4`, counting, split 56): **11.232 ms vs 15.90 ms = 29.4% faster**.
+  The v11av result (13.714 ms) missed this stretch gate; v11ay closes it.
+- [x] **No mandatory regression >5%.** Uniform, clustered, and sparse (`1e5` `128^3`,
+  `qb=4`, radix) all improve: spread 1.393 ms vs 2.82 ms (50.6% faster); total 1.956 ms
+  vs 2.95 ms (33.7% faster).
+- [x] **Preprocessing + spread total within 5% of method 3.** Both mandatory totals are
+  faster: uniform **14.446 ms vs 16.78 ms** (13.9% faster), clustered **12.834 ms vs
+  16.79 ms** (23.6% faster).
+- [x] **Prototype contract.** Standalone under `devel/morton_spread/`, no library build
+  change, FP32 `ns=6`, the measured `16x16x8` tile / `8x8x8` warp region / 16 cells per
+  thread geometry, and no global atomics in the spread.
+- [x] **Reported evidence.** `relL2`, spread/total times, effective throughput inputs
+  (`visits`, reread), occupancy, registers, shared memory, and the source-attribution
+  profile are recorded in the results note and the v11ay artifact directory.
+
+## Verification criteria
+
+- [x] Build the default prototype with
+  `./devel/morton_spread/run_exp_a.sh` (or the `nvcc -O3 -std=c++17 -arch=sm_75` command in
+  its README) and run the mandatory matrix. Default binaries are v11ay.
+- [x] Benchmark commands and raw results:
+  `profile-artifacts/expA-output-owned/opt-2026-10-22/v11ay/ab_v11av_v11ay.txt` and
+  `bench.txt` (uniform `1000000 64 64 64 0 1 5`; clustered
+  `1000000 64 64 64 1 4 5 0`; sparse `100000 128 128 128 0 4 5`).
+- [x] ptxas resource evidence: `v11ay/ptxas.txt` shows 96 registers / 12,696 B shared for
+  `spread_cartesian_owned` and 95 registers / 12,936 B shared for
+  `spread_cartesian_owned_block_shared`, 5 blocks/SM, 0 spill stores/loads.
+- [x] ncu evidence: `v11ay/uniform_qb1_ncu.ncu-rep` and
+  `v11ay/clustered_qb4_ncu.ncu-rep` with details/source CSVs; warp instructions
+  560.7M uniform / 686.1M clustered, down from 671.9M / 868.6M at v11av.
+- [x] Source and docs committed as `d1c5fc7a` and `fd5fb705`; the v11ay artifact
+  directory and README carry the full evidence.
 
 ## Notes
 
@@ -208,6 +254,26 @@ Link the prototype artifact, commands, results, and recommendation from `## Answ
   `stage_raw` line 241 store 2.8% with 72% excessive shared wavefronts (STAGE=24 stride gives
   bank conflicts). This is a source-derived hierarchy, not a captured device call stack: ncu
   PC sampling is flat and the functions are inlined.
+
+- 2026-10-23 17:22 — Closed the remaining clustered-spread gap with **v11ay**. The v11av
+  profile analysis identified the 16-cell accumulation body (37.6% / 48.2% of scan samples,
+  only 6.4 / 4.1 active lanes per accumulation instruction, 2.0-2.25x the useful FFMAs) as
+  the real cost, not shared-memory bandwidth. v11ay (1) gives the z row three zero pre-pads
+  and loads a lane group's four values from
+  `21 + support_coefficient_offset_z - local_cell_offset_z`; (2) reuses the x post-pad as
+  the y pre-pad so y also loads contiguously; (3) forms four real and four imaginary
+  `strength*z` factors once per lane group, cutting the 16-cell body from 16 FMUL + 32 FFMA
+  to 8 FMUL + 32 FFMA. `VALUES_PER_POINT` is 30, so the 5-block batches are 13/53; resources
+  remain 96/95 registers, 12,696/12,936 B shared, 5 blocks/SM, no spills.
+  4-process-run medians: uniform **10.912 / 14.446 ms**, clustered **11.232 / 12.834 ms**,
+  sparse **1.393 / 1.956 ms** (spread / total). Both mandatory `1e6` spread gates now pass
+  (31.6% uniform, 29.4% clustered faster than method 3); both mandatory totals are faster;
+  `relL2` 5.64e-7 / 2.26e-7 / 7.34e-8. Rejected: `VALUES_PER_POINT=31` (misaligned `int2`
+  metadata load), `VALUES_PER_POINT=32` (same-bank row aliasing + batch loss), xy-scaling,
+  scoped scaling, 3-point scan unroll, nsplit changes, and explicit `float2` staging
+  stores. Artifacts: `profile-artifacts/expA-output-owned/opt-2026-10-22/v11ay/`
+  (A/B log, ptxas, ncu captures, flamegraphs, call trees, README). Commits `d1c5fc7a`,
+  `fd5fb705`. Experiment A is now complete at v11ay; Experiment B remains unblocked.
 
 
 ## Session log — 2026-10-22 (comprehensive)
@@ -1323,9 +1389,11 @@ store traffic disrupted the scan more than it hid staging. Rejected; v11av remai
 Artifact: `profile-artifacts/expA-output-owned/opt-2026-10-22/v11aw/`.
 
 
-## Final outcome — success (2026-10-23)
+## Final outcome at v11av — success (2026-10-23; superseded by the v11ax/v11ay addendum below)
 
-Experiment A is successful. The final implementation is **v11av** (commit `ee278ffa`):
+Experiment A is successful at this point. The implementation here is **v11av** (commit
+`ee278ffa`); the v11ax/v11ay addendum below is the final result and closes the remaining
+clustered-spread headroom:
 per-warp and block-shared staging with three-point coefficient packing, packed payload
 gathers, GPU binstart construction, and measured block/warp-visit dispatch.
 

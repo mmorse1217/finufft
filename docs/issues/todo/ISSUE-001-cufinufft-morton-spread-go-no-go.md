@@ -109,6 +109,14 @@ research ticket; they are not committed or pushed, matching the local-only track
   (total 8.8% faster than method 3; spread 13.7% faster, short of the 20% stretch), sparse
   1.53/2.09 ms. No mandatory workload regressed. Experiment B (Morton ordering) is now
   unblocked; clustered-spread headroom is a follow-up performance target.
+- 2026-10-23 17:22 — Experiment A closed again at **v11ay** (`d1c5fc7a`, docs `fd5fb705`)
+  after the v11av profile analysis showed the scan's 16-cell accumulation body was the real
+  cost, not shared-memory bandwidth. Contiguous coefficient rows plus strength-scaled
+  accumulation give 4-process medians of uniform **10.912 / 14.446 ms**, clustered
+  **11.232 / 12.834 ms**, sparse **1.393 / 1.956 ms** (spread / total). Both mandatory `1e6`
+  spread gates now pass (uniform 31.6%, clustered 29.4% faster than method 3), both totals
+  are faster, and no workload regressed; `relL2` 5.64e-7 / 2.26e-7 / 7.34e-8. The map's
+  Experiment A decision gist is updated; Experiment B remains unblocked.
 
 ## Decisions so far
 
@@ -144,9 +152,12 @@ research ticket; they are not committed or pushed, matching the local-only track
   atomics; 90–180 MB global `RED` merge traffic.
 
 - [Prototype output-cell ownership with Cartesian bins](../done/ISSUE-009-output-cell-ownership-cartesian-prototype.md):
-  Experiment A succeeded with v11av. Uniform spread/total pass both gates; clustered total
-  is 8.8% faster than method 3 with spread 13.7% faster; sparse is substantially ahead; no
-  mandatory regression. Experiment B is unblocked.
+  Experiment A succeeded and was completed at **v11ay**. Both mandatory `1e6` spread gates
+  pass (uniform 31.6%, clustered 29.4% faster than method 3), both totals are faster
+  (uniform 14.446 vs 16.78 ms, clustered 12.834 vs 16.79 ms), sparse is substantially
+  ahead, and no mandatory workload regressed. The win came from removing the z/y
+  lane-group shift selects and halving the inner weight multiplies in the 16-cell scan, not
+  from changing the shared-memory layout. Experiment B is unblocked.
 
 ## Not yet specified
 
