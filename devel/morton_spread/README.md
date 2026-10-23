@@ -151,12 +151,20 @@ reconstructed from the **static source call graph** (`dim_support` under `scan_p
 `fold_rescale`/`cudaFMA` under `stage_coeff`); ncu PC sampling is flat and inlined functions
 have no runtime call stack. Stall reasons are event args, not frames. The complete captures
 (v1, v3, v5, v6, v7, v8, v10, `reopen-2026-10-22/`, and `opt-2026-10-22/`) are under
-`profile-artifacts/expA-output-owned/`; `opt-2026-10-22/v11at/` is the current version and
-carries the preprocessing rewrite on top of the block-shared clustered path.
+`profile-artifacts/expA-output-owned/`; `opt-2026-10-22/v11au/` is the current version and
+carries the three-point packing on top of the v11at preprocessing and block-shared path.
 
-## Verdict (current: v11at preprocessing + v11as block-shared staging)
+## Verdict (current: v11au three-point packing + v11at preprocessing + v11as block-shared staging)
 
-**v11at** keeps the v11as spread kernels and rewrites preprocessing: fused qbin+pack, a
+**v11au** keeps the v11at preprocessing and v11as block-shared clustered path, and changes
+the per-warp coefficient staging to process three points per warp iteration (9 lanes per
+point, two coefficients per lane; the second KER6 set comes from shared). Uniform spread
+falls **13.86 -> 12.59 ms**, passing the strict 12.76 ms gate; uniform total is **16.11 ms**
+and passes the 17.62 ms total gate. Sparse spread is 1.536 ms. Clustered is unchanged at
+14.03 ms spread / 15.62 ms total. Details:
+`profile-artifacts/expA-output-owned/opt-2026-10-22/v11au/`.
+
+**v11at** rewrote preprocessing: fused qbin+pack, a
 32-byte packed payload gather, and GPU binstart construction (radix: mark-starts + reverse
 exclusive scan; counting: GPU exclusive sum). Uniform preprocessing is **6.22 -> 3.09 ms**
 and uniform total is **20.38 -> 17.37 ms**, inside the 17.62 ms total gate. Clustered

@@ -302,6 +302,41 @@ __device__ __forceinline__ void prepare_point_coefficients(
   staged_point[coefficient_slot] = coefficient_value;
 }
 
+// Two coefficients for one point/dimension: the primary coefficient index k uses
+// the register-resident KER6 set, and k+3 uses the shared KER6 copy. This lets nine
+// lanes cover a point's 18 coefficients, so three points share one warp iteration.
+__device__ __forceinline__ void prepare_two_coefficients(
+    float *__restrict__ staged_point, int fine_grid_size_dimension,
+    int support_start_slot, int coefficient_slot, int second_coefficient_index,
+    const float *__restrict__ kernel_coefficients,
+    const float (*__restrict__ second_kernel_coefficients)[6]) {
+  using cufinufft::spreadinterp::fold_rescale;
+  const float folded_coordinate =
+      fold_rescale(staged_point[support_start_slot], fine_grid_size_dimension);
+  const float support_start_float =
+      ceilf(folded_coordinate - (float)(SUPPORT_WIDTH / 2));
+  const int support_start_int = (int)support_start_float;
+  const float horner_argument =
+      __fmaf_rn(2.f, support_start_float - folded_coordinate,
+                (float)(SUPPORT_WIDTH - 1));
+  reinterpret_cast<int *>(staged_point)[support_start_slot] = support_start_int;
+
+  float coefficient_value = kernel_coefficients[8];
+#pragma unroll
+  for (int horner_term = 7; horner_term >= 0; horner_term--)
+    coefficient_value = __fmaf_rn(horner_argument, coefficient_value,
+                                  kernel_coefficients[horner_term]);
+  staged_point[coefficient_slot] = coefficient_value;
+
+  float second_coefficient_value = second_kernel_coefficients[8][second_coefficient_index];
+#pragma unroll
+  for (int horner_term = 7; horner_term >= 0; horner_term--)
+    second_coefficient_value = __fmaf_rn(
+        horner_argument, second_coefficient_value,
+        second_kernel_coefficients[horner_term][second_coefficient_index]);
+  staged_point[coefficient_slot + 3] = second_coefficient_value;
+}
+
 // Support placement of a point in the frame of a GROUP_SIZE-cell group starting at lane_group_start.
 // Branchless: group_cell_count = number of group cells covered (0,1,2); the covered cells are
 // contiguous, local cell local_cell_offset+k gets kernel coefficient k[support_coefficient_offset+k] for k < group_cell_count.
@@ -396,6 +431,7 @@ __global__ void spread_cartesian_owned(
     const int *__restrict__ active_tile_indices) {
   __shared__ __align__(16) float
       staged_point_values[WARPS_PER_BLOCK][2][MAX_POINTS_PER_BATCH][VALUES_PER_POINT];
+  __shared__ float second_kernel_coefficients[9][6];
 
   const int warp_index     = threadIdx.x >> 5;
   const int lane_index     = threadIdx.x & 31;
@@ -423,17 +459,22 @@ __global__ void spread_cartesian_owned(
   // The nine Horner coefficients and the staging geometry for this lane are
   // loop-invariant: load/compute them once instead of per point.
   float kernel_coefficients[9] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  const int dimension   = lane_index / 6;
-  const int kernel_coefficient_index   = lane_index % 6;
+  const int coefficient_lane = lane_index % 9;
+  const int dimension   = coefficient_lane / 3;
+  const int kernel_coefficient_index   = coefficient_lane % 3;
   const int fine_grid_size_dimension  = (dimension == 0) ? fine_grid_size_x : ((dimension == 1) ? fine_grid_size_y : fine_grid_size_z);
   const int support_start_slot = dimension;
   const int coefficient_slot = 5 + dimension * 7 + kernel_coefficient_index;
-  if (lane_index < 18) {
+  if (lane_index < 27) {
 #pragma unroll
     for (int kernel_term = 0; kernel_term < 9; kernel_term++)
       kernel_coefficients[kernel_term] =
           KERNEL_COEFFICIENT_TABLE[kernel_term][kernel_coefficient_index];
   }
+  for (int table_entry = threadIdx.x; table_entry < 54; table_entry += blockDim.x)
+    second_kernel_coefficients[table_entry / 6][table_entry % 6] =
+        KERNEL_COEFFICIENT_TABLE[table_entry / 6][table_entry % 6];
+  __syncthreads();
 
   // Zero the padded coefficient slots once in both warp-private buffers. The
   // padding is never written again; scan_one_staged_point relies on it staying zero.
@@ -489,12 +530,19 @@ __global__ void spread_cartesian_owned(
                             input_strength_pairs, current_batch_values);
           __syncwarp();
           for (;;) {
-            // Hoist the lane_index predicate out of the per-point coefficient loop: the
-            // 18 staging lanes run the whole batch, then all lanes meet at the sync.
-            if (lane_index < 18) {
-              float *staged_point = current_batch_values;
-              for (int staged_point_slot = 0; staged_point_slot < staged_point_count; staged_point_slot++, staged_point += VALUES_PER_POINT)
-                prepare_point_coefficients(staged_point, fine_grid_size_dimension, support_start_slot, coefficient_slot, kernel_coefficients);
+            // Nine lanes per point cover the 18 coefficients (two per lane), so three
+            // points share one warp iteration. Lanes 27-31 stay idle.
+            if (lane_index < 27) {
+              const int point_slot = lane_index / 9;
+              float *staged_point =
+                  current_batch_values + point_slot * VALUES_PER_POINT;
+              for (int staged_point_slot = point_slot;
+                   staged_point_slot < staged_point_count;
+                   staged_point_slot += 3, staged_point += 3 * VALUES_PER_POINT)
+                prepare_two_coefficients(staged_point, fine_grid_size_dimension,
+                                         support_start_slot, coefficient_slot,
+                                         kernel_coefficient_index + 3,
+                                         kernel_coefficients, second_kernel_coefficients);
             }
             __syncwarp();
             const int next_first_point_index   = first_point_index + point_batch_stride;
