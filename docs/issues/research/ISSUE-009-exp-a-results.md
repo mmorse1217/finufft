@@ -617,47 +617,47 @@ budget. The full shuffle version needs more live values and would also fall to 4
 it is not viable without freeing registers elsewhere. v11t remains current best; v11t source
 and default binaries restored.
 
-## Method-3 baseline profile at v11as (2026-10-23)
+## Method-3 baseline profile at v11au (2026-10-23)
 
 Fresh profile of the comparison baseline. In this checkout the method-3 spread kernel is
 `spread_output_driven<float, 1, 3, 6>` (there is no symbol named `spread_cartesian`); the
-prototype kernel is `spread_cartesian_owned` / `spread_cartesian_owned_block_shared`.
-Full artifacts and commands:
+prototype kernels are `spread_cartesian_owned` and
+`spread_cartesian_owned_block_shared`. Full artifacts and commands:
 [`profile-artifacts/baseline-method3-2026-10-23/`](../../../profile-artifacts/baseline-method3-2026-10-23/README.md).
 
 Fresh head-to-head, second process run, 2 warm-ups + 5 timed runs:
 
-| Case | method 3 spread | v11as spread | v11as / m3 | method 3 total | v11as total |
+| Case | method 3 spread | v11au spread | v11au / m3 | method 3 total | v11au total |
 |---|---:|---:|---:|---:|---:|
-| uniform `1e6` `64^3` (`qb=1`, radix, per-warp) | 15.944 | **13.683** | **0.858 (1.17x faster)** | 16.761 | 20.322 |
-| clustered `1e6` `64^3` (`qb=4`, counting, block-shared, split 56) | 15.892 | **14.038** | **0.883 (1.13x faster)** | 16.814 | **15.878** |
-| sparse `1e5` `128^3` (`qb=4`, radix, per-warp) | 2.823 | **1.700** | **0.602 (1.66x faster)** | 2.957 | 2.356 |
+| uniform `1e6` `64^3` (`qb=1`, radix, 3-point packing) | 15.909 | **12.552** | **0.789 (1.27x faster)** | 16.734 | **16.080** |
+| clustered `1e6` `64^3` (`qb=4`, counting, block-shared, split 56) | 15.894 | **13.902** | **0.875 (1.14x faster)** | 16.812 | **15.494** |
+| sparse `1e5` `128^3` (`qb=4`, radix, 3-point packing) | 2.819 | **1.542** | **0.547 (1.83x faster)** | 2.950 | **2.099** |
 
-This reproduces the recorded v11as medians (13.85 / 14.03 / 1.712 ms spread; totals
-20.53 / 15.87 / 2.41 ms), so v11as remains current best. It keeps the v11ab per-warp
-kernel for uniform/sparse and switches to block-shared staging for clustered, selected by
-measured block/warp visits. Clustered spread falls 18.07 -> 14.03 ms and total 19.87 ->
-15.87 ms; uniform/sparse are unchanged apart from the block-visit metadata pass
-(~0.03-0.04 ms).
+This reproduces the recorded v11au medians (12.586 / 14.029 / 1.536 ms spread; totals
+16.112 / 15.624 / 2.092 ms), so v11au remains current best. It keeps the v11at
+preprocessing rewrite and v11as block-shared clustered path, and adds three-point
+coefficient packing (9 lanes per point, two coefficients per lane) to the per-warp path.
+Uniform spread now passes the strict 12.76 ms gate and uniform total passes the 17.62 ms
+gate; clustered total also beats method 3. Only clustered spread remains above target.
 
 ncu: method 3 uniform 15.75 ms / 380.2M warp instructions / 51 regs / 65.15 KB shared /
-25% occupancy / 2.00 active warps per scheduler / 71.9% no-eligible. v11as uniform is
-13.77 ms / 717.6M instructions / 95 regs / 12.54 KB / 5 blocks / 4.20 active warps /
-33.3% no-eligible. v11as clustered is 13.86 ms / 890.2M instructions / 94 regs /
-4.87 active warps / 24.9% no-eligible. It executes ~1.9x more instructions on uniform and
-~2.35x more on clustered, but wins uniform by raising occupancy/removing the per-point
-barrier and wins clustered by sharing the staged block batch (stage_coeff instructions
-fall roughly 4x). The remaining clustered cost is the scan, support placement, and
-block-barrier/loop overhead.
+25% occupancy / 2.00 active warps per scheduler / 71.9% no-eligible. v11au uniform is
+12.60 ms / 671.9M instructions / 96 regs / 12.76 KB / 5 blocks / 4.15 active warps /
+31.0% no-eligible. v11au clustered is 13.85 ms / 890.2M instructions / 94 regs /
+4.87 active warps / 24.9% no-eligible. It executes ~1.8x more instructions on uniform and
+~2.35x more on clustered, but wins uniform via three-point coefficient packing plus the
+earlier occupancy/barrier gains, and wins clustered by sharing the staged block batch
+(stage_coeff instructions fall roughly 4x). The remaining clustered cost is the scan,
+support placement, and block-barrier/loop overhead.
 
 Method 3 stall shares (uniform / clustered / sparse): `wait` 32.5 / 32.6 / 37.3%, barrier
 25.4 / 25.5 / 26.0%, shared-memory dependency 21.6 / 21.6 / 14.3%. Dense/clustered is
 barrier + shared-latency bound at 25% occupancy (65 KB local subgrid). Sparse adds merge
 index/global-merge work: the merge index modulo line is 15.9% of sparse source samples,
-and the global merge loop another 4.7%; that is the region v11as removes, which is why
-sparse is the strongest win. Uniform v11as is 13.7 ms vs the 12.76 ms gate target
-(~7.2% above), and the uniform total is still blocked by 6.21 ms of preprocessing plus
-0.43 ms of metadata vs method 3's 0.81 ms `setpts`.
+and the global merge loop another 4.7%; that is the region v11au removes, which is why
+sparse is the strongest win. Clustered spread is 13.9 ms vs the 12.72 ms gate target
+(about 1.18 ms high); uniform preprocessing is now 3.09 ms plus 0.44 ms of metadata, so
+the uniform total is no longer setup-bound.
 
 ## Clustered split-count tuning (v11x/v11y/v11z, 2026-10-23 00:39)
 
@@ -1381,3 +1381,26 @@ Committed as **674ad159**. Artifact:
 `profile-artifacts/expA-output-owned/opt-2026-10-22/v11au/` (source, ptxas, bench, ncu
 captures, flamegraphs, README). Remaining gate failure is clustered spread only; next
 candidates are the 32-cells/lane geometry or a warp-specialized producer/consumer pipeline.
+
+### v11au scan sample breakdown (2026-10-23)
+
+ncu source PC samples for the scan function, split into source-line groups:
+
+| group | uniform % of scan | clustered % of scan | dominant stalls |
+|---|---:|---:|---|
+| support placement | 31.5% | 23.2% | short scoreboard 36% / 44% |
+| coefficient LDS | 11.0% | 12.5% | wait / not_selected / math |
+| weight assembly / selects | 14.9% | 13.6% | wait / selected / branch |
+| metadata LDS (support/strength) | 4.5% | 4.6% | branch_resolving / wait |
+| early-out | 4.0% | 2.8% | wait |
+| 16-cell accumulation | 34.1% | 43.4% | math / not_selected / wait |
+
+Short-scoreboard accounts for **11.5%** of uniform scan samples and **11.7%** of clustered
+scan samples. Almost all of it is attributed to support placement waiting on the just-loaded
+support metadata; the metadata/coefficient LDS lines themselves show 0% short-scoreboard.
+LDS instructions are ~8-9% of total warp instructions, so the scan frame is not 70% LDS
+stalls; it is dominated by accumulation math/issue and support placement. The larger-warp-
+region tradeoff (halve per-point loads, double accumulator state, lower occupancy) remains
+plausible but is not justified by an "LDS is everything" reading of the flamegraph.
+
+Artifact: `profile-artifacts/expA-output-owned/opt-2026-10-22/v11au/scan_breakdown.txt`.

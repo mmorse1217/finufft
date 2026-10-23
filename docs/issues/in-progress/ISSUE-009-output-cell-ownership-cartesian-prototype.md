@@ -1279,3 +1279,13 @@ Details and flamegraphs:
 Committed as **674ad159**. Current state: uniform spread/total gates pass; clustered
 total passes but clustered spread remains 14.03 vs 12.72 ms. The remaining work is
 clustered scan-side only.
+
+### v11au scan breakdown note
+
+Short-scoreboard is **11.5%** (uniform) / **11.7%** (clustered) of scan samples, almost all
+attributed to support placement waiting on the metadata LDS result; the metadata and
+coefficient LDS lines themselves show 0% short-scoreboard. LDS instructions are ~8–9% of
+total warp instructions. The scan frame is dominated by 16-cell accumulation and support
+placement, not by LDS stalls. Full table:
+`docs/issues/research/ISSUE-009-exp-a-results.md` and
+`profile-artifacts/expA-output-owned/opt-2026-10-22/v11au/scan_breakdown.txt`.
