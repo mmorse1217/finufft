@@ -1495,4 +1495,8 @@ Remaining work is no longer needed for the Experiment A gates. If continued, the
 clear targets are (1) the ~1.35 ms uniform payload gather (random permutation) via a
 packed sorted payload read directly by staging, and (2) the fixed 16-cell body, which still
 does ~2x the useful cell updates; that needs a different ownership/geometry or shared
-accumulation, not more packing. Experiment B (Morton ordering) remains unblocked.
+accumulation, not more packing. A separate offline review of the remaining opportunities,
+including a fused rank-based counting sort and x-run endpoint sums for `kernel_visits`, is
+in
+[ISSUE-009-v11av-next-performance-steps.md](../research/ISSUE-009-v11av-next-performance-steps.md);
+its proposals are unmeasured next steps. Experiment B (Morton ordering) remains unblocked.
