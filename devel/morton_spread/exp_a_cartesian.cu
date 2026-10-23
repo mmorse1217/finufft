@@ -950,6 +950,88 @@ __global__ void kernel_block_visits(
   if (lane == 0) block_visits[wid] = v;
 }
 
+
+// Packed original point for the radix-path gather. The gather is random
+// (perm[i]), so reading one 32-byte record avoids four independent random array
+// accesses (x/y/z/strength) per point.
+struct alignas(32) PackedPoint {
+  float x, y, z, strength_real;
+  float strength_imag;
+  float pad[3];
+};
+
+__global__ void kernel_pack_points(const float *__restrict__ x, const float *__restrict__ y,
+                                   const float *__restrict__ z,
+                                   const cuFloatComplex *__restrict__ c,
+                                   float4 *__restrict__ packed, int M) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < M; i += blockDim.x * gridDim.x) {
+    packed[2 * i] = make_float4(x[i], y[i], z[i], c[i].x);
+    packed[2 * i + 1] = make_float4(c[i].y, 0.f, 0.f, 0.f);
+  }
+}
+
+__global__ void kernel_gather_sorted_packed(const int *__restrict__ perm,
+                                            const float4 *__restrict__ packed,
+                                            float *__restrict__ sx, float *__restrict__ sy,
+                                            float *__restrict__ sz,
+                                            cuFloatComplex *__restrict__ sc, int M) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < M; i += blockDim.x * gridDim.x) {
+    const int p = perm[i];
+    const float4 lo = packed[2 * p];
+    const float4 hi = packed[2 * p + 1];
+    sx[i] = lo.x;
+    sy[i] = lo.y;
+    sz[i] = lo.z;
+    sc[i] = make_cuFloatComplex(lo.w, hi.x);
+  }
+}
+
+// Fused qbin + packed-point pass for the radix path. The qbin kernel and the pack
+// kernel both read x/y/z; combining them avoids a second read of the coordinate arrays.
+__global__ void kernel_compute_qbin_pack(
+    const float *__restrict__ x, const float *__restrict__ y, const float *__restrict__ z,
+    const cuFloatComplex *__restrict__ c, int M, int nf1, int nf2, int nf3, int qb, int nqx,
+    int nqy, int nqz, int *__restrict__ qbin, float4 *__restrict__ packed) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < M; i += blockDim.x * gridDim.x) {
+    int b[3];
+    const float co[3] = {x[i], y[i], z[i]};
+    const int nf[3]   = {nf1, nf2, nf3};
+    const int nq[3]   = {nqx, nqy, nqz};
+    for (int d = 0; d < 3; d++) {
+      float r = cufinufft::spreadinterp::fold_rescale(co[d], nf[d]);
+      b[d]    = (int)(r / (float)qb);
+      b[d]    = min(max(b[d], 0), nq[d] - 1);
+    }
+    qbin[i] = b[0] + nqx * (b[1] + nqy * b[2]);
+    packed[2 * i]     = make_float4(x[i], y[i], z[i], c[i].x);
+    packed[2 * i + 1] = make_float4(c[i].y, 0.f, 0.f, 0.f);
+  }
+}
+
+
+// Radix-path binstart construction. mark_starts writes the first sorted position of
+// each non-empty bin; a reverse exclusive scan fills the empty bins with the next
+// non-empty start. The scan operator keeps the carried start unless the current bin
+// has one, i.e. next[b] = starts[b] if non-empty else next[b+1].
+struct NextStartOp {
+  __host__ __device__ int operator()(int carried, int current) const {
+    return current >= 0 ? current : carried;
+  }
+};
+
+__global__ void kernel_reverse_int(const int *__restrict__ src, int *__restrict__ dst,
+                                   int n) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x)
+    dst[i] = src[n - 1 - i];
+}
+
+__global__ void kernel_fill_next_start(const int *__restrict__ reversed_starts,
+                                       const int *__restrict__ reversed_prefix,
+                                       int *__restrict__ binstart, int n) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x)
+    binstart[n - 1 - i] = reversed_starts[i] >= 0 ? reversed_starts[i] : reversed_prefix[i];
+}
+
 // ---------------------------------------------------------------------------
 // Host harness
 // ---------------------------------------------------------------------------
@@ -1074,12 +1156,18 @@ int main(int argc, char **argv) {
   float *d_sx, *d_sy, *d_sz;
   cuFloatComplex *d_sc;
   unsigned int *d_keys_out = nullptr;
-  int *d_perm = nullptr, *d_starts = nullptr;
+  int *d_perm = nullptr, *d_starts = nullptr, *d_rev_starts = nullptr,
+      *d_rev_prefix = nullptr;
+  float4 *d_packed = nullptr;
   void *d_sort_tmp = nullptr;
   size_t sort_tmp_bytes = 0;
+  void *d_scan_tmp = nullptr;
+  size_t scan_tmp_bytes = 0;
+  void *d_startscan_tmp = nullptr;
+  size_t startscan_tmp_bytes = 0;
 
   CU(cudaMalloc(&d_qbin, M * sizeof(int)));
-  CU(cudaMalloc(&d_counts, nbins * sizeof(int)));
+  CU(cudaMalloc(&d_counts, (nbins + 1) * sizeof(int)));
   CU(cudaMalloc(&d_cursor, nbins * sizeof(int)));
   CU(cudaMalloc(&d_binstart, (nbins + 1) * sizeof(int)));
   CU(cudaMalloc(&d_sorted, M * sizeof(int)));
@@ -1089,7 +1177,12 @@ int main(int argc, char **argv) {
   CU(cudaMalloc(&d_sc, M * sizeof(cuFloatComplex)));
   CU(cudaMalloc(&d_keys_out, M * sizeof(unsigned int)));
   CU(cudaMalloc(&d_perm, M * sizeof(int)));
-  CU(cudaMalloc(&d_starts, nbins * sizeof(int)));
+  if (prep == 1) {
+    CU(cudaMalloc(&d_packed, (size_t)M * 2 * sizeof(float4)));
+    CU(cudaMalloc(&d_starts, nbins * sizeof(int)));
+    CU(cudaMalloc(&d_rev_starts, nbins * sizeof(int)));
+    CU(cudaMalloc(&d_rev_prefix, nbins * sizeof(int)));
+  }
   if (prep == 1) {
     size_t bytes = 0;
     cub::DeviceRadixSort::SortPairs(nullptr, bytes, (const unsigned int *)d_qbin, d_keys_out,
@@ -1098,18 +1191,31 @@ int main(int argc, char **argv) {
     sort_tmp_bytes = bytes;
     CU(cudaMalloc(&d_sort_tmp, sort_tmp_bytes));
   }
-  std::vector<int> hstart(nbins + 1, 0);
-  std::vector<int> hstarts(nbins, 0);
+  cub::DeviceScan::ExclusiveSum(nullptr, scan_tmp_bytes, d_counts, d_binstart, nbins + 1);
+  CU(cudaMalloc(&d_scan_tmp, scan_tmp_bytes));
+  if (prep == 1) {
+    NextStartOp next_start_op;
+    cub::DeviceScan::ExclusiveScan(nullptr, startscan_tmp_bytes, d_rev_starts, d_rev_prefix,
+                                   next_start_op, M, nbins);
+    CU(cudaMalloc(&d_startscan_tmp, startscan_tmp_bytes));
+  }
   std::vector<cuFloatComplex> h_ref(nf), h_new(nf);
 
   std::vector<double> pre_ms;
   for (int r = -2; r < nrun; r++) {
     CU(cudaDeviceSynchronize());
     const auto t0 = std::chrono::steady_clock::now();
-    nvtxRangePushA("preprocess_qbin");
-    kernel_compute_qbin<<<(M + 255) / 256, 256>>>(dx, dy, dz, M, N1, N2, N3, qb, nqx, nqy,
-                                                  nqz, d_qbin);
-    nvtxRangePop();
+    if (prep == 1) {
+      nvtxRangePushA("preprocess_qbin_pack");
+      kernel_compute_qbin_pack<<<(M + 255) / 256, 256>>>(
+          dx, dy, dz, dc, M, N1, N2, N3, qb, nqx, nqy, nqz, d_qbin, d_packed);
+      nvtxRangePop();
+    } else {
+      nvtxRangePushA("preprocess_qbin");
+      kernel_compute_qbin<<<(M + 255) / 256, 256>>>(dx, dy, dz, M, N1, N2, N3, qb, nqx, nqy,
+                                                    nqz, d_qbin);
+      nvtxRangePop();
+    }
     if (prep == 1) {
       // CUB radix sort of (bin, point index): no histogram, no per-bin atomics.
       nvtxRangePushA("preprocess_sort");
@@ -1117,36 +1223,29 @@ int main(int argc, char **argv) {
       cub::DeviceRadixSort::SortPairs(d_sort_tmp, sort_tmp_bytes, (const unsigned int *)d_qbin,
                                       d_keys_out, (const unsigned int *)d_sorted,
                                       (unsigned int *)d_perm, M, 0, end_bit);
-      kernel_gather_sorted<<<(M + 255) / 256, 256>>>(d_perm, dx, dy, dz, dc, d_sx, d_sy, d_sz,
-                                                     d_sc, M);
+      kernel_gather_sorted_packed<<<(M + 255) / 256, 256>>>(
+          d_perm, d_packed, d_sx, d_sy, d_sz, d_sc, M);
       nvtxRangePop();
       nvtxRangePushA("preprocess_starts");
       CU(cudaMemset(d_starts, 0xFF, nbins * sizeof(int)));
       kernel_mark_starts<<<(M + 255) / 256, 256>>>(d_keys_out, M, d_starts);
-      CU(cudaMemcpy(hstarts.data(), d_starts, nbins * sizeof(int), cudaMemcpyDeviceToHost));
-      hstart[nbins] = M;
-      for (int b = nbins - 1; b >= 0; --b)
-        hstart[b] = (hstarts[b] >= 0 && hstarts[b] < hstart[b + 1]) ? hstarts[b] : hstart[b + 1];
-      CU(cudaMemcpy(d_binstart, hstart.data(), (nbins + 1) * sizeof(int),
-                    cudaMemcpyHostToDevice));
+      kernel_reverse_int<<<(nbins + 255) / 256, 256>>>(d_starts, d_rev_starts, nbins);
+      NextStartOp next_start_op;
+      CU(cub::DeviceScan::ExclusiveScan(d_startscan_tmp, startscan_tmp_bytes, d_rev_starts,
+                                        d_rev_prefix, next_start_op, M, nbins));
+      kernel_fill_next_start<<<(nbins + 255) / 256, 256>>>(d_rev_starts, d_rev_prefix,
+                                                            d_binstart, nbins);
+      CU(cudaMemcpy(d_binstart + nbins, &M, sizeof(int), cudaMemcpyHostToDevice));
       nvtxRangePop();
     } else {
-      // Counting sort: atomic histogram, host scan, atomic per-bin scatter.
-      CU(cudaMemset(d_counts, 0, nbins * sizeof(int)));
+      // Counting sort: atomic histogram, GPU prefix scan, atomic per-bin scatter.
+      CU(cudaMemset(d_counts, 0, (nbins + 1) * sizeof(int)));
       nvtxRangePushA("preprocess_hist");
       kernel_hist<<<(M + 255) / 256, 256>>>(d_qbin, M, d_counts);
       nvtxRangePop();
       nvtxRangePushA("preprocess_scan");
-      std::vector<int> hcount(nbins);
-      CU(cudaMemcpy(hcount.data(), d_counts, nbins * sizeof(int), cudaMemcpyDeviceToHost));
-      int acc = 0;
-      for (int b = 0; b < nbins; b++) {
-        hstart[b] = acc;
-        acc += hcount[b];
-      }
-      hstart[nbins] = acc;
-      CU(cudaMemcpy(d_binstart, hstart.data(), (nbins + 1) * sizeof(int),
-                    cudaMemcpyHostToDevice));
+      CU(cub::DeviceScan::ExclusiveSum(d_scan_tmp, scan_tmp_bytes, d_counts, d_binstart,
+                                       nbins + 1));
       CU(cudaMemset(d_cursor, 0, nbins * sizeof(int)));
       nvtxRangePop();
       nvtxRangePushA("preprocess_scatter");

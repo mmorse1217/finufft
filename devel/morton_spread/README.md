@@ -151,12 +151,20 @@ reconstructed from the **static source call graph** (`dim_support` under `scan_p
 `fold_rescale`/`cudaFMA` under `stage_coeff`); ncu PC sampling is flat and inlined functions
 have no runtime call stack. Stall reasons are event args, not frames. The complete captures
 (v1, v3, v5, v6, v7, v8, v10, `reopen-2026-10-22/`, and `opt-2026-10-22/`) are under
-`profile-artifacts/expA-output-owned/`; `opt-2026-10-22/v11as/` is the current version and
-carries the block-shared clustered path.
+`profile-artifacts/expA-output-owned/`; `opt-2026-10-22/v11at/` is the current version and
+carries the preprocessing rewrite on top of the block-shared clustered path.
 
-## Verdict (current: v11as block-shared staging for clustered; v11ab per-warp elsewhere)
+## Verdict (current: v11at preprocessing + v11as block-shared staging)
 
-**v11as** keeps the v11ab per-warp kernel for uniform/sparse and switches to a block-shared
+**v11at** keeps the v11as spread kernels and rewrites preprocessing: fused qbin+pack, a
+32-byte packed payload gather, and GPU binstart construction (radix: mark-starts + reverse
+exclusive scan; counting: GPU exclusive sum). Uniform preprocessing is **6.22 -> 3.09 ms**
+and uniform total is **20.38 -> 17.37 ms**, inside the 17.62 ms total gate. Clustered
+preprocessing is 1.72 -> 1.46 ms and sparse 0.41 -> 0.29 ms. Spread times are unchanged.
+Details: `profile-artifacts/expA-output-owned/opt-2026-10-22/v11at/`.
+
+**v11as** introduced the current clustered path. It keeps the v11ab per-warp kernel for
+uniform/sparse and switches to a block-shared
 double-buffered batch when measured `4 × block_visits <= 1.05 × warp_visits`. Each of the four warps stages a
 contiguous quarter of the batch; all four scan the block union for their own regions. One
 `__syncthreads()` per batch, no relevance mask, `BLOCK_POINTS_PER_BATCH=56`, and
