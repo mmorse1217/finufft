@@ -1347,3 +1347,84 @@ the prototype is correct (`relL2` 5.49e-7 / 2.0-2.3e-7 / 6.76e-8), removes sprea
 beats method 3 on the mandatory totals, and passes the uniform spread gate. Experiment B
 (Morton ordering) is now unblocked; the remaining clustered-spread headroom is a follow-up
 performance target, not an Experiment A blocker.
+
+## v11ax/v11ay addendum — scan arithmetic, both mandatory spread gates pass (2026-10-23)
+
+The v11av profile analysis
+([`docs/issues/research/ISSUE-009-v11av-profile-analysis.md`](../research/ISSUE-009-v11av-profile-analysis.md))
+showed the flamegraphs' shared-load reading was misleading: the scan's 16-cell body was
+37.6% / 48.2% of scan samples, only 6.4 / 4.1 of 32 lanes were active per accumulation
+instruction, and the kernel executed 2.04x / 2.25x the useful FFMAs because it updates
+zero-weight cells. Two exact scan changes follow from that.
+
+### Changes
+
+1. **Contiguous z coefficient row (v11ax_z).** Three zero pre-pads (18-20; 18 is also the
+   y post-pad) and the existing post-pads (27-29) bracket the z row. The four z kernel
+   values for a lane group load from
+   `21 + support_coefficient_offset_z - local_cell_offset_z`, replacing the nested
+   `local_cell_offset_z` `FSEL`/`ISETP` chain. `VALUES_PER_POINT` becomes 30.
+2. **Strength-scaled accumulation (v11ax).** Form four real and four imaginary
+   `strength*z` factors once per lane group, then one FMA per cell. The 16-cell body drops
+   from 16 FMUL + 32 FFMA to 8 FMUL + 32 FFMA (48 -> 40 warp instructions). This changes
+   FP32 multiplication association, not the polynomial; `relL2` stays in the noise floor.
+3. **Contiguous y row at zero memory cost (v11ay).** The x post-pad at slot 11 is also the
+   y pre-pad, so y loads from `12 + support_coefficient_offset_y - local_cell_offset_y`
+   without extra shared memory. Final layout: support 0-2, strength 3-4, x 5-10, pad 11,
+   y 12-17, z pre-pads 18-20, z 21-26, post-pads 27-29.
+
+The larger row lowers the 5-block batches from 14/56 to **13/53**; registers remain
+**96 (per-warp) / 95 (block-shared)**, shared **12,696 / 12,936 B**, **5 blocks/SM**, no
+spills.
+
+### Results
+
+Medians of 4 process runs, 5 timed runs each, best configuration per workload:
+
+| workload | v11av spread / total | v11ay spread / total | method 3 spread / total |
+|---|---:|---:|---:|
+| uniform `1e6` `64^3` qb=1 radix | 12.528 / 16.058 | **10.912 / 14.446** | 15.95 / 16.78 |
+| clustered `1e6` `64^3` qb=4 counting | 13.714 / 15.314 | **11.232 / 12.834** | 15.90 / 16.79 |
+| sparse `1e5` `128^3` qb=4 radix | 1.536 / 2.089 | **1.393 / 1.956** | 2.82 / 2.95 |
+
+- Uniform is **31.6% faster on spread and 13.9% faster on total**; clustered is **29.4%
+  faster on spread and 23.6% faster on total**; sparse is 50.6% / 33.7% faster.
+- **Both mandatory `1e6` spread gates now pass** (>=20% faster than method 3), and both
+  mandatory totals are faster than method 3.
+- `relL2`: 5.64e-7 uniform, 2.26e-7 clustered, 7.34e-8 sparse, inside the FP32 noise floor.
+- ncu warp instructions: uniform 671.9M -> **560.7M** (-16.6%); clustered 868.6M ->
+  **686.1M** (-21.0%). ncu duration 12.60 / 13.53 -> **11.12 / 11.05 ms**.
+- Clustered is now at ~79% compute and ~78% L1/TEX; the kernel is no longer purely
+  instruction-bound. The remaining scan body is the two-FFMA-per-cell accumulation plus
+  coefficient LDS; the contiguous rows removed the z/y shift selects.
+
+Isolation: contiguous z alone is 11.93 / 12.73 ms; adding strength scaling gives
+11.04 / 11.61; adding contiguous y gives the final 10.91 / 11.23. The strength scaling is
+the larger part.
+
+### Rejected
+
+- **v11az** (all rows contiguous, `VALUES_PER_POINT=31`): odd row stride breaks the
+  8-byte `int2` metadata load (`misaligned address`).
+- **v11be** (`VALUES_PER_POINT=32`): 16-byte-aligned rows, but every row starts on the same
+  shared bank; 11.56 / 11.46 ms. Worse.
+- **v11ba** (scale xy instead of z): 11.21 / 11.36 / 1.423 ms; worse.
+- **v11bb** (scaling scoped inside the z loop): 10.82 / 11.24 / 1.393 ms; tied, not kept.
+- **v11bc** (`EXP_A_NSPLIT` sweep): uniform nsplit 2/4 is worse (11.12/11.15 vs 10.92);
+  clustered 16/32/56/64 = 11.89/11.33/**11.23**/11.36; 1/56 remains the knee.
+- **v11bd** (three-point scan unroll): clustered 11.42 ms (+1.6%); rejected.
+- **v11bf** (two `float2` staging stores): neutral; ptxas scheduling already adequate.
+
+### Artifacts and next
+
+Source and default binaries are v11ay. Artifacts:
+`profile-artifacts/expA-output-owned/opt-2026-10-22/v11ax_z/`, `v11ax/`, `v11ay/`
+(current), `v11az/`, `v11ba/`-`v11bf/`; v11ay has the 4-run A/B log, ptxas, ncu
+reports/details/source CSVs, flamegraphs, call trees, and README. The profile-analysis
+document is updated with the implemented/measured status.
+
+Remaining work is no longer needed for the Experiment A gates. If continued, the two
+clear targets are (1) the ~1.35 ms uniform payload gather (random permutation) via a
+packed sorted payload read directly by staging, and (2) the fixed 16-cell body, which still
+does ~2x the useful cell updates; that needs a different ownership/geometry or shared
+accumulation, not more packing. Experiment B (Morton ordering) remains unblocked.
