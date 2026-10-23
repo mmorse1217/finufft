@@ -617,7 +617,7 @@ budget. The full shuffle version needs more live values and would also fall to 4
 it is not viable without freeing registers elsewhere. v11t remains current best; v11t source
 and default binaries restored.
 
-## Method-3 baseline profile at v11au (2026-10-23)
+## Method-3 baseline profile at v11av (2026-10-23)
 
 Fresh profile of the comparison baseline. In this checkout the method-3 spread kernel is
 `spread_output_driven<float, 1, 3, 6>` (there is no symbol named `spread_cartesian`); the
@@ -627,37 +627,37 @@ prototype kernels are `spread_cartesian_owned` and
 
 Fresh head-to-head, second process run, 2 warm-ups + 5 timed runs:
 
-| Case | method 3 spread | v11au spread | v11au / m3 | method 3 total | v11au total |
+| Case | method 3 spread | v11av spread | v11av / m3 | method 3 total | v11av total |
 |---|---:|---:|---:|---:|---:|
-| uniform `1e6` `64^3` (`qb=1`, radix, 3-point packing) | 15.909 | **12.552** | **0.789 (1.27x faster)** | 16.734 | **16.080** |
-| clustered `1e6` `64^3` (`qb=4`, counting, block-shared, split 56) | 15.894 | **13.902** | **0.875 (1.14x faster)** | 16.812 | **15.494** |
-| sparse `1e5` `128^3` (`qb=4`, radix, 3-point packing) | 2.819 | **1.542** | **0.547 (1.83x faster)** | 2.950 | **2.099** |
+| uniform `1e6` `64^3` (`qb=1`, radix, 3-point packing) | 15.950 | **12.583** | **0.789 (1.27x faster)** | 16.771 | **16.106** |
+| clustered `1e6` `64^3` (`qb=4`, counting, block-shared 3-point packing, split 56) | 15.906 | **13.595** | **0.855 (1.17x faster)** | 16.843 | **15.175** |
+| sparse `1e5` `128^3` (`qb=4`, radix, 3-point packing) | 2.817 | **1.538** | **0.546 (1.83x faster)** | 2.949 | **2.069** |
 
-This reproduces the recorded v11au medians (12.586 / 14.029 / 1.536 ms spread; totals
-16.112 / 15.624 / 2.092 ms), so v11au remains current best. It keeps the v11at
-preprocessing rewrite and v11as block-shared clustered path, and adds three-point
-coefficient packing (9 lanes per point, two coefficients per lane) to the per-warp path.
-Uniform spread now passes the strict 12.76 ms gate and uniform total passes the 17.62 ms
-gate; clustered total also beats method 3. Only clustered spread remains above target.
+This reproduces the recorded v11av medians (12.575 / 13.714 / 1.534 ms spread; totals
+16.101 / 15.311 / 2.092 ms), so v11av remains current best. It extends the v11au
+three-point coefficient packing to the block-shared clustered staging path and keeps the
+v11at preprocessing rewrite. Uniform/sparse are unchanged; clustered spread falls
+14.03 -> 13.71 ms and total 15.62 -> 15.31 ms. Uniform spread/total gates still pass,
+clustered total beats method 3, and only clustered spread remains above target.
 
 ncu: method 3 uniform 15.75 ms / 380.2M warp instructions / 51 regs / 65.15 KB shared /
-25% occupancy / 2.00 active warps per scheduler / 71.9% no-eligible. v11au uniform is
+25% occupancy / 2.00 active warps per scheduler / 71.9% no-eligible. v11av uniform is
 12.60 ms / 671.9M instructions / 96 regs / 12.76 KB / 5 blocks / 4.15 active warps /
-31.0% no-eligible. v11au clustered is 13.85 ms / 890.2M instructions / 94 regs /
-4.87 active warps / 24.9% no-eligible. It executes ~1.8x more instructions on uniform and
-~2.35x more on clustered, but wins uniform via three-point coefficient packing plus the
-earlier occupancy/barrier gains, and wins clustered by sharing the staged block batch
-(stage_coeff instructions fall roughly 4x). The remaining clustered cost is the scan,
-support placement, and block-barrier/loop overhead.
+31.0% no-eligible. v11av clustered is 13.53 ms / 868.6M instructions / 94 regs /
+4.87 active warps / 25.0% no-eligible. It executes ~1.8x more instructions on uniform and
+~2.3x more on clustered, but wins uniform via three-point packing plus the earlier
+occupancy/barrier gains, and wins clustered by sharing the staged block batch and applying
+the same packing. Clustered staging is now only 4.7% of kernel samples; the remaining cost
+is scan-side (76.0% of samples).
 
 Method 3 stall shares (uniform / clustered / sparse): `wait` 32.5 / 32.6 / 37.3%, barrier
 25.4 / 25.5 / 26.0%, shared-memory dependency 21.6 / 21.6 / 14.3%. Dense/clustered is
 barrier + shared-latency bound at 25% occupancy (65 KB local subgrid). Sparse adds merge
 index/global-merge work: the merge index modulo line is 15.9% of sparse source samples,
-and the global merge loop another 4.7%; that is the region v11au removes, which is why
-sparse is the strongest win. Clustered spread is 13.9 ms vs the 12.72 ms gate target
-(about 1.18 ms high); uniform preprocessing is now 3.09 ms plus 0.44 ms of metadata, so
-the uniform total is no longer setup-bound.
+and the global merge loop another 4.7%; that is the region v11av removes, which is why
+sparse is the strongest win. Clustered spread is 13.7 ms vs the 12.72 ms gate target
+(about 0.9-1.0 ms high); uniform preprocessing is 3.08 ms plus 0.44 ms of metadata, so the
+uniform total is no longer setup-bound.
 
 ## Clustered split-count tuning (v11x/v11y/v11z, 2026-10-23 00:39)
 
@@ -1431,3 +1431,25 @@ scan geometry; both trade work reduction against scanner occupancy.
 Committed as **ee278ffa**. Artifact:
 `profile-artifacts/expA-output-owned/opt-2026-10-22/v11av/` (source, ptxas, bench, ncu
 captures, flamegraphs, README).
+
+## Software-pipelined block staging rejected (v11aw, 2026-10-23)
+
+Tried same-warp software pipelining on top of v11av. `stage_block_quarter` was split into
+raw staging and coefficient groups. Raw staging for the next batch is issued before scanning
+the current batch; next-batch coefficient groups are interleaved with the scan, roughly one
+group every `scan_iterations / coefficient_groups` iterations, with a flush before the
+barrier.
+
+| workload | v11av | v11aw |
+|---|---:|---:|
+| clustered spread | **13.714 ms** | 14.586 ms |
+| uniform spread | 12.575 ms | 12.553 ms |
+| sparse spread | 1.534 ms | 1.532 ms |
+
+Clustered regressed by **0.87 ms (+6.4%)**; block kernel stayed at 96 registers,
+12,760 B shared, 5 blocks/SM, no spills, and `relL2` was unchanged at 2.20e-7.
+
+The staging path was already only 4.7% of the kernel. Same-warp interleaving cannot execute
+staging and scan concurrently; it only fills stalls. The added schedule/control and shared
+store traffic disrupted the scan more than it hid staging. Rejected; v11av remains current.
+Artifact: `profile-artifacts/expA-output-owned/opt-2026-10-22/v11aw/`.

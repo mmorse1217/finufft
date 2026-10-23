@@ -1312,3 +1312,12 @@ and new flamegraphs:
 
 Committed as **ee278ffa**. Clustered spread is now 13.71 ms against the 12.72 ms gate;
 staging is only 4.7% of the kernel, so the remaining work is scan-side.
+
+## v11aw addendum — software-pipelined block staging rejected (2026-10-23)
+
+Tried same-warp software pipelining on v11av: split next-batch raw/coefficient staging and
+interleaved coefficient groups with the current scan. Clustered regressed
+**13.714 -> 14.586 ms (+6.4%)** at 96 regs / 5 blocks / no spills; uniform and sparse were
+unchanged. Staging was only 4.7% of the kernel, and the added schedule/control plus shared
+store traffic disrupted the scan more than it hid staging. Rejected; v11av remains current.
+Artifact: `profile-artifacts/expA-output-owned/opt-2026-10-22/v11aw/`.
