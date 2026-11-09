@@ -347,8 +347,18 @@ __device__ __forceinline__ void prepare_two_coefficients(
 __device__ __forceinline__ void place_support(int support_start, int fine_grid_size_dimension, int lane_group_start, int group_size, int &group_cell_count,
                                             int &support_coefficient_offset, int &local_cell_offset) {
   int relative_support_start = support_start - lane_group_start;
-  relative_support_start += fine_grid_size_dimension & (relative_support_start >> 31);       // relative_support_start < 0 -> relative_support_start + fine_grid_size_dimension; relative_support_start is now < fine_grid_size_dimension for lane_group_start >= 0,
-                              // so the former relative_support_start >= fine_grid_size_dimension correction cannot fire.
+  // The support start can be a whole period (or more) below the lane group:
+  // a point at the origin has support_start = -ceil(ns/2), while a lane group
+  // near the high edge of the grid can start at nf-2. The first add handles
+  // the common one-period case branchlessly; the loop handles the remaining
+  // periods for lane groups near the far edge. This matches the multi-period
+  // reduction in the library owned-spread implementation.
+  relative_support_start += fine_grid_size_dimension & (relative_support_start >> 31);
+  if (relative_support_start < 0) {
+    relative_support_start += fine_grid_size_dimension;
+    while (relative_support_start < 0)
+      relative_support_start += fine_grid_size_dimension;
+  }
   // group_cell_count/support_coefficient_offset/local_cell_offset below are selects: ptxas lowers them to SEL/ISETP with no branch
   // (SASS branch count is identical to an explicit mask form, which measured
   // 11-17% slower because it adds ~21 LOP3 per scan).

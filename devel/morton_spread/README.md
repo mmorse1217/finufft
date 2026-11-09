@@ -83,6 +83,80 @@ partial reduction when `nsplit > 1`) separately, checks the fine-grid output aga
 (`relL2`), and reports registers, shared memory, occupancy, candidate point reads, and active
 warp regions.
 
+## Readable atomic-free baseline
+
+The readable baseline is split into three files: `atomic_free_spread.cuh` declares the
+point/grid types and launch API, `atomic_free_spread.cu` holds the kernels and launch
+wrappers, and `atomic_free_spread_bench.cu` is the entry point. It is a deliberately
+unoptimized, standalone baseline for the same type-1 correctness contract. It is not built
+by `run_exp_a.sh` and is not part of the library. Each thread owns one output cell,
+enumerates the Cartesian bins around its block's tile, and writes the cell once.
+Binning/sorting are on the host; there are no splits, partial grids, active-tile lists, or
+spreading atomics. It calls `eval_kernel_vec_horner` directly and reduces support offsets
+modulo the grid, which makes it an independent check on the optimized staged scan.
+
+It is a **correctness baseline, not a performance candidate**. Measured on the T1000 in
+this worktree, its spread kernel takes 260 / 471 / 44.7 ms for uniform / clustered /
+sparse, or **13.6x / 24.7x / 10.9x slower** than method 3. It deliberately repeats point
+work per output cell. Do not confuse it with the optimized `exp_a_cartesian.cu` timings.
+
+```bash
+./devel/morton_spread/run_atomic_free_spread.sh        # build + correctness matrix
+./devel/morton_spread/run_atomic_free_spread.sh all    # + bin-size/seed sweep
+# or: BUILD_DIR=/path/to/build/gpu ./devel/morton_spread/run_atomic_free_spread.sh
+# nrun defaults to 5; override with NRUN=10 ./devel/morton_spread/run_atomic_free_spread.sh
+build/gpu/atomic_free_spread_bench M N1 N2 N3 cluster bin_size [pattern [seed [nrun]]]
+```
+
+`pattern` selects point placement: `0` = uniform / eight tight clusters (the default),
+`1` = exact seam and out-of-domain coordinates, `2` = exact grid nodes and near-node
+offsets, `3` = one dense cluster. The binary compares the full fine grid against pinned
+method 3 and exits non-zero when `relL2 >= 1e-4` or any structural/consistency check
+fails. `run_atomic_free_spread.sh` covers the mandatory shapes plus the boundary patterns;
+current results on the T1000:
+
+| case | pattern | relL2 |
+|---|---:|---:|
+| uniform 1e6, 64^3, qb=4 | 0 | 5.27e-7 |
+| clustered 1e6, 64^3, qb=4 | 0 | 6.39e-6 |
+| sparse 1e5, 128^3, qb=4 | 0 | 7.00e-8 |
+| seam 1e5, 64^3, qb=4 | 1 | 2.58e-6 |
+| grid nodes 1e5, 64^3, qb=4 | 2 | 1.50e-6 |
+| dense cluster 1e5, 64^3, qb=4 | 3 | 7.03e-6 |
+| seam 4096, 6^3, qb=6 | 1 | 7.55e-7 |
+| grid nodes 4096, 6x9x13, qb=2 | 2 | 6.21e-7 |
+| grid nodes 2e4, 33x35x31, qb=4 | 2 | 2.10e-7 |
+
+The benchmark times host point generation, the two host-to-device uploads, the GPU bin
+assignment, the host counting sort, and the spread kernel. The spread time is the median of
+`nrun` CUDA-event runs after two warm-ups (min/max are printed too); method 3 `setpts` and
+`execute` are timed separately. `prep total` is the sum of the upload/bin/copy/sort phases,
+`setup` adds point generation, and `end_to_end` is `setup + spread`; reference work is
+validation only and is not included.
+
+Correctness instrumentation checks valid bin IDs, a monotonic offset table with
+`offsets[num_bins] == M`, that every output cell was written (the grid is poisoned with a
+0xFF NaN sentinel before the final run), finiteness, the global sum against method 3, and
+`relL2`. The process exits non-zero if any check fails. The `total` check is not absolute
+mass conservation: `gpu_spreadinterponly` returns the raw spread grid, whose total is
+scaled by the non-unit kernel-weight sum, so the check compares against method 3's total
+instead of the input strength sum.
+
+The seam pattern found a real bug in the optimized `exp_a_cartesian.cu`: its
+`place_support()` reduced the support offset by only one grid period, which leaves a
+negative offset for lane groups near the far x/y edge when a point sits exactly at the
+left seam. That path gave `relL2 = 6.4e-2`. The library owned-spread implementation already
+had the multi-period fix; it is migrated back into `exp_a_cartesian.cu` (an `if`/`while`
+after the branchless first correction). The atomic baseline was unaffected because
+`coefficient_index()` uses `% grid_size`. The fix leaves the mandatory
+uniform/clustered/sparse `relL2` values unchanged (5.63e-7 / 2.34e-7 / 7.34e-8 here), but
+it is not free: an interleaved A/B on the T1000 moved spread time 12.34 -> 13.13 ms
+uniform (+6.4%), 12.69 -> 12.77 ms clustered (+0.6%), and 1.575 -> 1.644 ms sparse
+(+4.4%). The **optimized `exp_a_cartesian.cu`** spread speedups against method 3 remain
+1.37x / 1.41x / 1.91x, so the mandatory gates still pass. A staging-time normalization
+variant measured ~2-3% instead, but this source keeps the same reduction as the library so
+the two implementations match.
+
 ## Source naming
 
 The current v11ab source uses descriptive identifiers. Historical notes and older
