@@ -89,65 +89,59 @@ The readable baseline is split into three files: `atomic_free_spread.cuh` declar
 point/grid types and launch API, `atomic_free_spread.cu` holds the kernels and launch
 wrappers, and `atomic_free_spread_bench.cu` is the entry point. It is a standalone
 baseline for the same type-1 correctness contract. It is not built by `run_exp_a.sh` and
-is not part of the library. Each thread owns one output cell, and each block enumerates the
-Cartesian bins around its tile and writes its cells once. Binning/sorting are on the host;
-there are no splits, partial grids, active-tile lists, or spreading atomics. It calls
-`eval_kernel_vec_horner` directly and reduces support offsets modulo the grid, which makes
-it an independent check on the optimized staged scan.
+is not part of the library. Each thread owns a small group of output cells, and each block
+enumerates the Cartesian bins around its tile and writes its cells once. Binning/sorting are
+on the host; there are no splits, partial grids, active-tile lists, or spreading atomics. It
+calls `eval_kernel_vec_horner` directly and reduces support offsets modulo the grid, which
+makes it an independent check on the optimized staged scan.
 
 ### Staged weight batches
 
 The per-cell loop does **not** evaluate the kernel. A point's weights depend on the point and
 the cell offset, not on the thread, so evaluating them per cell repeats the same 18 Horner
-polynomials (and the same 18-way coefficient selection) 256 times per block. Instead each
-block stages a batch of `STAGE_POINTS = 64` candidate points into shared memory as
+polynomials (and the same 18-way coefficient selection) for every cell. Instead each block
+stages a batch of `STAGE_POINTS = 32` candidate points into shared memory as
 **tile-local, zero-filled vectors**: `kx[j][local]` is the weight of staged point `j` for cell
 `tile_x + local`, and likewise for y and z, with `0.0` where the point does not cover that
 cell (including cells past the end of the grid).
 
+- A block covers an `8x8x8` tile with `128` threads (`BLOCK_X/Y/Z = 4/8/4`); each thread owns
+  a `2x1x2` group of cells (`GROUP_X/Y/Z = 2/1/2`). The block shape keeps every warp on one z
+  slice, so the z weights stay a broadcast.
 - Three staging lanes per point, one per dimension: `fold_rescale`, `ceilf`, one
-  `eval_kernel_vec_horner`, then eight `stage_tile_weights` slots that call the same
-  `coefficient_index()` the per-cell loop used to call. 192 of the 256 threads stage; the
-  batch costs 5.67 KB of shared memory and two `__syncthreads()`.
-- The cell loop then has no support test, no branch, and no coefficient selection: three
-  shared loads, two multiplies, two fused multiply-adds per staged point. A zero weight adds
-  an exact zero, so the output matches the per-cell form (a non-finite point strength would
-  now reach cells the point does not cover).
-- The early return for cells outside a partial tile became a store predicate, because a
-  thread may not exit while the block still has barriers to reach.
+  `eval_kernel_vec_horner`, then `TILE_X`, `TILE_Y`, or `TILE_Z` `stage_tile_weights` slots
+  that call the same `coefficient_index()` the per-cell loop used to call. 96 of the 128
+  threads stage; the batch costs 4.64 KB of static shared memory and two `__syncthreads()`.
+- The cell loop then has no support test, no branch, and no coefficient selection: a thread
+  forms two x-y weight products and applies two z `float2` values, so four cells consume five
+  shared loads, two multiplies, and eight fused multiply-adds per staged point. That is 1.25
+  shared loads per cell. A zero weight adds an exact zero, so the output matches the per-cell
+  form (a non-finite point strength would now reach cells the point does not cover).
+- Cells outside a partial tile are skipped by the per-cell bounds check at the store; every
+  thread still reaches the barriers.
 
 That removes both wastes at once: the Horner work is amortized over the tile instead of
 repeated per cell, and the 112-instruction register-select tree becomes one indexed shared
-load. Per candidate point per block the kernel drops from ~1355 to ~95 warp instructions.
+load.
 
 Measured on the T1000 in this worktree (median of 5, `nrun=5`):
 
 | case | before (`17c05838`) | after | speedup | vs method-3 execute |
 |---|---:|---:|---:|---:|
-| uniform 1e6, 64^3 | 185.9 ms | **34.0 ms** | 5.5x | 1.79x slower |
-| clustered 1e6, 64^3 | 426.9 ms | **36.3 ms** | 11.8x | 1.90x slower |
-| sparse 1e5, 128^3 | 19.3 ms | **12.7 ms** | 1.5x | 3.04x slower |
-| dense cluster 1e5, 64^3 | 111 ms | **9.3 ms** | 11.9x | 3.16x slower |
+| uniform 1e6, 64^3 | 185.9 ms | **19.5 ms** | 9.5x | 1.02x slower |
+| clustered 1e6, 64^3 | 426.9 ms | **26.9 ms** | 15.9x | 1.41x slower |
+| sparse 1e5, 128^3 | 19.3 ms | **6.0 ms** | 3.2x | 1.44x slower |
+| dense cluster 1e5, 64^3 | 111 ms | **8.5 ms** | 13.1x | 2.84x slower |
 
-The staged z row is pre-scaled by the point strength, so a cell reads two weights and one
-`float2` (`kx[x]`, `ky[y]`, `kz*strength[z]`) and does one multiply and two fused
-multiply-adds. That cut the cell loop from four shared loads to three and bought 43.8 ->
-34.0 ms uniform, 46.1 -> 36.3 clustered, 11.0 -> 9.3 dense.
+The staged z row is pre-scaled by the point strength, so the cell loop never loads the
+strength separately. A thread reuses each x-y product across the two z cells and each z
+`float2` across the two x cells.
 
 The full Nsight Compute capture for the four canonical shapes is
-`build/gpu/traces/af_profile_20261110_043510/` (`summary.md` plus the CSVs). The kernel is no
-longer instruction- or FMA-bound: instructions fell from 16.4B to 0.99B on uniform while IPC
-fell from 3.35 to 1.55. It is now bound by the shared-memory **request** rate: LSUIN requests
-are at 94% of peak on uniform with the data pipe only 48% busy, so three loads per cell-visit
-(96M warp-visits, ~290M warp loads) set a floor of ~30 ms and the kernel runs at 33.7 ms.
-`__syncthreads()` is the next term: 18% of warp state on uniform, 46% on sparse, where a
-3-point bin forces a batch smaller than `STAGE_POINTS`.
-
-Loop-level ILP does not help at this point: processing two points per iteration with a second
-accumulator pair left IPC at 1.55 and LSUIN at 93%, so it was reverted. The remaining lever is
-fewer shared loads per cell, which needs several cells per thread (the `exp_a_cartesian.cu`
-scan reads ~0.5 weights per cell from a 16-cell lane group and runs the same workload in
-12.6 ms).
+`build/gpu/traces/af_profile_20261110_045511/` (`summary.md` plus the CSVs). On uniform the
+kernel is at 74.5% LSUIN requests and 46.1% shared wavefronts; MIO throttle is 39.5% and
+barrier 22.9% of warp state. On sparse the barrier share rises to 25.2%, where a 3-point bin
+forces a batch smaller than `STAGE_POINTS`.
 
 The staged rows are padded to an odd number of floats (`TILE_X + 1`, `TILE_Y + 1`,
 `TILE_Z + 1`). Without the padding the staging lanes write the same `local` of 32 different
@@ -157,8 +151,8 @@ store wavefronts fall 55.2M -> 8.8M (-10.7% of all shared wavefronts on uniform)
 bought 48.5 -> 43.8 ms uniform, 50.3 -> 46.1 ms clustered, 11.4 -> 11.0 ms dense, and nothing
 on sparse (it never had the conflicts, and it is barrier-bound).
 
-It is still **not a performance candidate**: it is 2.3-3.7x slower than method 3, and it
-recomputes weights for all 256 cells per point when only ~18 are covered. It is, however, no
+It is still **not a performance candidate**: it is 1.02-2.84x slower than method 3, and it
+stages weights for all 512 cells per point when only ~18 are covered. It is, however, no
 longer dominated by redundant point work.
 
 ```bash

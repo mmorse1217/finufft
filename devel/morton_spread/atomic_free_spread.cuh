@@ -16,19 +16,30 @@ namespace atomic_free_spread {
 constexpr int WIDTH = 6;
 constexpr int HALO = WIDTH / 2;
 
-// One CUDA block owns one output tile; one thread owns one output cell.
+// One CUDA block owns one output tile; one thread owns a small box of cells.
 constexpr int TILE_X = 8;
 constexpr int TILE_Y = 8;
-constexpr int TILE_Z = 4;
+constexpr int TILE_Z = 8;
 
-// One thread per cell, so the block size follows the tile.
-constexpr int BLOCK_THREADS = TILE_X * TILE_Y * TILE_Z;
+// Cells per thread in each dimension. A warp spans one z slice, so the z
+// weights it reads stay a broadcast.
+constexpr int GROUP_X = 2;
+constexpr int GROUP_Y = 1;
+constexpr int GROUP_Z = 2;
+
+constexpr int BLOCK_X = TILE_X / GROUP_X;
+constexpr int BLOCK_Y = TILE_Y / GROUP_Y;
+constexpr int BLOCK_Z = TILE_Z / GROUP_Z;
+constexpr int BLOCK_THREADS = BLOCK_X * BLOCK_Y * BLOCK_Z;
 
 // Candidate points whose kernel weights are staged into shared memory at once.
 // Each point needs three staging slots, one per dimension, all live before the
 // cell loop runs.
-constexpr int STAGE_POINTS = 64;
+constexpr int STAGE_POINTS = 32;
 
+static_assert(TILE_X % GROUP_X == 0 && TILE_Y % GROUP_Y == 0 &&
+                  TILE_Z % GROUP_Z == 0,
+              "a tile must be divisible into thread groups");
 static_assert(3 * STAGE_POINTS <= BLOCK_THREADS, "staging must fit in one round");
 static_assert(STAGE_POINTS % 32 == 0, "a warp must stage a single dimension");
 

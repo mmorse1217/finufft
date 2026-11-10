@@ -2,8 +2,9 @@
 //
 // This is a standalone experiment, not part of the library build. It uses a
 // width-6 kernel (sigma=2, tolerance 1e-5), single precision, and periodic
-// boundaries. Each GPU thread owns one output cell and writes it exactly once.
-// There are no splits, partial grids, active-tile lists, or spreading atomics.
+// boundaries. Each GPU thread owns a small box of output cells and writes each
+// one exactly once. There are no splits, partial grids, active-tile lists, or
+// spreading atomics.
 //
 // For simplicity, binning and sorting are done on the CPU after a GPU kernel
 // computes the bin IDs. The latter ensures bin assignment uses the exact same
@@ -131,15 +132,62 @@ __device__ __forceinline__ void stage_tile_weights(float2 *dest, int tile_begin,
   }
 }
 
-// One block owns one tile; one thread owns one cell. The block stages the kernel
-// weights of a batch of candidate points into shared memory, indexed by cell
-// position inside the tile, and each cell then reads the three values it needs:
-// the x and y weights and the z weight already scaled by the point strength.
-//
-// The staged vectors are tile-local and zero-filled, so the cell loop has no
-// support test, no branch, and no coefficient selection. A zero weight adds an
-// exact zero, so uncovered cells keep their accumulator; a non-finite point
-// strength would now reach cells the point does not cover.
+// Add the staged batch to this thread's cell group. Each x-y product serves the
+// group's z cells and each z value serves its x cells, so a point costs
+// GROUP_X + GROUP_Y + GROUP_Z shared loads for GROUP_X * GROUP_Y * GROUP_Z cells.
+__device__ __forceinline__ void accumulate_batch(
+    const float (*kx)[TILE_X + 1], const float (*ky)[TILE_Y + 1],
+    const float2 (*kz)[TILE_Z + 1], int staged, int x0, int y0, int z0,
+    float2 (&acc)[GROUP_X][GROUP_Y][GROUP_Z]) {
+  for (int j = 0; j < staged; ++j) {
+    float weight[GROUP_X][GROUP_Y];
+    #pragma unroll
+    for (int gx = 0; gx < GROUP_X; ++gx)
+      #pragma unroll
+      for (int gy = 0; gy < GROUP_Y; ++gy)
+        weight[gx][gy] = kx[j][x0 + gx] * ky[j][y0 + gy];
+
+    float2 z[GROUP_Z];
+    #pragma unroll
+    for (int gz = 0; gz < GROUP_Z; ++gz) z[gz] = kz[j][z0 + gz];
+
+    #pragma unroll
+    for (int gx = 0; gx < GROUP_X; ++gx)
+      #pragma unroll
+      for (int gy = 0; gy < GROUP_Y; ++gy)
+        #pragma unroll
+        for (int gz = 0; gz < GROUP_Z; ++gz) {
+          acc[gx][gy][gz].x += z[gz].x * weight[gx][gy];
+          acc[gx][gy][gz].y += z[gz].y * weight[gx][gy];
+        }
+  }
+}
+
+// Write this thread's cell group, skipping cells past the end of a partial tile.
+__device__ __forceinline__ void store_cell_group(
+    cuFloatComplex *output, Grid grid, int tile_x, int tile_y, int tile_z, int x0,
+    int y0, int z0, const float2 (&acc)[GROUP_X][GROUP_Y][GROUP_Z]) {
+  #pragma unroll
+  for (int gx = 0; gx < GROUP_X; ++gx)
+    #pragma unroll
+    for (int gy = 0; gy < GROUP_Y; ++gy)
+      #pragma unroll
+      for (int gz = 0; gz < GROUP_Z; ++gz) {
+        const int x = tile_x + x0 + gx;
+        const int y = tile_y + y0 + gy;
+        const int z = tile_z + z0 + gz;
+        if (x < grid.nx && y < grid.ny && z < grid.nz) {
+          const long long index =
+              x + (long long)grid.nx * (y + (long long)grid.ny * z);
+          output[index] = make_cuFloatComplex(acc[gx][gy][gz].x, acc[gx][gy][gz].y);
+        }
+      }
+}
+
+// One block owns one tile; one thread owns a GROUP_X x GROUP_Y x GROUP_Z box of
+// cells. The block stages tile-local, zero-filled weight vectors into shared
+// memory, so summing a staged point needs no support test, branch, or
+// coefficient selection.
 __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
                        cuFloatComplex *output) {
   using cufinufft::spreadinterp::eval_kernel_vec_horner;
@@ -148,12 +196,10 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
   int tile_x = blockIdx.x * TILE_X;
   int tile_y = blockIdx.y * TILE_Y;
   int tile_z = blockIdx.z * TILE_Z;
-  int x = tile_x + threadIdx.x;
-  int y = tile_y + threadIdx.y;
-  int z = tile_z + threadIdx.z;
+  int x0 = threadIdx.x * GROUP_X;
+  int y0 = threadIdx.y * GROUP_Y;
+  int z0 = threadIdx.z * GROUP_Z;
 
-  // The candidate-bin ranges depend only on blockIdx and the grid, not on the
-  // thread, so compute them once per block instead of once per thread.
   __shared__ NearBins x_bins, y_bins, z_bins;
   if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
     const int end_x = min(tile_x + TILE_X, grid.nx);
@@ -174,7 +220,8 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
   __shared__ float2 kz[STAGE_POINTS][TILE_Z + 1];
   __syncthreads();
 
-  const int linear_tid = threadIdx.x + TILE_X * (threadIdx.y + TILE_Y * threadIdx.z);
+  const int linear_tid =
+      threadIdx.x + BLOCK_X * (threadIdx.y + BLOCK_Y * threadIdx.z);
 
   // One staging lane per (point, dimension): dim d owns the lanes
   // [d * STAGE_POINTS, (d + 1) * STAGE_POINTS), so every warp stages a single
@@ -184,10 +231,7 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
   const int stage_point = linear_tid % STAGE_POINTS;
   const bool is_stager = stage_dim < 3;
 
-  // Threads on the ragged edge of a partial tile own no cell, but they must keep
-  // reaching the barriers, so the early return becomes a store predicate.
-  const bool owns_cell = x < grid.nx && y < grid.ny && z < grid.nz;
-  float real = 0.0f, imag = 0.0f;
+  float2 acc[GROUP_X][GROUP_Y][GROUP_Z] = {};
 
   for (int z_bin_index = 0; z_bin_index < z_bins.count; ++z_bin_index) {
     const int bz = z_bins[z_bin_index];
@@ -198,9 +242,8 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
         const int bin = bx + grid.bins_x * (by + grid.bins_y * bz);
         const int bin_begin = bin_offsets[bin];
         const int bin_end = bin_offsets[bin + 1];
-        // This loop carries the block's barriers, so every thread must run it.
-        // Only the body is conditional: `staged` shrinks on the last batch of a
-        // bin.
+        // This loop carries the block's barriers, so every thread must run it;
+        // only the staging body is conditional.
         for (int base = bin_begin; base < bin_end; base += STAGE_POINTS) {
           const int staged = min(STAGE_POINTS, bin_end - base);
           if (is_stager && stage_point < staged) {
@@ -222,21 +265,13 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
             }
           }
           __syncthreads();
-          for (int j = 0; j < staged; ++j) {
-            const float weight = kx[j][threadIdx.x] * ky[j][threadIdx.y];
-            const float2 z = kz[j][threadIdx.z];
-            real += z.x * weight;
-            imag += z.y * weight;
-          }
+          accumulate_batch(kx, ky, kz, staged, x0, y0, z0, acc);
           __syncthreads();
         }
       }
     }
   }
-  if (owns_cell) {
-    long long index = x + (long long)grid.nx * (y + (long long)grid.ny * z);
-    output[index] = make_cuFloatComplex(real, imag);
-  }
+  store_cell_group(output, grid, tile_x, tile_y, tile_z, x0, y0, z0, acc);
 }
 
 }  // namespace
@@ -248,7 +283,7 @@ void launch_assign_bins(const Point *points, int count, Grid grid, int *bin_ids)
 
 void launch_spread(const Point *points, const int *bin_offsets, Grid grid,
                    cuFloatComplex *output) {
-  dim3 threads(TILE_X, TILE_Y, TILE_Z);
+  dim3 threads(BLOCK_X, BLOCK_Y, BLOCK_Z);
   dim3 blocks(1 + (grid.nx - 1) / TILE_X, 1 + (grid.ny - 1) / TILE_Y,
               1 + (grid.nz - 1) / TILE_Z);
   spread<<<blocks, threads>>>(points, bin_offsets, grid, output);
