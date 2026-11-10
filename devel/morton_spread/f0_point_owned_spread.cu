@@ -41,7 +41,7 @@ static_assert(TILE_CELLS == 2 * THREADS, "each thread writes two tile cells");
 static_assert(PAD_X >= TILE_X + 1, "the x stride must be padded");
 
 // A folded point plus the integer starts of its width-WIDTH support on each
-// axis, matching the baseline staging expression ceilf(folded - HALO).
+// axis, matching the baseline staging expression ceilf(folded - SUPPORT_OVERHANG).
 struct FoldedPoint {
   float x, y, z;
   int sx, sy, sz;
@@ -70,9 +70,9 @@ __device__ __forceinline__ FoldedPoint fold_point(const Point &point, Grid grid)
   folded.x = fold_rescale(point.x, grid.nx);
   folded.y = fold_rescale(point.y, grid.ny);
   folded.z = fold_rescale(point.z, grid.nz);
-  folded.sx = int(ceilf(folded.x - HALO));
-  folded.sy = int(ceilf(folded.y - HALO));
-  folded.sz = int(ceilf(folded.z - HALO));
+  folded.sx = int(ceilf(folded.x - SUPPORT_OVERHANG));
+  folded.sy = int(ceilf(folded.y - SUPPORT_OVERHANG));
+  folded.sz = int(ceilf(folded.z - SUPPORT_OVERHANG));
   return folded;
 }
 
@@ -239,7 +239,7 @@ __global__ void spread_f0(const Point *points, const int *bin_offsets, Grid grid
                           static_cast<int>(blockIdx.z) * TILE_Z};
   const int lane = threadIdx.x;
 
-  __shared__ detail::NearBins x_bins, y_bins, z_bins;
+  __shared__ detail::CandidateBins x_bins, y_bins, z_bins;
   __shared__ float weights[3 * WIDTH][THREADS];
   __shared__ float tile_real[TILE_FLOATS];
   __shared__ float tile_imag[TILE_FLOATS];
@@ -248,12 +248,12 @@ __global__ void spread_f0(const Point *points, const int *bin_offsets, Grid grid
     const int end_x = origin.x + TILE_X < grid.nx ? origin.x + TILE_X : grid.nx;
     const int end_y = origin.y + TILE_Y < grid.ny ? origin.y + TILE_Y : grid.ny;
     const int end_z = origin.z + TILE_Z < grid.nz ? origin.z + TILE_Z : grid.nz;
-    x_bins = detail::near_bins(origin.x, end_x, grid.bin_size, grid.nx,
-                               grid.bins_x);
-    y_bins = detail::near_bins(origin.y, end_y, grid.bin_size, grid.ny,
-                               grid.bins_y);
-    z_bins = detail::near_bins(origin.z, end_z, grid.bin_size, grid.nz,
-                               grid.bins_z);
+    x_bins = detail::candidate_bins(origin.x, end_x, grid.bin_size, grid.nx,
+                                    grid.bins_x);
+    y_bins = detail::candidate_bins(origin.y, end_y, grid.bin_size, grid.ny,
+                                    grid.bins_y);
+    z_bins = detail::candidate_bins(origin.z, end_z, grid.bin_size, grid.nz,
+                                    grid.bins_z);
   }
   __syncthreads();
 

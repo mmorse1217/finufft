@@ -1,7 +1,7 @@
-// Interface for the readable, atomic-free 3D type-1 spreading baseline and the
-// F0 point-owned spread prototype.
+// Interface for the warp-owned, atomic-free 3D type-1 spreading prototype and
+// the F0 point-owned spread prototype.
 //
-// The baseline implementation lives in atomic_free_spread.cu, the F0 prototype
+// The warp-owned implementation lives in atomic_free_spread.cu, the F0 prototype
 // in f0_point_owned_spread.cu, and the command line, timing, reference
 // comparison, and correctness checks in atomic_free_spread_bench.cu.
 
@@ -15,34 +15,44 @@ namespace atomic_free_spread {
 
 // Width-6 kernel (sigma=2, tolerance 1e-5).
 constexpr int WIDTH = 6;
-constexpr int HALO = WIDTH / 2;
 
-// One CUDA block owns one output tile; one thread owns a small box of cells.
-constexpr int TILE_X = 8;
-constexpr int TILE_Y = 8;
-constexpr int TILE_Z = 8;
+// Kernel support beyond a warp region: ceil(WIDTH / 2) cells per side. This is
+// the support overhang, not the glossary's padding, which describes a local
+// subgrid.
+constexpr int SUPPORT_OVERHANG = (WIDTH + 1) / 2;
 
-// Cells per thread in each dimension. A warp spans one z slice, so the z
-// weights it reads stay a broadcast.
-constexpr int GROUP_X = 2;
-constexpr int GROUP_Y = 1;
-constexpr int GROUP_Z = 2;
+// One warp owns one 8x8x8 warp region, and one lane owns a 2x2x4 lane cell group.
+// A CUDA threadblock packs WARP_REGIONS_PER_THREADBLOCK independent work items;
+// each work item is one (warp region, split) pair, so the threadblock is only a
+// launch container, not a tile.
+constexpr int WARP_REGION_X = 8;
+constexpr int WARP_REGION_Y = 8;
+constexpr int WARP_REGION_Z = 8;
 
-constexpr int BLOCK_X = TILE_X / GROUP_X;
-constexpr int BLOCK_Y = TILE_Y / GROUP_Y;
-constexpr int BLOCK_Z = TILE_Z / GROUP_Z;
-constexpr int BLOCK_THREADS = BLOCK_X * BLOCK_Y * BLOCK_Z;
+constexpr int LANE_CELLS_X = 2;
+constexpr int LANE_CELLS_Y = 2;
+constexpr int LANE_CELLS_Z = 4;
 
-// Candidate points whose kernel weights are staged into shared memory at once.
-// Each point needs three staging slots, one per dimension, all live before the
-// cell loop runs.
-constexpr int STAGE_POINTS = 32;
+constexpr int LANES_X = WARP_REGION_X / LANE_CELLS_X;  // 4
+constexpr int LANES_Y = WARP_REGION_Y / LANE_CELLS_Y;  // 4
+constexpr int LANES_Z = WARP_REGION_Z / LANE_CELLS_Z;  // 2
+constexpr int LANES_PER_WARP = 32;
 
-static_assert(TILE_X % GROUP_X == 0 && TILE_Y % GROUP_Y == 0 &&
-                  TILE_Z % GROUP_Z == 0,
-              "a tile must be divisible into thread groups");
-static_assert(3 * STAGE_POINTS <= BLOCK_THREADS, "staging must fit in one round");
-static_assert(STAGE_POINTS % 32 == 0, "a warp must stage a single dimension");
+constexpr int WARP_REGION_CELLS = WARP_REGION_X * WARP_REGION_Y * WARP_REGION_Z;
+
+// Launch-policy knob: warps per threadblock. The spread launch packs work items
+// into a 1D grid, so this only sets the threadblock size (two warps = 64
+// threads) and the number of concurrent work items per threadblock.
+constexpr int WARP_REGIONS_PER_THREADBLOCK = 2;  // 1, 2, or 4
+constexpr int WARPS_PER_THREADBLOCK = WARP_REGIONS_PER_THREADBLOCK;
+constexpr int THREADS_PER_THREADBLOCK = WARPS_PER_THREADBLOCK * 32;
+
+static_assert(WARP_REGION_X % LANE_CELLS_X == 0);
+static_assert(WARP_REGION_Y % LANE_CELLS_Y == 0);
+static_assert(WARP_REGION_Z % LANE_CELLS_Z == 0);
+static_assert(LANES_X * LANES_Y * LANES_Z == LANES_PER_WARP);
+static_assert(WARP_REGION_CELLS ==
+              LANES_PER_WARP * LANE_CELLS_X * LANE_CELLS_Y * LANE_CELLS_Z);
 
 struct Point {
   float x, y, z;
@@ -61,12 +71,31 @@ inline Grid make_grid(int nx, int ny, int nz, int bin_size) {
 }
 
 // The last bin may be shorter than bin_size.
-inline long long bin_count(const Grid &grid) {
+__host__ __device__ inline long long bin_count(const Grid &grid) {
   return (long long)grid.bins_x * grid.bins_y * grid.bins_z;
 }
 
-inline long long cell_count(const Grid &grid) {
+__host__ __device__ inline long long cell_count(const Grid &grid) {
   return (long long)grid.nx * grid.ny * grid.nz;
+}
+
+// Warp-region geometry: ceil(n / WARP_REGION_*) regions per dimension, packed
+// x-fastest into flat region IDs. Edge regions are clipped by the kernel. The
+// helpers are host/device because the launch and the kernels both decode IDs.
+__host__ __device__ __forceinline__ int warp_regions_x(const Grid &grid) {
+  return (grid.nx + WARP_REGION_X - 1) / WARP_REGION_X;
+}
+
+__host__ __device__ __forceinline__ int warp_regions_y(const Grid &grid) {
+  return (grid.ny + WARP_REGION_Y - 1) / WARP_REGION_Y;
+}
+
+__host__ __device__ __forceinline__ int warp_regions_z(const Grid &grid) {
+  return (grid.nz + WARP_REGION_Z - 1) / WARP_REGION_Z;
+}
+
+__host__ __device__ __forceinline__ int warp_region_count(const Grid &grid) {
+  return warp_regions_x(grid) * warp_regions_y(grid) * warp_regions_z(grid);
 }
 
 namespace detail {
@@ -78,10 +107,12 @@ __device__ __forceinline__ int floor_div(int a, int b) {
   return quotient - ((remainder >> 31) & 1);
 }
 
-// The candidate bins for one dimension, in periodic (unwrapped) order. All
-// bins are returned exactly once; when the expanded tile covers the whole grid
-// the range is capped to [0, bins) so a wrapped bin is not visited twice.
-struct NearBins {
+// The candidate bins for one dimension, in periodic (unwrapped) order. A bin is
+// a candidate when its box can contain a source whose kernel support reaches
+// the region. All candidate bins are returned exactly once; when the expanded
+// region covers the whole grid the range is capped to [0, bins) so a wrapped
+// bin is not visited twice.
+struct CandidateBins {
   int first;
   int count;
   int bins;
@@ -94,10 +125,11 @@ struct NearBins {
   }
 };
 
-// Return the bins intersecting [tile_begin - HALO, tile_end + HALO). The last
-// bin of each period may be shorter than bin_size, so map an extended
-// coordinate to its bin copy first, then let operator[] fold the copy index
-// back into [0, bins). This replaces the per-bin bin_near_tile test.
+// Return the bins intersecting [region_begin - SUPPORT_OVERHANG,
+// region_end + SUPPORT_OVERHANG). The last bin of each period may be shorter
+// than bin_size, so map an extended coordinate to its bin copy first, then let
+// operator[] fold the copy index back into [0, bins). This replaces the per-bin
+// bin_near_tile test.
 __device__ __forceinline__ int extended_bin_index(int coordinate, int bin_size,
                                                   int grid_size, int bins) {
   const int period = floor_div(coordinate, grid_size);
@@ -106,15 +138,17 @@ __device__ __forceinline__ int extended_bin_index(int coordinate, int bin_size,
   return period * bins + local_bin;
 }
 
-__device__ __forceinline__ NearBins near_bins(int tile_begin, int tile_end,
-                                              int bin_size, int grid_size, int bins) {
-  const int query_begin = tile_begin - HALO;
-  const int query_end = tile_end + HALO;  // exclusive
+__device__ __forceinline__ CandidateBins candidate_bins(int region_begin,
+                                                        int region_end,
+                                                        int bin_size,
+                                                        int grid_size, int bins) {
+  const int query_begin = region_begin - SUPPORT_OVERHANG;
+  const int query_end = region_end + SUPPORT_OVERHANG;  // exclusive
   const int first = extended_bin_index(query_begin, bin_size, grid_size, bins);
   const int last = extended_bin_index(query_end - 1, bin_size, grid_size, bins);
   int count = last - first + 1;
-  if (count >= bins) return NearBins{0, bins, bins};
-  return NearBins{first, count, bins};
+  if (count >= bins) return CandidateBins{0, bins, bins};
+  return CandidateBins{first, count, bins};
 }
 
 }  // namespace detail
@@ -126,8 +160,11 @@ __device__ __forceinline__ NearBins near_bins(int tile_begin, int tile_end,
 void launch_assign_bins(const Point *points, int count, Grid grid, int *bin_ids);
 
 // Launch the atomic-free spread. Each output cell is written exactly once by
-// one thread, at the end of that thread's scan. The caller must check
-// cudaGetLastError() after this launch.
+// one lane, either directly at the end of that lane's scan or by the split
+// reduction that follows it. The launch detects the active warp regions (those
+// with a non-empty candidate bin), compacts them into a list, and chooses a
+// split count for hot inputs; inactive regions are written as zeros. The caller
+// must check cudaGetLastError() after this launch.
 void launch_spread(const Point *points, const int *bin_offsets, Grid grid,
                    cuFloatComplex *output);
 
