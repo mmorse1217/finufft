@@ -21,6 +21,17 @@ constexpr int TILE_X = 8;
 constexpr int TILE_Y = 8;
 constexpr int TILE_Z = 4;
 
+// One thread per cell, so the block size follows the tile.
+constexpr int BLOCK_THREADS = TILE_X * TILE_Y * TILE_Z;
+
+// Candidate points whose kernel weights are staged into shared memory at once.
+// Each point needs three staging slots, one per dimension, all live before the
+// cell loop runs.
+constexpr int STAGE_POINTS = 64;
+
+static_assert(3 * STAGE_POINTS <= BLOCK_THREADS, "staging must fit in one round");
+static_assert(STAGE_POINTS % 32 == 0, "a warp must stage a single dimension");
+
 struct Point {
   float x, y, z;
   cuFloatComplex strength;

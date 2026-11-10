@@ -80,7 +80,8 @@ SOURCE_GROUPS: List[Tuple[str, re.Pattern[str]]] = [
     (
         "support index / modulo",
         re.compile(
-            r"grid_size|coefficient_index|support_start|offset < WIDTH|offset < 0"
+            r"grid_size|coefficient_index|support_start|offset < WIDTH|offset < 0|"
+            r"weight_index|covered|dest\[local\]"
         ),
     ),
     (

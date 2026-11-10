@@ -87,18 +87,68 @@ warp regions.
 
 The readable baseline is split into three files: `atomic_free_spread.cuh` declares the
 point/grid types and launch API, `atomic_free_spread.cu` holds the kernels and launch
-wrappers, and `atomic_free_spread_bench.cu` is the entry point. It is a deliberately
-unoptimized, standalone baseline for the same type-1 correctness contract. It is not built
-by `run_exp_a.sh` and is not part of the library. Each thread owns one output cell,
-enumerates the Cartesian bins around its block's tile, and writes the cell once.
-Binning/sorting are on the host; there are no splits, partial grids, active-tile lists, or
-spreading atomics. It calls `eval_kernel_vec_horner` directly and reduces support offsets
-modulo the grid, which makes it an independent check on the optimized staged scan.
+wrappers, and `atomic_free_spread_bench.cu` is the entry point. It is a standalone
+baseline for the same type-1 correctness contract. It is not built by `run_exp_a.sh` and
+is not part of the library. Each thread owns one output cell, and each block enumerates the
+Cartesian bins around its tile and writes its cells once. Binning/sorting are on the host;
+there are no splits, partial grids, active-tile lists, or spreading atomics. It calls
+`eval_kernel_vec_horner` directly and reduces support offsets modulo the grid, which makes
+it an independent check on the optimized staged scan.
 
-It is a **correctness baseline, not a performance candidate**. Measured on the T1000 in
-this worktree, its spread kernel takes 260 / 471 / 44.7 ms for uniform / clustered /
-sparse, or **13.6x / 24.7x / 10.9x slower** than method 3. It deliberately repeats point
-work per output cell. Do not confuse it with the optimized `exp_a_cartesian.cu` timings.
+### Staged weight batches
+
+The per-cell loop does **not** evaluate the kernel. A point's weights depend on the point and
+the cell offset, not on the thread, so evaluating them per cell repeats the same 18 Horner
+polynomials (and the same 18-way coefficient selection) 256 times per block. Instead each
+block stages a batch of `STAGE_POINTS = 64` candidate points into shared memory as
+**tile-local, zero-filled vectors**: `kx[j][local]` is the weight of staged point `j` for cell
+`tile_x + local`, and likewise for y and z, with `0.0` where the point does not cover that
+cell (including cells past the end of the grid).
+
+- Three staging lanes per point, one per dimension: `fold_rescale`, `ceilf`, one
+  `eval_kernel_vec_horner`, then eight `stage_tile_weights` slots that call the same
+  `coefficient_index()` the per-cell loop used to call. 192 of the 256 threads stage; the
+  batch costs 5.67 KB of shared memory and two `__syncthreads()`.
+- The cell loop then has no support test, no branch, and no coefficient selection: three
+  shared loads, two multiplies, two fused multiply-adds per staged point. A zero weight adds
+  an exact zero, so the output matches the per-cell form (a non-finite point strength would
+  now reach cells the point does not cover).
+- The early return for cells outside a partial tile became a store predicate, because a
+  thread may not exit while the block still has barriers to reach.
+
+That removes both wastes at once: the Horner work is amortized over the tile instead of
+repeated per cell, and the 112-instruction register-select tree becomes one indexed shared
+load. Per candidate point per block the kernel drops from ~1355 to ~95 warp instructions.
+
+Measured on the T1000 in this worktree (median of 5, `nrun=5`):
+
+| case | before (`17c05838`) | after | speedup | vs method-3 execute |
+|---|---:|---:|---:|---:|
+| uniform 1e6, 64^3 | 185.9 ms | **43.8 ms** | 4.2x | 2.30x slower |
+| clustered 1e6, 64^3 | 426.9 ms | **46.1 ms** | 9.3x | 2.41x slower |
+| sparse 1e5, 128^3 | 19.3 ms | **12.88 ms** | 1.5x | 3.08x slower |
+| dense cluster 1e5, 64^3 | 111 ms | **11.0 ms** | 10.1x | 3.69x slower |
+
+The full Nsight Compute capture for the four canonical shapes is
+`build/gpu/traces/af_profile_20261110_041508/` (`summary.md` plus the CSVs). It shows the
+kernel is no longer instruction- or FMA-bound: instructions fell from 16.4B to 1.15B on
+uniform while IPC fell from 3.35 to 1.40. The binding resources are now shared-memory issue
+and latency (LSUIN requests 85%, MIO-throttle 56% of warp-state cycles, LDS 55% of samples on
+`kx[j][threadIdx.x] * ky[j][threadIdx.y] * kz[j][threadIdx.z]`), plus `__syncthreads()`:
+20% of warp state on uniform and 47% on sparse, where a 3-point bin forces a batch smaller
+than `STAGE_POINTS`.
+
+The staged rows are padded to an odd number of floats (`TILE_X + 1`, `TILE_Y + 1`,
+`TILE_Z + 1`). Without the padding the staging lanes write the same `local` of 32 different
+points at once, and an 8-float row puts four points on each bank: 46.4M bank conflicts,
+6.6 store wavefronts per store instruction. With odd strides the conflicts are exactly 0 and
+store wavefronts fall 55.2M -> 8.8M (-10.7% of all shared wavefronts on uniform), which
+bought 48.5 -> 43.8 ms uniform, 50.3 -> 46.1 ms clustered, 11.4 -> 11.0 ms dense, and nothing
+on sparse (it never had the conflicts, and it is barrier-bound).
+
+It is still **not a performance candidate**: it is 2.3-3.7x slower than method 3, and it
+recomputes weights for all 256 cells per point when only ~18 are covered. It is, however, no
+longer dominated by redundant point work.
 
 ```bash
 ./devel/morton_spread/run_atomic_free_spread.sh        # build + correctness matrix
@@ -147,8 +197,9 @@ The seam pattern found a real bug in the optimized `exp_a_cartesian.cu`: its
 negative offset for lane groups near the far x/y edge when a point sits exactly at the
 left seam. That path gave `relL2 = 6.4e-2`. The library owned-spread implementation already
 had the multi-period fix; it is migrated back into `exp_a_cartesian.cu` (an `if`/`while`
-after the branchless first correction). The atomic baseline was unaffected because
-`coefficient_index()` uses `% grid_size`. The fix leaves the mandatory
+after the branchless first correction). The atomic baseline was unaffected because its
+`coefficient_index()` reduces `cell - support_start` explicitly, and that difference is
+bounded by one grid period for a single cell. The fix leaves the mandatory
 uniform/clustered/sparse `relL2` values unchanged (5.63e-7 / 2.34e-7 / 7.34e-8 here), but
 it is not free: an interleaved A/B on the T1000 moved spread time 12.34 -> 13.13 ms
 uniform (+6.4%), 12.69 -> 12.77 ms clustered (+0.6%), and 1.575 -> 1.644 ms sparse

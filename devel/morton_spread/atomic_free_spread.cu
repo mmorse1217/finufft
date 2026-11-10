@@ -100,9 +100,30 @@ __device__ __forceinline__ int coefficient_index(int cell, int support_start,
   return offset < WIDTH ? offset : -1;
 }
 
-// One block owns one tile; one thread owns one cell. All threads independently
-// enumerate the tile's candidate points. This repeats work, but makes the
-// ownership and accumulation especially easy to follow.
+// Fill dest[0..COUNT) with this point's kernel weights for the cells
+// tile_begin + local, and with 0 where the point does not cover the cell.
+// coefficient_index() returns the position within the point's WIDTH kernel
+// values, or -1 when the point's support does not reach that cell.
+template<int COUNT>
+__device__ __forceinline__ void stage_tile_weights(float *dest, int tile_begin,
+                                                   int start, int grid_size,
+                                                   const float *ker) {
+  for (int local = 0; local < COUNT; ++local) {
+    const int cell = tile_begin + local;
+    const int weight_index = coefficient_index(cell, start, grid_size);
+    const bool covered = cell < grid_size && weight_index >= 0;
+    dest[local] = covered ? ker[weight_index] : 0.0f;
+  }
+}
+
+// One block owns one tile; one thread owns one cell. The block stages the kernel
+// weights of a batch of candidate points into shared memory, indexed by cell
+// position inside the tile, and each cell then reads the three weights it needs.
+//
+// The staged vectors are tile-local and zero-filled, so the cell loop has no
+// support test, no branch, and no coefficient selection. A zero weight adds an
+// exact zero, so results match the per-cell form; a non-finite point strength
+// would now reach cells the point does not cover.
 __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
                        cuFloatComplex *output) {
   using cufinufft::spreadinterp::eval_kernel_vec_horner;
@@ -126,9 +147,30 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
     y_bins = near_bins(tile_y, end_y, grid.bin_size, grid.ny, grid.bins_y);
     z_bins = near_bins(tile_z, end_z, grid.bin_size, grid.nz, grid.bins_z);
   }
-  __syncthreads();
-  if (x >= grid.nx || y >= grid.ny || z >= grid.nz) return;
 
+  // Staged weights for one batch: kx[j][local] is the weight of staged point j
+  // for cell tile_x + local, and likewise for y and z. Rows are padded to an odd
+  // number of floats so that the staging lanes, which write one `local` of many
+  // consecutive points at once, hit distinct shared-memory banks.
+  __shared__ float kx[STAGE_POINTS][TILE_X + 1];
+  __shared__ float ky[STAGE_POINTS][TILE_Y + 1];
+  __shared__ float kz[STAGE_POINTS][TILE_Z + 1];
+  __shared__ float2 strength[STAGE_POINTS];
+  __syncthreads();
+
+  const int linear_tid = threadIdx.x + TILE_X * (threadIdx.y + TILE_Y * threadIdx.z);
+
+  // One staging lane per (point, dimension): dim d owns the lanes
+  // [d * STAGE_POINTS, (d + 1) * STAGE_POINTS), so every warp stages a single
+  // dimension and the dimension branches below do not diverge. Lanes past
+  // 3 * STAGE_POINTS only take part in the barriers.
+  const int stage_dim = linear_tid / STAGE_POINTS;
+  const int stage_point = linear_tid % STAGE_POINTS;
+  const bool is_stager = stage_dim < 3;
+
+  // Threads on the ragged edge of a partial tile own no cell, but they must keep
+  // reaching the barriers, so the early return becomes a store predicate.
+  const bool owns_cell = x < grid.nx && y < grid.ny && z < grid.nz;
   float real = 0.0f, imag = 0.0f;
 
   for (int z_bin_index = 0; z_bin_index < z_bins.count; ++z_bin_index) {
@@ -138,32 +180,48 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
       for (int x_bin_index = 0; x_bin_index < x_bins.count; ++x_bin_index) {
         const int bx = x_bins[x_bin_index];
         const int bin = bx + grid.bins_x * (by + grid.bins_y * bz);
-        for (int i = bin_offsets[bin]; i < bin_offsets[bin + 1]; ++i) {
-          Point p = points[i];
-          float px = fold_rescale(p.x, grid.nx);
-          float py = fold_rescale(p.y, grid.ny);
-          float pz = fold_rescale(p.z, grid.nz);
-          int sx = int(ceilf(px - HALO));
-          int sy = int(ceilf(py - HALO));
-          int sz = int(ceilf(pz - HALO));
-          int ix = coefficient_index(x, sx, grid.nx);
-          int iy = coefficient_index(y, sy, grid.ny);
-          int iz = coefficient_index(z, sz, grid.nz);
-          if (ix < 0 || iy < 0 || iz < 0) continue;
-
-          float kx[WIDTH], ky[WIDTH], kz[WIDTH];
-          eval_kernel_vec_horner<float, WIDTH>(kx, float(sx) - px, 2.0);
-          eval_kernel_vec_horner<float, WIDTH>(ky, float(sy) - py, 2.0);
-          eval_kernel_vec_horner<float, WIDTH>(kz, float(sz) - pz, 2.0);
-          float weight = kx[ix] * ky[iy] * kz[iz];
-          real += p.strength.x * weight;
-          imag += p.strength.y * weight;
+        const int bin_begin = bin_offsets[bin];
+        const int bin_end = bin_offsets[bin + 1];
+        // This loop carries the block's barriers, so every thread must run it.
+        // Only the body is conditional: `staged` shrinks on the last batch of a
+        // bin.
+        for (int base = bin_begin; base < bin_end; base += STAGE_POINTS) {
+          const int staged = min(STAGE_POINTS, bin_end - base);
+          if (is_stager && stage_point < staged) {
+            const Point p = points[base + stage_point];
+            const float raw = stage_dim == 0 ? p.x : (stage_dim == 1 ? p.y : p.z);
+            const int size =
+                stage_dim == 0 ? grid.nx : (stage_dim == 1 ? grid.ny : grid.nz);
+            const float rescaled = fold_rescale(raw, size);
+            const int start = int(ceilf(rescaled - HALO));
+            float ker[WIDTH];
+            eval_kernel_vec_horner<float, WIDTH>(ker, float(start) - rescaled, 2.0);
+            if (stage_dim == 0) {
+              stage_tile_weights<TILE_X>(kx[stage_point], tile_x, start, grid.nx, ker);
+              strength[stage_point] = make_float2(p.strength.x, p.strength.y);
+            } else if (stage_dim == 1) {
+              stage_tile_weights<TILE_Y>(ky[stage_point], tile_y, start, grid.ny, ker);
+            } else {
+              stage_tile_weights<TILE_Z>(kz[stage_point], tile_z, start, grid.nz, ker);
+            }
+          }
+          __syncthreads();
+          for (int j = 0; j < staged; ++j) {
+            const float weight =
+                kx[j][threadIdx.x] * ky[j][threadIdx.y] * kz[j][threadIdx.z];
+            const float2 s = strength[j];
+            real += s.x * weight;
+            imag += s.y * weight;
+          }
+          __syncthreads();
         }
       }
     }
   }
-  long long index = x + (long long)grid.nx * (y + (long long)grid.ny * z);
-  output[index] = make_cuFloatComplex(real, imag);
+  if (owns_cell) {
+    long long index = x + (long long)grid.nx * (y + (long long)grid.ny * z);
+    output[index] = make_cuFloatComplex(real, imag);
+  }
 }
 
 }  // namespace
