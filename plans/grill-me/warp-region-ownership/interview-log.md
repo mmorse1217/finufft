@@ -347,6 +347,61 @@
 - **Classification:** Decision (A.1), Open (sparse trade-off).
 - **New question:** Approve A.1, or accept the sparse regression and proceed?
 
+### Turn 17 — Changes B+C cleanup approved before A.1
+
+- **State:** Ready for execution (Changes B+C)
+- **User instruction:** Implement the host active-tile planning and compact
+  partial buffers in a subagent as cleanup before proceeding.
+- **Scope:** Change B: compute the active-region plan on the host from the host
+  bin offsets, inside `launch_spread`, and remove the GPU detection/compaction
+  kernels and blocking copy. Change C: compact partial buffers
+  `[split][active_region][local_cell]` and local-cell reduction. Do not change the
+  scan/staging.
+- **Measurement:** The host plan stays inside the timed `launch_spread`, so the
+  bench `spread` interval includes it. The compact partial allocation is much
+  smaller; report the sizes and outliers.
+- **Classification:** Decision.
+- **Next action:** Worker implements B+C; validate 9/9 + 25/25; bench; then resume
+  A.1/sparse.
+
+### Turn 18 — Changes B+C implemented; host-plan cost is visible
+
+- **State:** Needs confirmation (host-plan cost)
+- **Result:** B+C correct: 9/9, 25/25, poisoned-output `unwritten=0`, edge grids.
+  Uniform 18.688 ms, clustered 14.772, sparse 3.344, dense 1.645 (clean run;
+  second run uniform 18.422, sparse 3.466). Compact partial: clustered 8 MiB,
+  dense 1 MiB, none for uniform/sparse. No dense outlier in the final run.
+- **Resource:** `spread` 95 registers, 6,144 B shared, 0 spills;
+  `reduce_split_slices` 64 registers, 0 spills.
+- **Issue:** The host plan scans 4096 regions × candidate bins inside every timed
+  `launch_spread` for sparse, costing 0.5–0.6 ms; uniform pays ~0.3–0.5 ms. The
+  compact partials are not the cause; sparse stays on the full-grid path.
+- **Decision:** Address the host-plan cost before resuming A.1. Optimize the plan
+  (precompute per-dimension candidate ranges or prefix sums) or cache it across
+  runs and report cold/amortized cost. Do not move it to prep without labelling
+  the comparison.
+- **Classification:** Decision (address cost), Open (method).
+- **New question:** Optimize the host plan, cache it, or accept the cost?
+
+### Turn 19 — benchmark-shaped launch branches challenged
+
+- **State:** Needs confirmation (branch-cleanup scope)
+- **User critique:** The implementation implicitly branches on the benchmark case
+  through the `LaunchPath`/launch-path enum in `launch_spread` and the scan.
+- **Acknowledgment:** The path is selected from `active_count` and `split_count`,
+  not case names, but the canonical cases map to different branches: uniform and
+  sparse use `FullGrid` split 1; clustered and dense use `ActiveSplit` split 32.
+  `ActiveSingleSplit` is not exercised by the canonical four. The
+  `active_count < 512 ? 2048 : 512` heuristic is exp_a's and is tuned to these
+  sizes. That is benchmark-shaped in effect, even if not literal case matching.
+- **Classification:** Fact/Decision. The multi-path launch is hard to defend as a
+  general kernel; clean it up before more tuning.
+- **Decision:** Remove the benchmark-shaped branches first. Unify full-grid and
+  active-list launches; remove `ActiveSingleSplit` and the `LaunchPath` enum;
+  keep `split_count` and an optional active list as the only adaptive facts.
+- **New question:** Confirm the branch-cleanup scope, then choose host-plan
+  optimization, A.1, or sparse staging work.
+
 ## Decision history
 
 ### D1 — Preserve the glossary's `tile` definition; add local ownership terms
@@ -567,13 +622,55 @@
   slower on uniform and 25.9% slower on sparse.
 - **Confidence:** High on the diagnosis; Medium on whether 13/16 recovers uniform.
 
+### D16 — Do B+C cleanup now, before A.1
+
+- **Status:** Decided
+- **Decision:** Implement the host active plan and compact partial buffers before
+  the staging-group experiment. Leave the scan/staging unchanged.
+- **Rationale:** The user wants the cleanup before proceeding; B/C are independent
+  of the scan and remove allocation risk and GPU metadata complexity. They will
+  make the later A.1/sparse experiments easier to interpret.
+- **Alternatives rejected:** A.1 first (user chose cleanup); one combined B+C+A.1
+  worker (harder to attribute).
+- **Confidence:** High.
+
+### D17 — Resolve the host-plan cost before A.1
+
+- **Status:** Decided on addressing it; method Open
+- **Decision:** Optimize or cache the host plan and report the cost honestly before
+  resuming the staging-group experiment.
+- **Rationale:** Sparse pays 0.5–0.6 ms and uniform 0.3–0.5 ms for the plan; that
+  would confound A.1's uniform/sparse comparison. The plan is intentionally inside
+  `launch_spread`, so the cost is real, not hidden.
+- **Alternatives rejected:** Accept the cost (confounds A.1); move the plan to prep
+  silently (dishonest); revert to GPU detection/compaction (more code and a
+  blocking copy).
+- **Confidence:** High on addressing it; Medium on optimize vs cache.
+
+### D18 — Remove benchmark-shaped launch branches before further tuning
+
+- **Status:** Decided on direction; scope Open
+- **Decision:** Unify the full-grid/active-list launch paths, remove
+  `ActiveSingleSplit` and the `LaunchPath` enum, and keep only `split_count` plus
+  an optional active list. Document or simplify the split heuristic.
+- **Rationale:** The canonical cases currently land in different branches, which
+  makes the speedup look benchmark-shaped. A single general path is easier to
+  defend and compare across workloads.
+- **Alternatives rejected:** Keep the adaptive paths and document them (still
+  benchmark-shaped); use a fixed split policy (likely large regressions on one
+  side); tune performance before cleanup (compounds the problem).
+- **Confidence:** High on cleanup; Medium on the performance cost of unifying the
+  paths.
+
 ## Unresolved questions
 
-1. Does A.1 with `STAGING_GROUP_SIZE = 13` or 16 recover uniform to within 5%?
-2. If sparse remains 25% slower, accept the one-lane staging regression for
+1. Branch-cleanup scope: always use an active list (all regions when uniform),
+   remove `ActiveSingleSplit`, and use one store mode? Or keep a minimal
+   `split_count == 1` fast path?
+2. Host-plan cost: optimize the plan, cache it with cold/amortized reporting, or
+   accept the 0.3–0.6 ms cost?
+3. Does A.1 with `STAGING_GROUP_SIZE = 13` or 16 recover uniform to within 5%?
+4. If sparse remains 25% slower, accept the one-lane staging regression for
    simplicity, or add a parallel small-bin staging path?
-3. After A.1, approve Change B (host plan) and Change C (compact partials), or
-   stop at the concise scan.
-4. Are host tests for the pure geometry/cursor modules required in the concise
-   prototype?
-5. Is the F0 prototype in scope for the `CandidateBins` move?
+5. Measurement hygiene: which non-canonical workloads should be added before the
+   next profile?

@@ -1,7 +1,7 @@
 # Atomic-free spread: warp-owned 8×8×8 regions with 16 cells per lane
 
-> Status: Ready for execution (Change A: window/coverage scan)
-> Last updated: Turn 15 (Change A handoff)
+> Status: Ready for execution (Changes B+C cleanup before A.1)
+> Last updated: Turn 17 (B+C handoff)
 
 ## Outcome
 
@@ -1483,6 +1483,44 @@ uniform and sparse. If uniform returns to tolerance and sparse remains the only
 outlier, decide explicitly whether the sparse regression is acceptable or whether
 staging needs a parallel small-bin path.
 
+### Changes B+C result — correct, host plan cost visible
+
+Changes B (host active plan) and C (compact partial buffers) are correct: 9/9
+matrix, 25/25 sweep, poisoned-output `unwritten=0`, edge grids, and the split
+path all pass.
+
+| case | Change A | B+C (clean run) | path | compact partial |
+|---|---:|---:|---|---:|
+| uniform | 18.154 ms | **18.688 ms** | full grid, split 1 | none |
+| clustered | 14.496 ms | **14.772 ms** | active split, split 32 | **8 MiB** |
+| sparse | 2.818 ms | **3.344 ms** | full grid, split 1 | none |
+| dense | 1.774 ms | **1.645 ms** | active split, split 32 | **1 MiB** |
+
+A second run gave uniform 18.422, clustered 14.766, sparse 3.466, dense 1.657;
+the difference is run-to-run variation. The compact partial removes the old
+67–536 MB full-grid split allocation and the large allocation outliers. No dense
+outlier appeared in the final run; one earlier clustered sample had a single
+17.4 ms maximum against a 14.8 ms median.
+
+Resources: `spread` 95 registers, 6,144 B shared, 0 spills; `reduce_split_slices`
+64 registers, 0 spills.
+
+Assessment:
+
+- **Change C works.** Clustered partial memory is 8 MiB, dense 1 MiB, and
+  uniform/sparse allocate none. The compact local-cell store/reduction is simpler
+  and removes the large-buffer risk.
+- **The host plan is honest but expensive.** Sparse is 0.5–0.6 ms slower than
+  Change A because the plan scans 4096 regions × candidate bins inside every
+  timed `launch_spread`. Uniform pays ~0.3–0.5 ms for the 512-region plan. The
+  plan is not hidden in prep; that was deliberate.
+- **Options:** optimize the host plan (precompute per-dimension candidate ranges,
+  or a prefix-sum over bins), cache the plan across runs and report cold and
+  amortized costs, or accept the cost. Do not move it to prep without labelling
+  the headline comparison.
+- **Recommendation:** optimize or cache the plan before A.1, because A.1 will
+  compare uniform/sparse and the host-plan overhead will confound the result.
+
 ### Validation
 
 - Prototype on a branch/worktree; keep the current kernel as the reference until
@@ -1494,6 +1532,80 @@ staging needs a parallel small-bin path.
   as an opt-in fast path.
 - Profile uniform/clustered/sparse/dense after the staging+scan change and again
   after the host-plan/compact-partial change.
+
+## Benchmark-shaped path selection
+
+The host plan currently maps the four canonical cases to different `LaunchPath`
+branches:
+
+| case | active regions | split count | path |
+|---|---:|---:|---|
+| uniform | 512/512 | 1 | `FullGrid` |
+| sparse | 4096/4096 | 1 | `FullGrid` |
+| clustered | 64/512 | 32 | `ActiveSplit` |
+| dense | 8/512 | 32 | `ActiveSplit` |
+
+The choice is derived from `active_count` and the split heuristic, not from case
+names. But because the canonical cases have very different active counts, the
+effect is benchmark-shaped: the cases take different code paths. `ActiveSingleSplit`
+is not exercised by the canonical four. The `active_count < 512 ? 2048 : 512`
+split target is exp_a's heuristic and is tuned to these sizes.
+
+This is only legitimate if the policy generalizes and is documented. If the paths
+exist to make the four canonical cases look good, it is cheating. The clean
+direction is to remove the special-case branches and keep one general kernel path
+with a single adaptive parameter, `split_count`, plus an optional active list.
+
+### Possible next steps
+
+**Remove benchmark-shaped branching first**
+
+1. **Unify full-grid and active-list launches.** Always pass a region list (or
+   `nullptr` meaning flat region IDs). Full-grid becomes active-list with all
+   regions and `split_count == 1`. Remove the `FullGrid` branch.
+2. **Remove `ActiveSingleSplit`.** Use the same active-list kernel with
+   `split_count == 1`; either write global output directly or always use compact
+   partials + reduction. One store mode, one launch path.
+3. **Remove the `LaunchPath` enum.** Keep only `split_count` and
+   `active_regions == nullptr` as the kernel's two runtime facts. The host policy
+   becomes: build the list, choose split count, launch.
+4. **Use a fixed split policy** (always 1, or always a general value) to test how
+   much of the speedup depends on adapting to the four cases. This is a
+   diagnostic, not a final design; measure uniform/clustered/sparse/dense.
+5. **Document or simplify the split heuristic.** If `active_count < 512 ? 2048 :
+   512` stays, state why it generalizes beyond the canonical sizes. Otherwise use
+   a simpler rule (e.g., target a fixed number of work items per SM).
+6. **Keep the narrow-grid fallback** unless a unified window scan can handle tiny
+   grids without per-cell taps. It is a correctness branch, not a benchmark
+   branch, but it is another path to document.
+
+**General performance work after the cleanup**
+
+1. **Optimize or cache the host active plan.** Sparse pays 0.5–0.6 ms and uniform
+   0.3–0.5 ms. Use a 3D prefix sum over bin counts, precompute per-dimension
+   candidate ranges, or cache with cold/amortized reporting.
+2. **Staging-group size experiment (A.1).** Try 13 or 16 sources per group to
+   raise the non-wrapping vote hit rate on uniform. Measure all four cases.
+3. **Parallel small-bin staging.** Sparse's one-lane staging does three full
+   Horner evaluations for a three-source bin; Phase 2's nine-lane staging used 27
+   lanes. Add a small-bin parallel path if sparse must return to tolerance.
+4. **x-run batching.** Merge consecutive candidate bins into one source range so
+   staging groups are larger and spatially coherent. General improvement, not a
+   case-specific branch.
+5. **Double-buffered staging.** Overlap the next source group's global loads with
+   the current scan.
+6. **Persistent workspace.** Remove per-launch active-list/partial allocations;
+   report cold vs amortized behavior.
+7. **Measurement hygiene.** Add non-canonical workloads (different M, grid, cluster
+   count, bin size) and compare end-to-end `prep + spread` with method 3
+   `setpts + execute`. Do not use kernel-only NCU as the headline.
+
+### Recommendation
+
+Do the branch cleanup before more performance tuning. A single general launch path
+with `split_count` as the only adaptive parameter is easier to defend and easier
+to compare across workloads. Then optimize the host plan, run A.1, and decide the
+sparse trade-off with data from more than the four canonical cases.
 
 ## Milestones and next actions
 
@@ -1516,13 +1628,20 @@ staging needs a parallel small-bin path.
   `build/gpu/traces/af_profile_20261110_192025/`. Uniform 18.15 ms (+8.7%),
   clustered 14.50 ms (−11.8%), sparse 2.82 ms (+25.9%), dense 1.77 ms (−8.5%).
   Translation unit 783 lines, down from 1005.
-- [In progress] Change A.1: try `STAGING_GROUP_SIZE = 13` or 16 to improve the
+- [Done] Change B: host active plan, measured inside `launch_spread`; GPU
+  detection/compaction and the blocking copy removed.
+- [Done] Change C: compact partial buffers `[split][active_region][local_cell]`;
+  clustered partial 8 MiB, dense 1 MiB, no full-grid allocations.
+- [In progress] Branch cleanup: remove the benchmark-shaped `LaunchPath`
+  branches; unify full-grid/active-list and remove `ActiveSingleSplit`. Keep
+  `split_count` and an optional active list as the only adaptive facts.
+- [Open] Host-plan cost: optimize or cache the plan and report cold vs amortized
+  cost. Sparse is 0.5–0.6 ms slower from scanning 4096 regions per launch;
+  uniform ~0.3–0.5 ms.
+- [Open] Change A.1: try `STAGING_GROUP_SIZE = 13` or 16 to improve the
   non-wrapping vote hit rate on uniform; re-bench uniform and sparse.
 - [Open] Decide the sparse trade-off: accept the one-lane staging regression, or
-  add a parallel small-bin staging path. Do not proceed to B/C before this.
-- [Open] Change B: move the active-region plan to the host, measured inside
-  `launch_spread`, and remove GPU detection/compaction. Only after A.1.
-- [Open] Change C: compact partial grids and local-cell reduction. Only after
-  A.1.
-- [Open] Next action: run A.1 in a worker or decide to accept the sparse
-  regression.
+  add a parallel small-bin staging path.
+- [Open] Measurement hygiene: add non-canonical workloads and compare end-to-end
+  `prep + spread` with method 3 `setpts + execute`.
+- [Open] Next action: branch cleanup, then host-plan cost, then A.1/sparse.

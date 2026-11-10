@@ -253,12 +253,14 @@ bool is_unwritten_sentinel(const cuFloatComplex &value) {
 const char *pass_fail(bool pass) { return pass ? "PASS" : "FAIL"; }
 
 void launch_selected_spread(int kernel, const Point *points,
-                            const int *bin_offsets, Grid grid,
+                            const int *bin_offsets,
+                            const int *host_bin_offsets, Grid grid,
                             cuFloatComplex *output) {
   if (kernel == 1) {
     atomic_free_spread::launch_spread_f0(points, bin_offsets, grid, output);
   } else {
-    atomic_free_spread::launch_spread(points, bin_offsets, grid, output);
+    atomic_free_spread::launch_spread(points, bin_offsets, host_bin_offsets,
+                                      grid, output);
   }
 }
 
@@ -382,8 +384,8 @@ int main(int argc, char **argv) {
   CudaTimer spread_timer;
   for (int run = -2; run < nrun; ++run) {
     spread_timer.begin();
-    launch_selected_spread(kernel, device_points.get(), device_offsets.get(), grid,
-                           device_output.get());
+    launch_selected_spread(kernel, device_points.get(), device_offsets.get(),
+                           offsets.data(), grid, device_output.get());
     CUDA_CHECK(cudaGetLastError());
     const double milliseconds = spread_timer.end();
     if (run >= 0) spread_ms.push_back(milliseconds);
@@ -406,8 +408,8 @@ int main(int argc, char **argv) {
   // Correctness run: poison the output first so an unwritten cell is visible.
   CUDA_CHECK(cudaMemset(device_output.get(), 0xFF,
                         (size_t)num_cells * sizeof(cuFloatComplex)));
-  launch_selected_spread(kernel, device_points.get(), device_offsets.get(), grid,
-                         device_output.get());
+  launch_selected_spread(kernel, device_points.get(), device_offsets.get(),
+                         offsets.data(), grid, device_output.get());
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
   std::vector<cuFloatComplex> result((size_t)num_cells);

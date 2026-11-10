@@ -11,6 +11,8 @@
 #include <cuda_runtime.h>
 #include <cufinufft.h>
 
+#include <vector>
+
 namespace atomic_free_spread {
 
 // Width-6 kernel (sigma=2, tolerance 1e-5).
@@ -101,7 +103,7 @@ __host__ __device__ __forceinline__ int warp_region_count(const Grid &grid) {
 namespace detail {
 
 // Truncating division plus a mask correction: floor(a/b) for positive b.
-__device__ __forceinline__ int floor_div(int a, int b) {
+__host__ __device__ __forceinline__ int floor_div(int a, int b) {
   const int quotient = a / b;
   const int remainder = a - quotient * b;
   return quotient - ((remainder >> 31) & 1);
@@ -117,7 +119,7 @@ struct CandidateBins {
   int count;
   int bins;
 
-  __device__ __forceinline__ int operator[](int i) const {
+  __host__ __device__ __forceinline__ int operator[](int i) const {
     int bin = first + i;
     if (bin < 0) bin += bins;
     else if (bin >= bins) bin -= bins;
@@ -130,18 +132,19 @@ struct CandidateBins {
 // than bin_size, so map an extended coordinate to its bin copy first, then let
 // operator[] fold the copy index back into [0, bins). This replaces the per-bin
 // bin_near_tile test.
-__device__ __forceinline__ int extended_bin_index(int coordinate, int bin_size,
-                                                  int grid_size, int bins) {
+__host__ __device__ __forceinline__ int extended_bin_index(int coordinate,
+                                                           int bin_size,
+                                                           int grid_size,
+                                                           int bins) {
   const int period = floor_div(coordinate, grid_size);
   const int local_coordinate = coordinate - period * grid_size;  // [0, grid_size)
-  const int local_bin = min(local_coordinate / bin_size, bins - 1);
-  return period * bins + local_bin;
+  const int last_bin = bins - 1;
+  const int local_bin = local_coordinate / bin_size;
+  return period * bins + (local_bin < last_bin ? local_bin : last_bin);
 }
 
-__device__ __forceinline__ CandidateBins candidate_bins(int region_begin,
-                                                        int region_end,
-                                                        int bin_size,
-                                                        int grid_size, int bins) {
+__host__ __device__ __forceinline__ CandidateBins candidate_bins(
+    int region_begin, int region_end, int bin_size, int grid_size, int bins) {
   const int query_begin = region_begin - SUPPORT_OVERHANG;
   const int query_end = region_end + SUPPORT_OVERHANG;  // exclusive
   const int first = extended_bin_index(query_begin, bin_size, grid_size, bins);
@@ -153,6 +156,22 @@ __device__ __forceinline__ CandidateBins candidate_bins(int region_begin,
 
 }  // namespace detail
 
+// The launch policy selected by the host active-region plan.
+enum class LaunchPath { Empty, FullGrid, ActiveSingleSplit, ActiveSplit };
+
+// Host-side active-region plan. regions is the deterministic, compacted list of
+// warp-region IDs whose candidate bins contain at least one source. split_count
+// is the split heuristic result, and path selects the launch/reduction shape.
+struct ActiveRegionPlan {
+  std::vector<int> regions;
+  int split_count = 1;
+  LaunchPath path = LaunchPath::Empty;
+};
+
+// Plan the active warp regions from the host bin-offset table. This is computed
+// inside launch_spread so the benchmark's spread interval includes it.
+ActiveRegionPlan plan_active_regions(const int *host_bin_offsets, Grid grid);
+
 // Assign each point to a flattened Cartesian bin (x varies fastest). The
 // kernel folds coordinates with cuFINUFFT's fold_rescale, so bin assignment
 // uses the exact same floating-point fold as the spread kernel. The caller
@@ -161,11 +180,13 @@ void launch_assign_bins(const Point *points, int count, Grid grid, int *bin_ids)
 
 // Launch the atomic-free spread. Each output cell is written exactly once by
 // one lane, either directly at the end of that lane's scan or by the split
-// reduction that follows it. The launch detects the active warp regions (those
-// with a non-empty candidate bin), compacts them into a list, and chooses a
-// split count for hot inputs; inactive regions are written as zeros. The caller
-// must check cudaGetLastError() after this launch.
-void launch_spread(const Point *points, const int *bin_offsets, Grid grid,
+// reduction that follows it. The launch plans the active warp regions on the
+// host from host_bin_offsets (those with a non-empty candidate bin), uploads the
+// compacted list when needed, and chooses a split count for hot inputs; inactive
+// regions are written as zeros. device_bin_offsets drives the device scan. The
+// caller must check cudaGetLastError() after this launch.
+void launch_spread(const Point *points, const int *device_bin_offsets,
+                   const int *host_bin_offsets, Grid grid,
                    cuFloatComplex *output);
 
 // Launch the F0 point-owned spread. Each block owns one exact output tile and

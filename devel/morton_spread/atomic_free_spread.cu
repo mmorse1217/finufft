@@ -6,15 +6,18 @@
 // lane cell group, so each output cell is written exactly once by one lane.
 // There are no spreading atomics.
 //
-// The launch is split into four phases: detect the active warp regions (any
-// non-empty candidate bin), compact them into a deterministic list, launch one
-// work item per (active region, split) pair, and (when splits are used) reduce
-// the per-split partial grids into the output. A spread kernel launch therefore
-// carries a work-item count instead of a threadblock tile grid: a full-grid
-// launch passes no active list and indexes flat warp-region IDs directly, while
-// an active-list launch decodes active_regions[work_id / split_count] and takes
-// split_index = work_id % split_count. Inactive regions are zeroed by the host
-// memset and are never touched by the kernel or the reduction.
+// The launch is split into three phases: plan the active warp regions on the
+// host from the bin-offset table (a region is active when any candidate bin is
+// non-empty), launch one work item per (active region, split) pair, and (when
+// splits are used) reduce the compact partial buffers into the output. A spread
+// kernel launch therefore carries a work-item count instead of a threadblock
+// tile grid: a full-grid launch passes no active list and indexes flat warp-region
+// IDs directly, while an active-list launch decodes
+// active_regions[work_id / split_count] and takes
+// split_index = work_id % split_count. The split path stores
+// partial[(split_index * active_count + region_slot) * WARP_REGION_CELLS +
+// local_cell], so it never computes a global cell index. Inactive regions are
+// zeroed by the host memset and are never touched by the kernel or the reduction.
 //
 // Sources are staged in shared memory as one record per source: three support
 // starts, six kernel values per dimension, and the strength. One lane stages one
@@ -50,7 +53,7 @@ namespace {
 
 // A failed allocation, memset, or copy in launch_spread would otherwise be
 // reported only by the caller's cudaGetLastError(), which cannot see a failed
-// cudaMemcpy of the active-region count. This prototype is benchmark-only, so a
+// cudaMemcpy of the active-region list. This prototype is benchmark-only, so a
 // failure is fatal and loud instead of silently spreading into a partly
 // initialised grid.
 void check_cuda(cudaError_t status, const char *what) {
@@ -424,6 +427,32 @@ __device__ __forceinline__ void store_cell_group(
       }
 }
 
+// Write this lane's cell group into one compact partial slice using warp-region-
+// local cell indices. Only cells inside the clipped region extent are stored; the
+// split reduction skips the remaining local cells and maps each surviving local
+// cell to the global output index once.
+__device__ __forceinline__ void store_cell_group_local(
+    const CellAccumulator &acc, cuFloatComplex *region_slice, WarpRegion region,
+    LaneCellGroup cell_group) {
+  #pragma unroll
+  for (int lx = 0; lx < LANE_CELLS_X; ++lx)
+    #pragma unroll
+    for (int ly = 0; ly < LANE_CELLS_Y; ++ly)
+      #pragma unroll
+      for (int lz = 0; lz < LANE_CELLS_Z; ++lz) {
+        const int x = cell_group.x + lx;
+        const int y = cell_group.y + ly;
+        const int z = cell_group.z + lz;
+        if (x < region.nx && y < region.ny && z < region.nz) {
+          const int local_index =
+              x + WARP_REGION_X * (y + WARP_REGION_Y * z);
+          region_slice[local_index] =
+              make_cuFloatComplex(acc.cell[lx][ly][lz].x,
+                                  acc.cell[lx][ly][lz].y);
+        }
+      }
+}
+
 // Enumerate the non-empty candidate bins of one warp region, one contiguous
 // sorted source range at a time. Every lane of a warp constructs and advances
 // the same cursor, so the candidate-bin loops and __syncwarp() are warp-uniform.
@@ -472,85 +501,45 @@ class SourceRangeCursor {
   int z_index_ = 0;
 };
 
-// Active detection: one thread per warp region. A region is active when the sum
-// of the source counts of its candidate bins is nonzero. The candidate-bin set is
-// exactly the one SourceRangeCursor enumerates, so the test can only
-// over-report: a source in a candidate bin may still miss the region, but no
-// region that would accumulate a contribution is ever skipped.
-__global__ void detect_active_regions(const int *__restrict__ bin_offsets,
-                                      Grid grid, int regions_x, int regions_y,
-                                      int region_count,
-                                      int *__restrict__ active_flags) {
-  const int region_id = blockIdx.x * blockDim.x + threadIdx.x;
-  if (region_id >= region_count) return;
-  const WarpRegion region =
-      warp_region_from_id(region_id, grid, regions_x, regions_y);
-  if (region.nx <= 0 || region.ny <= 0 || region.nz <= 0) {
-    active_flags[region_id] = 0;
-    return;
-  }
-  const detail::CandidateBins x_bins = detail::candidate_bins(
-      region.x, region.x + region.nx, grid.bin_size, grid.nx, grid.bins_x);
-  const detail::CandidateBins y_bins = detail::candidate_bins(
-      region.y, region.y + region.ny, grid.bin_size, grid.ny, grid.bins_y);
-  const detail::CandidateBins z_bins = detail::candidate_bins(
-      region.z, region.z + region.nz, grid.bin_size, grid.nz, grid.bins_z);
-  int source_count = 0;
-  for (int z_index = 0; z_index < z_bins.count; ++z_index)
-    for (int y_index = 0; y_index < y_bins.count; ++y_index)
-      for (int x_index = 0; x_index < x_bins.count; ++x_index) {
-        const int bin =
-            x_bins[x_index] +
-            grid.bins_x * (y_bins[y_index] + grid.bins_y * z_bins[z_index]);
-        source_count += bin_offsets[bin + 1] - bin_offsets[bin];
-      }
-  active_flags[region_id] = source_count != 0 ? 1 : 0;
-}
-
-// Compact the active region IDs in region order. Single-threaded on purpose: the
-// region count is small (512 for 64^3, 4096 for 128^3) and one thread keeps the
-// list deterministic without atomics.
-__global__ void compact_active_regions(const int *__restrict__ active_flags,
-                                       int region_count,
-                                       int *__restrict__ active_regions,
-                                       int *__restrict__ active_count) {
-  int active_total = 0;
-  for (int region_id = 0; region_id < region_count; ++region_id)
-    if (active_flags[region_id]) active_regions[active_total++] = region_id;
-  active_count[0] = active_total;
-}
-
-// Sum the per-split partial grids into the output for active warp regions only.
-// Inactive regions are zeroed once by the host memset and are never read here, so
-// a split launch reduces split_count * active_count * WARP_REGION_CELLS cells
-// instead of split_count whole grids. Each active-region cell of each split slice
-// is fully defined by the spread kernel, which always stores its whole region.
-__global__ void sum_splits(const cuFloatComplex *__restrict__ partial,
-                           int split_count, long long cells,
-                           cuFloatComplex *__restrict__ output,
-                           const int *__restrict__ active_regions,
-                           int active_count, Grid grid, int regions_x,
-                           int regions_y) {
+// Sum the compact per-split partial slices into the output for active warp
+// regions only. One task is one local cell of one active region: the split
+// slices are summed in fixed order, and the local cell is mapped to the global
+// output index once. Inactive regions are zeroed once by the host memset and are
+// never read here. Each active-region cell of each split slice is fully defined
+// by the spread kernel, which always stores its whole region.
+__global__ void reduce_split_slices(const cuFloatComplex *__restrict__ partial,
+                                    int split_count,
+                                    const int *__restrict__ active_regions,
+                                    int active_count, Grid grid,
+                                    cuFloatComplex *__restrict__ output) {
+  const int regions_x = warp_regions_x(grid);
+  const int regions_y = warp_regions_y(grid);
   const long long task_count = (long long)active_count * WARP_REGION_CELLS;
   const float2 *const split_values = reinterpret_cast<const float2 *>(partial);
   for (long long task = (long long)blockIdx.x * blockDim.x + threadIdx.x;
        task < task_count; task += (long long)blockDim.x * gridDim.x) {
     const int region_slot = (int)(task / WARP_REGION_CELLS);
-    const int local_cell = (int)(task - (long long)region_slot * WARP_REGION_CELLS);
+    const int local_cell =
+        (int)(task - (long long)region_slot * WARP_REGION_CELLS);
     const int local_x = local_cell % WARP_REGION_X;
     const int local_y = (local_cell / WARP_REGION_X) % WARP_REGION_Y;
     const int local_z = local_cell / (WARP_REGION_X * WARP_REGION_Y);
-    const WarpRegion region = warp_region_from_id(active_regions[region_slot], grid,
-                                                  regions_x, regions_y);
+    const WarpRegion region = warp_region_from_id(active_regions[region_slot],
+                                                  grid, regions_x, regions_y);
     if (local_x >= region.nx || local_y >= region.ny || local_z >= region.nz)
       continue;
     const int x = region.x + local_x;
     const int y = region.y + local_y;
     const int z = region.z + local_z;
-    const long long index = x + (long long)grid.nx * (y + (long long)grid.ny * z);
-    float2 value = split_values[index];
+    const long long index =
+        x + (long long)grid.nx * (y + (long long)grid.ny * z);
+    float2 value = split_values[(long long)region_slot * WARP_REGION_CELLS +
+                                local_cell];
     for (int split = 1; split < split_count; ++split) {
-      const float2 split_value = split_values[(long long)split * cells + index];
+      const float2 split_value =
+          split_values[((long long)split * active_count + region_slot) *
+                           WARP_REGION_CELLS +
+                       local_cell];
       value.x += split_value.x;
       value.y += split_value.y;
     }
@@ -635,7 +624,13 @@ __device__ __forceinline__ void spread_region(
     }
   }
 
-  store_cell_group(acc, region_output, grid, region, cell_group);
+  // The split path writes a compact warp-region-local slice; the single-split
+  // paths write global output indices directly.
+  if (split_count > 1) {
+    store_cell_group_local(acc, region_output, region, cell_group);
+  } else {
+    store_cell_group(acc, region_output, grid, region, cell_group);
+  }
 }
 
 // Ask ptxas for at most about 102 registers per thread in the default two-warp
@@ -650,7 +645,7 @@ constexpr int MIN_THREADBLOCKS_PER_SM =
 __global__ __launch_bounds__(THREADS_PER_THREADBLOCK, MIN_THREADBLOCKS_PER_SM)
 void spread(const Point *points, const int *bin_offsets, Grid grid,
             cuFloatComplex *output, const int *active_regions, int split_count,
-            int work_count) {
+            int active_count, int work_count) {
   // One single-buffered staging group per warp. Each work item owns one warp
   // region, so the buffer is warp-private and needs only __syncwarp().
   __shared__ __align__(16) StagedSource staging[WARPS_PER_THREADBLOCK]
@@ -675,11 +670,12 @@ void spread(const Point *points, const int *bin_offsets, Grid grid,
   // threadblock-wide barrier.
   if (region.nx <= 0 || region.ny <= 0 || region.nz <= 0) return;
 
-  // A split writes its whole warp region into its own slice of the partial grid;
-  // the single-split paths write the final grid directly.
+  // A split writes its whole warp region into its compact partial slice; the
+  // single-split paths write the final grid directly.
   cuFloatComplex *const region_output =
       (split_count > 1)
-          ? output + (long long)split_index * cell_count(grid)
+          ? output + ((long long)split_index * active_count + region_slot) *
+                         WARP_REGION_CELLS
           : output;
 
   spread_region(points, bin_offsets, grid, region, lane_cell_group(lane),
@@ -689,95 +685,175 @@ void spread(const Point *points, const int *bin_offsets, Grid grid,
 
 }  // namespace
 
+ActiveRegionPlan plan_active_regions(const int *host_bin_offsets, Grid grid) {
+  const int regions_x = warp_regions_x(grid);
+  const int regions_y = warp_regions_y(grid);
+  const int regions_z = warp_regions_z(grid);
+  const int region_count = regions_x * regions_y * regions_z;
+
+  ActiveRegionPlan plan;
+  plan.regions.reserve((size_t)region_count);
+
+  // A region is active when the sum of the source counts of its candidate bins
+  // is nonzero. The candidate-bin set is exactly the one SourceRangeCursor
+  // enumerates, so the test can only over-report: a source in a candidate bin
+  // may still miss the region, but no region that would accumulate a
+  // contribution is ever skipped.
+  for (int region_z = 0; region_z < regions_z; ++region_z) {
+    const int z = region_z * WARP_REGION_Z;
+    const int remaining_z = grid.nz - z;
+    const int nz = remaining_z < WARP_REGION_Z ? remaining_z : WARP_REGION_Z;
+    if (nz <= 0) continue;
+    for (int region_y = 0; region_y < regions_y; ++region_y) {
+      const int y = region_y * WARP_REGION_Y;
+      const int remaining_y = grid.ny - y;
+      const int ny = remaining_y < WARP_REGION_Y ? remaining_y : WARP_REGION_Y;
+      if (ny <= 0) continue;
+      for (int region_x = 0; region_x < regions_x; ++region_x) {
+        const int x = region_x * WARP_REGION_X;
+        const int remaining_x = grid.nx - x;
+        const int nx =
+            remaining_x < WARP_REGION_X ? remaining_x : WARP_REGION_X;
+        if (nx <= 0) continue;
+
+        const detail::CandidateBins x_bins = detail::candidate_bins(
+            x, x + nx, grid.bin_size, grid.nx, grid.bins_x);
+        const detail::CandidateBins y_bins = detail::candidate_bins(
+            y, y + ny, grid.bin_size, grid.ny, grid.bins_y);
+        const detail::CandidateBins z_bins = detail::candidate_bins(
+            z, z + nz, grid.bin_size, grid.nz, grid.bins_z);
+        int source_count = 0;
+        for (int z_index = 0; z_index < z_bins.count; ++z_index)
+          for (int y_index = 0; y_index < y_bins.count; ++y_index)
+            for (int x_index = 0; x_index < x_bins.count; ++x_index) {
+              const int bin =
+                  x_bins[x_index] +
+                  grid.bins_x *
+                      (y_bins[y_index] + grid.bins_y * z_bins[z_index]);
+              source_count +=
+                  host_bin_offsets[bin + 1] - host_bin_offsets[bin];
+            }
+        if (source_count != 0) {
+          const int region_id =
+              region_x + regions_x * (region_y + regions_y * region_z);
+          plan.regions.push_back(region_id);
+        }
+      }
+    }
+  }
+
+  const int active_count = (int)plan.regions.size();
+  if (active_count == 0) {
+    plan.split_count = 1;
+    plan.path = LaunchPath::Empty;
+    return plan;
+  }
+
+  // Split heuristic: aim for about 2048 work items when few regions are active
+  // (clustered and dense inputs), otherwise 512, and never exceed 32. Uniform
+  // and sparse inputs stay at split_count == 1.
+  const long long split_target = active_count < 512 ? 2048 : 512;
+  plan.split_count = 1;
+  while (plan.split_count < 32 &&
+         (long long)active_count * plan.split_count < split_target)
+    plan.split_count <<= 1;
+
+  if (plan.split_count == 1 && active_count == region_count)
+    plan.path = LaunchPath::FullGrid;
+  else if (plan.split_count == 1)
+    plan.path = LaunchPath::ActiveSingleSplit;
+  else
+    plan.path = LaunchPath::ActiveSplit;
+  return plan;
+}
+
 void launch_assign_bins(const Point *points, int count, Grid grid, int *bin_ids) {
   constexpr int THREADS = 256;
   assign_bins<<<(count + THREADS - 1) / THREADS, THREADS>>>(points, count, grid, bin_ids);
 }
 
-void launch_spread(const Point *points, const int *bin_offsets, Grid grid,
+void launch_spread(const Point *points, const int *device_bin_offsets,
+                   const int *host_bin_offsets, Grid grid,
                    cuFloatComplex *output) {
-  const int regions_x = warp_regions_x(grid);
-  const int regions_y = warp_regions_y(grid);
   const int region_count = warp_region_count(grid);
   const long long cells = cell_count(grid);
   const size_t output_bytes = (size_t)cells * sizeof(cuFloatComplex);
 
-  // Temporaries are allocated per launch with cudaMalloc/cudaFree; there is no
-  // persistent workspace yet. The benchmark's spread interval therefore includes
-  // the two metadata kernels, the blocking host copy of active_count, the output
-  // memset, the partial-grid allocation, and the split reduction. Those costs are
-  // reported rather than hidden.
-  int *active_flags = nullptr;
-  int *active_regions = nullptr;
-  int *active_count = nullptr;
-  check_cuda(cudaMalloc(&active_flags, (size_t)region_count * sizeof(int)),
-             "cudaMalloc(active_flags)");
-  check_cuda(cudaMalloc(&active_regions, (size_t)region_count * sizeof(int)),
-             "cudaMalloc(active_regions)");
-  check_cuda(cudaMalloc(&active_count, sizeof(int)), "cudaMalloc(active_count)");
+  // The active-region plan is recomputed here so the caller's spread interval
+  // includes the host scan, the active-list upload, the kernel, the output memset,
+  // and the split reduction. Temporaries are allocated per launch with
+  // cudaMalloc/cudaFree; there is no persistent workspace yet.
+  const ActiveRegionPlan plan = plan_active_regions(host_bin_offsets, grid);
+  const int active_count = (int)plan.regions.size();
+  const int split_count = plan.split_count;
 
-  constexpr int METADATA_THREADS = 256;
-  detect_active_regions<<<(region_count + METADATA_THREADS - 1) / METADATA_THREADS,
-                          METADATA_THREADS>>>(bin_offsets, grid, regions_x,
-                                              regions_y, region_count, active_flags);
-  compact_active_regions<<<1, 1>>>(active_flags, region_count, active_regions,
-                                   active_count);
-  int host_active_count = 0;
-  check_cuda(cudaMemcpy(&host_active_count, active_count, sizeof(int),
-                        cudaMemcpyDeviceToHost),
-             "cudaMemcpy(active_count)");
-
-  // Split heuristic: aim for about 2048 work items when few regions are active
-  // (clustered and dense inputs), otherwise 512, and never exceed 32. Uniform
-  // and sparse inputs stay at split_count == 1.
-  const int split_target = host_active_count < 512 ? 2048 : 512;
-  int split_count = 1;
-  while (split_count < 32 && host_active_count * split_count < split_target)
-    split_count <<= 1;
-
+  constexpr int REDUCE_THREADS = 256;
   const dim3 threads(THREADS_PER_THREADBLOCK);
-  cuFloatComplex *partial = nullptr;
 
-  if (host_active_count == 0) {
+  if (active_count == 0) {
     // No warp region has a source: every cell is a zero.
-    check_cuda(cudaMemsetAsync(output, 0, output_bytes), "cudaMemsetAsync(output)");
-  } else if (split_count > 1) {
-    // Split path: each work item writes its whole warp region into its own split
-    // slice, so every active-region cell of every slice is defined.
-    const int work_count = host_active_count * split_count;
-    check_cuda(cudaMalloc(&partial, (size_t)split_count * output_bytes),
-               "cudaMalloc(partial)");
-    spread<<<(work_count + WARPS_PER_THREADBLOCK - 1) / WARPS_PER_THREADBLOCK,
-             threads>>>(points, bin_offsets, grid, partial, active_regions,
-                        split_count, work_count);
-    // Zero the inactive regions once; the reduction writes only active cells.
-    check_cuda(cudaMemsetAsync(output, 0, output_bytes), "cudaMemsetAsync(output)");
-    const long long reduce_tasks = (long long)host_active_count * WARP_REGION_CELLS;
-    const long long reduce_blocks =
-        (reduce_tasks + METADATA_THREADS - 1) / METADATA_THREADS;
-    sum_splits<<<(unsigned int)reduce_blocks, METADATA_THREADS>>>(
-        partial, split_count, cells, output, active_regions, host_active_count,
-        grid, regions_x, regions_y);
-    check_cuda(cudaFree(partial), "cudaFree(partial)");
-  } else if (host_active_count == region_count) {
-    // Full-grid fast path: every region is active, so the active list is only an
-    // identity map. Skip it and write the output directly with no memset.
-    spread<<<(region_count + WARPS_PER_THREADBLOCK - 1) / WARPS_PER_THREADBLOCK,
-             threads>>>(points, bin_offsets, grid, output, nullptr, 1,
-                        region_count);
-  } else {
-    // Active-list single-split path: skip empty regions, but zero the output first
-    // because those regions are never written.
-    check_cuda(cudaMemsetAsync(output, 0, output_bytes), "cudaMemsetAsync(output)");
-    spread<<<(host_active_count + WARPS_PER_THREADBLOCK - 1) /
-                 WARPS_PER_THREADBLOCK,
-             threads>>>(points, bin_offsets, grid, output, active_regions, 1,
-                        host_active_count);
+    check_cuda(cudaMemsetAsync(output, 0, output_bytes),
+               "cudaMemsetAsync(output)");
+    return;
   }
 
-  check_cuda(cudaFree(active_flags), "cudaFree(active_flags)");
-  check_cuda(cudaFree(active_regions), "cudaFree(active_regions)");
-  check_cuda(cudaFree(active_count), "cudaFree(active_count)");
+  int *active_regions = nullptr;
+  cuFloatComplex *partial = nullptr;
+
+  if (plan.path != LaunchPath::FullGrid) {
+    check_cuda(cudaMalloc(&active_regions, (size_t)active_count * sizeof(int)),
+               "cudaMalloc(active_regions)");
+    check_cuda(cudaMemcpy(active_regions, plan.regions.data(),
+                          (size_t)active_count * sizeof(int),
+                          cudaMemcpyHostToDevice),
+               "cudaMemcpy(active_regions)");
+  }
+
+  if (plan.path == LaunchPath::ActiveSplit) {
+    check_cuda(cudaMalloc(&partial, (size_t)split_count * (size_t)active_count *
+                                        WARP_REGION_CELLS *
+                                        sizeof(cuFloatComplex)),
+               "cudaMalloc(partial)");
+  }
+
+  if (plan.path == LaunchPath::FullGrid) {
+    // Full-grid fast path: every region is active and there is one split, so the
+    // active list is only an identity map. Write the output directly, no memset.
+    spread<<<(region_count + WARPS_PER_THREADBLOCK - 1) /
+                 WARPS_PER_THREADBLOCK,
+             threads>>>(points, device_bin_offsets, grid, output, nullptr, 1,
+                        active_count, region_count);
+  } else if (plan.path == LaunchPath::ActiveSingleSplit) {
+    // Active-list single-split path: skip empty regions, but zero the output first
+    // because those regions are never written.
+    check_cuda(cudaMemsetAsync(output, 0, output_bytes),
+               "cudaMemsetAsync(output)");
+    spread<<<(active_count + WARPS_PER_THREADBLOCK - 1) /
+                 WARPS_PER_THREADBLOCK,
+             threads>>>(points, device_bin_offsets, grid, output, active_regions,
+                        1, active_count, active_count);
+  } else {
+    // Split path: each work item writes its whole warp region into its compact
+    // partial slice, so every active-region cell of every slice is defined.
+    const int work_count = active_count * split_count;
+    spread<<<(work_count + WARPS_PER_THREADBLOCK - 1) /
+                 WARPS_PER_THREADBLOCK,
+             threads>>>(points, device_bin_offsets, grid, partial,
+                        active_regions, split_count, active_count, work_count);
+    // Zero the inactive regions once; the reduction writes only active cells.
+    check_cuda(cudaMemsetAsync(output, 0, output_bytes),
+               "cudaMemsetAsync(output)");
+    const long long reduce_tasks =
+        (long long)active_count * WARP_REGION_CELLS;
+    const long long reduce_blocks =
+        (reduce_tasks + REDUCE_THREADS - 1) / REDUCE_THREADS;
+    reduce_split_slices<<<(unsigned int)reduce_blocks, REDUCE_THREADS>>>(
+        partial, split_count, active_regions, active_count, grid, output);
+    check_cuda(cudaFree(partial), "cudaFree(partial)");
+  }
+
+  if (active_regions != nullptr)
+    check_cuda(cudaFree(active_regions), "cudaFree(active_regions)");
 }
 
 }  // namespace atomic_free_spread
