@@ -1742,6 +1742,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"-isystem={cuda_home / 'include'}",
             f"-isystem={poet_include}",
             "devel/morton_spread/atomic_free_spread.cu",
+            "devel/morton_spread/f0_point_owned_spread.cu",
             "devel/morton_spread/atomic_free_spread_bench.cu",
             "-o",
             str(binary),

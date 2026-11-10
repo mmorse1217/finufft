@@ -10,12 +10,14 @@
 // Build and run with ./devel/morton_spread/run_atomic_free_spread.sh.
 //
 // Usage: atomic_free_spread_bench
-//            [M [N1 [N2 [N3 [cluster [bin_size [pattern [seed [nrun]]]]]]]]]
+//            [M [N1 [N2 [N3 [cluster [bin_size [pattern [seed [nrun
+//            [kernel]]]]]]]]]]
 // cluster: 0 = uniform points, 1 = eight tight clusters.
 // pattern: 0 = uniform/cluster (default), 1 = seam and out-of-domain points,
 //          2 = exact grid nodes and near-node offsets, 3 = one dense cluster.
 //          Patterns 1-3 ignore cluster and use seed for reproducible selection.
 // nrun: timed spread runs after two warm-ups (default 5; median reported).
+// kernel: 0 = atomic-free baseline (default), 1 = F0 point-owned spread.
 
 #include "atomic_free_spread.cuh"
 
@@ -250,6 +252,16 @@ bool is_unwritten_sentinel(const cuFloatComplex &value) {
 
 const char *pass_fail(bool pass) { return pass ? "PASS" : "FAIL"; }
 
+void launch_selected_spread(int kernel, const Point *points,
+                            const int *bin_offsets, Grid grid,
+                            cuFloatComplex *output) {
+  if (kernel == 1) {
+    atomic_free_spread::launch_spread_f0(points, bin_offsets, grid, output);
+  } else {
+    atomic_free_spread::launch_spread(points, bin_offsets, grid, output);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -262,15 +274,17 @@ int main(int argc, char **argv) {
   int pattern = argc > 7 ? std::atoi(argv[7]) : 0;
   int seed = argc > 8 ? std::atoi(argv[8]) : 42;
   int nrun = argc > 9 ? std::atoi(argv[9]) : 5;
-  if (argc > 10 || count <= 0 || nx < atomic_free_spread::WIDTH ||
+  int kernel = argc > 10 ? std::atoi(argv[10]) : 0;
+  if (argc > 11 || count <= 0 || nx < atomic_free_spread::WIDTH ||
       ny < atomic_free_spread::WIDTH || nz < atomic_free_spread::WIDTH ||
       (cluster != 0 && cluster != 1) || bin_size <= 0 ||
-      (pattern < 0 || pattern > 3) || nrun <= 0) {
+      (pattern < 0 || pattern > 3) || nrun <= 0 ||
+      (kernel != 0 && kernel != 1)) {
     std::fprintf(stderr,
                  "Usage: %s [M [N1 [N2 [N3 [cluster [bin_size [pattern [seed "
-                 "[nrun]]]]]]]]]\n"
+                 "[nrun [kernel]]]]]]]]]]\n"
                  "M, bin_size, and nrun must be positive; grid dimensions >= %d; "
-                 "cluster is 0 or 1; pattern is 0..3.\n",
+                 "cluster is 0 or 1; pattern is 0..3; kernel is 0 or 1.\n",
                  argv[0], atomic_free_spread::WIDTH);
     return 1;
   }
@@ -284,9 +298,9 @@ int main(int argc, char **argv) {
   }
 
   std::printf("case   M=%d grid=%dx%dx%d cluster=%d bin_size=%d pattern=%d seed=%d "
-              "nrun=%d bins=%lld cells=%lld\n",
-              count, nx, ny, nz, cluster, bin_size, pattern, seed, nrun, num_bins,
-              num_cells);
+              "nrun=%d kernel=%d bins=%lld cells=%lld\n",
+              count, nx, ny, nz, cluster, bin_size, pattern, seed, nrun, kernel,
+              num_bins, num_cells);
 
   const auto generate_start = Clock::now();
   HostPoints host = generate_points(count, nx, ny, nz, cluster, pattern, seed);
@@ -368,8 +382,8 @@ int main(int argc, char **argv) {
   CudaTimer spread_timer;
   for (int run = -2; run < nrun; ++run) {
     spread_timer.begin();
-    atomic_free_spread::launch_spread(device_points.get(), device_offsets.get(), grid,
-                                      device_output.get());
+    launch_selected_spread(kernel, device_points.get(), device_offsets.get(), grid,
+                           device_output.get());
     CUDA_CHECK(cudaGetLastError());
     const double milliseconds = spread_timer.end();
     if (run >= 0) spread_ms.push_back(milliseconds);
@@ -392,8 +406,8 @@ int main(int argc, char **argv) {
   // Correctness run: poison the output first so an unwritten cell is visible.
   CUDA_CHECK(cudaMemset(device_output.get(), 0xFF,
                         (size_t)num_cells * sizeof(cuFloatComplex)));
-  atomic_free_spread::launch_spread(device_points.get(), device_offsets.get(), grid,
-                                    device_output.get());
+  launch_selected_spread(kernel, device_points.get(), device_offsets.get(), grid,
+                         device_output.get());
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
   std::vector<cuFloatComplex> result((size_t)num_cells);

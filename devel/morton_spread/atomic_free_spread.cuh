@@ -1,8 +1,9 @@
-// Interface for the readable, atomic-free 3D type-1 spreading baseline.
+// Interface for the readable, atomic-free 3D type-1 spreading baseline and the
+// F0 point-owned spread prototype.
 //
-// The implementation lives in atomic_free_spread.cu; the command line,
-// timing, reference comparison, and correctness checks live in
-// atomic_free_spread_bench.cu.
+// The baseline implementation lives in atomic_free_spread.cu, the F0 prototype
+// in f0_point_owned_spread.cu, and the command line, timing, reference
+// comparison, and correctness checks in atomic_free_spread_bench.cu.
 
 #ifndef ATOMIC_FREE_SPREAD_CUH
 #define ATOMIC_FREE_SPREAD_CUH
@@ -68,6 +69,56 @@ inline long long cell_count(const Grid &grid) {
   return (long long)grid.nx * grid.ny * grid.nz;
 }
 
+namespace detail {
+
+// Truncating division plus a mask correction: floor(a/b) for positive b.
+__device__ __forceinline__ int floor_div(int a, int b) {
+  const int quotient = a / b;
+  const int remainder = a - quotient * b;
+  return quotient - ((remainder >> 31) & 1);
+}
+
+// The candidate bins for one dimension, in periodic (unwrapped) order. All
+// bins are returned exactly once; when the expanded tile covers the whole grid
+// the range is capped to [0, bins) so a wrapped bin is not visited twice.
+struct NearBins {
+  int first;
+  int count;
+  int bins;
+
+  __device__ __forceinline__ int operator[](int i) const {
+    int bin = first + i;
+    if (bin < 0) bin += bins;
+    else if (bin >= bins) bin -= bins;
+    return bin;
+  }
+};
+
+// Return the bins intersecting [tile_begin - HALO, tile_end + HALO). The last
+// bin of each period may be shorter than bin_size, so map an extended
+// coordinate to its bin copy first, then let operator[] fold the copy index
+// back into [0, bins). This replaces the per-bin bin_near_tile test.
+__device__ __forceinline__ int extended_bin_index(int coordinate, int bin_size,
+                                                  int grid_size, int bins) {
+  const int period = floor_div(coordinate, grid_size);
+  const int local_coordinate = coordinate - period * grid_size;  // [0, grid_size)
+  const int local_bin = min(local_coordinate / bin_size, bins - 1);
+  return period * bins + local_bin;
+}
+
+__device__ __forceinline__ NearBins near_bins(int tile_begin, int tile_end,
+                                              int bin_size, int grid_size, int bins) {
+  const int query_begin = tile_begin - HALO;
+  const int query_end = tile_end + HALO;  // exclusive
+  const int first = extended_bin_index(query_begin, bin_size, grid_size, bins);
+  const int last = extended_bin_index(query_end - 1, bin_size, grid_size, bins);
+  int count = last - first + 1;
+  if (count >= bins) return NearBins{0, bins, bins};
+  return NearBins{first, count, bins};
+}
+
+}  // namespace detail
+
 // Assign each point to a flattened Cartesian bin (x varies fastest). The
 // kernel folds coordinates with cuFINUFFT's fold_rescale, so bin assignment
 // uses the exact same floating-point fold as the spread kernel. The caller
@@ -79,6 +130,14 @@ void launch_assign_bins(const Point *points, int count, Grid grid, int *bin_ids)
 // cudaGetLastError() after this launch.
 void launch_spread(const Point *points, const int *bin_offsets, Grid grid,
                    cuFloatComplex *output);
+
+// Launch the F0 point-owned spread. Each block owns one exact output tile and
+// scatters per-point support into shared tiles with shared-memory atomics; the
+// summation order within a tile is nondeterministic. Each in-grid tile cell is
+// written exactly once after a block barrier. The caller must check
+// cudaGetLastError() after this launch.
+void launch_spread_f0(const Point *points, const int *bin_offsets, Grid grid,
+                      cuFloatComplex *output);
 
 }  // namespace atomic_free_spread
 

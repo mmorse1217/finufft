@@ -36,52 +36,6 @@ __global__ void assign_bins(const Point *points, int count, Grid grid, int *bin_
   bin_ids[i] = bx + grid.bins_x * (by + grid.bins_y * bz);
 }
 
-// Truncating division plus a mask correction: floor(a/b) for positive b.
-__device__ __forceinline__ int floor_div(int a, int b) {
-  const int quotient = a / b;
-  const int remainder = a - quotient * b;
-  return quotient - ((remainder >> 31) & 1);
-}
-
-// The candidate bins for one dimension, in periodic (unwrapped) order. All
-// bins are returned exactly once; when the expanded tile covers the whole grid
-// the range is capped to [0, bins) so a wrapped bin is not visited twice.
-struct NearBins {
-  int first;
-  int count;
-  int bins;
-
-  __device__ __forceinline__ int operator[](int i) const {
-    int bin = first + i;
-    if (bin < 0) bin += bins;
-    else if (bin >= bins) bin -= bins;
-    return bin;
-  }
-};
-
-// Return the bins intersecting [tile_begin - HALO, tile_end + HALO). The last
-// bin of each period may be shorter than bin_size, so map an extended
-// coordinate to its bin copy first, then let operator[] fold the copy index
-// back into [0, bins). This replaces the per-bin bin_near_tile test.
-__device__ __forceinline__ int extended_bin_index(int coordinate, int bin_size,
-                                                  int grid_size, int bins) {
-  const int period = floor_div(coordinate, grid_size);
-  const int local_coordinate = coordinate - period * grid_size;  // [0, grid_size)
-  const int local_bin = min(local_coordinate / bin_size, bins - 1);
-  return period * bins + local_bin;
-}
-
-__device__ __forceinline__ NearBins near_bins(int tile_begin, int tile_end,
-                                              int bin_size, int grid_size, int bins) {
-  const int query_begin = tile_begin - HALO;
-  const int query_end = tile_end + HALO;  // exclusive
-  const int first = extended_bin_index(query_begin, bin_size, grid_size, bins);
-  const int last = extended_bin_index(query_end - 1, bin_size, grid_size, bins);
-  int count = last - first + 1;
-  if (count >= bins) return NearBins{0, bins, bins};
-  return NearBins{first, count, bins};
-}
-
 // Return the support coefficient for this cell, or -1 if the point does not
 // cover it. Grid sizes are at least WIDTH, so at most one coefficient matches.
 //
@@ -200,14 +154,14 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
   int y0 = threadIdx.y * GROUP_Y;
   int z0 = threadIdx.z * GROUP_Z;
 
-  __shared__ NearBins x_bins, y_bins, z_bins;
+  __shared__ detail::NearBins x_bins, y_bins, z_bins;
   if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
     const int end_x = min(tile_x + TILE_X, grid.nx);
     const int end_y = min(tile_y + TILE_Y, grid.ny);
     const int end_z = min(tile_z + TILE_Z, grid.nz);
-    x_bins = near_bins(tile_x, end_x, grid.bin_size, grid.nx, grid.bins_x);
-    y_bins = near_bins(tile_y, end_y, grid.bin_size, grid.ny, grid.bins_y);
-    z_bins = near_bins(tile_z, end_z, grid.bin_size, grid.nz, grid.bins_z);
+    x_bins = detail::near_bins(tile_x, end_x, grid.bin_size, grid.nx, grid.bins_x);
+    y_bins = detail::near_bins(tile_y, end_y, grid.bin_size, grid.ny, grid.bins_y);
+    z_bins = detail::near_bins(tile_z, end_z, grid.bin_size, grid.nz, grid.bins_z);
   }
 
   // Staged weights for one batch: kx[j][local] and ky[j][local] are the weights
