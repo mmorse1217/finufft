@@ -124,19 +124,30 @@ Measured on the T1000 in this worktree (median of 5, `nrun=5`):
 
 | case | before (`17c05838`) | after | speedup | vs method-3 execute |
 |---|---:|---:|---:|---:|
-| uniform 1e6, 64^3 | 185.9 ms | **43.8 ms** | 4.2x | 2.30x slower |
-| clustered 1e6, 64^3 | 426.9 ms | **46.1 ms** | 9.3x | 2.41x slower |
-| sparse 1e5, 128^3 | 19.3 ms | **12.88 ms** | 1.5x | 3.08x slower |
-| dense cluster 1e5, 64^3 | 111 ms | **11.0 ms** | 10.1x | 3.69x slower |
+| uniform 1e6, 64^3 | 185.9 ms | **34.0 ms** | 5.5x | 1.79x slower |
+| clustered 1e6, 64^3 | 426.9 ms | **36.3 ms** | 11.8x | 1.90x slower |
+| sparse 1e5, 128^3 | 19.3 ms | **12.7 ms** | 1.5x | 3.04x slower |
+| dense cluster 1e5, 64^3 | 111 ms | **9.3 ms** | 11.9x | 3.16x slower |
+
+The staged z row is pre-scaled by the point strength, so a cell reads two weights and one
+`float2` (`kx[x]`, `ky[y]`, `kz*strength[z]`) and does one multiply and two fused
+multiply-adds. That cut the cell loop from four shared loads to three and bought 43.8 ->
+34.0 ms uniform, 46.1 -> 36.3 clustered, 11.0 -> 9.3 dense.
 
 The full Nsight Compute capture for the four canonical shapes is
-`build/gpu/traces/af_profile_20261110_041508/` (`summary.md` plus the CSVs). It shows the
-kernel is no longer instruction- or FMA-bound: instructions fell from 16.4B to 1.15B on
-uniform while IPC fell from 3.35 to 1.40. The binding resources are now shared-memory issue
-and latency (LSUIN requests 85%, MIO-throttle 56% of warp-state cycles, LDS 55% of samples on
-`kx[j][threadIdx.x] * ky[j][threadIdx.y] * kz[j][threadIdx.z]`), plus `__syncthreads()`:
-20% of warp state on uniform and 47% on sparse, where a 3-point bin forces a batch smaller
-than `STAGE_POINTS`.
+`build/gpu/traces/af_profile_20261110_043510/` (`summary.md` plus the CSVs). The kernel is no
+longer instruction- or FMA-bound: instructions fell from 16.4B to 0.99B on uniform while IPC
+fell from 3.35 to 1.55. It is now bound by the shared-memory **request** rate: LSUIN requests
+are at 94% of peak on uniform with the data pipe only 48% busy, so three loads per cell-visit
+(96M warp-visits, ~290M warp loads) set a floor of ~30 ms and the kernel runs at 33.7 ms.
+`__syncthreads()` is the next term: 18% of warp state on uniform, 46% on sparse, where a
+3-point bin forces a batch smaller than `STAGE_POINTS`.
+
+Loop-level ILP does not help at this point: processing two points per iteration with a second
+accumulator pair left IPC at 1.55 and LSUIN at 93%, so it was reverted. The remaining lever is
+fewer shared loads per cell, which needs several cells per thread (the `exp_a_cartesian.cu`
+scan reads ~0.5 weights per cell from a 16-cell lane group and runs the same workload in
+12.6 ms).
 
 The staged rows are padded to an odd number of floats (`TILE_X + 1`, `TILE_Y + 1`,
 `TILE_Z + 1`). Without the padding the staging lanes write the same `local` of 32 different

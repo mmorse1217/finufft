@@ -100,30 +100,46 @@ __device__ __forceinline__ int coefficient_index(int cell, int support_start,
   return offset < WIDTH ? offset : -1;
 }
 
-// Fill dest[0..COUNT) with this point's kernel weights for the cells
-// tile_begin + local, and with 0 where the point does not cover the cell.
+// Weight of this point for cell `cell`, or 0 when the point does not cover it.
 // coefficient_index() returns the position within the point's WIDTH kernel
 // values, or -1 when the point's support does not reach that cell.
+__device__ __forceinline__ float cell_weight(int cell, int start, int grid_size,
+                                             const float *ker) {
+  const int weight_index = coefficient_index(cell, start, grid_size);
+  const bool covered = cell < grid_size && weight_index >= 0;
+  return covered ? ker[weight_index] : 0.0f;
+}
+
+// Fill dest[0..COUNT) with the weights of the cells tile_begin + local.
 template<int COUNT>
 __device__ __forceinline__ void stage_tile_weights(float *dest, int tile_begin,
                                                    int start, int grid_size,
                                                    const float *ker) {
+  for (int local = 0; local < COUNT; ++local)
+    dest[local] = cell_weight(tile_begin + local, start, grid_size, ker);
+}
+
+// Same, pre-scaled by the point strength, for the dimension the cell loop reads
+// as one float2 instead of loading the strength separately.
+template<int COUNT>
+__device__ __forceinline__ void stage_tile_weights(float2 *dest, int tile_begin,
+                                                   int start, int grid_size,
+                                                   const float *ker, float2 strength) {
   for (int local = 0; local < COUNT; ++local) {
-    const int cell = tile_begin + local;
-    const int weight_index = coefficient_index(cell, start, grid_size);
-    const bool covered = cell < grid_size && weight_index >= 0;
-    dest[local] = covered ? ker[weight_index] : 0.0f;
+    const float weight = cell_weight(tile_begin + local, start, grid_size, ker);
+    dest[local] = make_float2(weight * strength.x, weight * strength.y);
   }
 }
 
 // One block owns one tile; one thread owns one cell. The block stages the kernel
 // weights of a batch of candidate points into shared memory, indexed by cell
-// position inside the tile, and each cell then reads the three weights it needs.
+// position inside the tile, and each cell then reads the three values it needs:
+// the x and y weights and the z weight already scaled by the point strength.
 //
 // The staged vectors are tile-local and zero-filled, so the cell loop has no
 // support test, no branch, and no coefficient selection. A zero weight adds an
-// exact zero, so results match the per-cell form; a non-finite point strength
-// would now reach cells the point does not cover.
+// exact zero, so uncovered cells keep their accumulator; a non-finite point
+// strength would now reach cells the point does not cover.
 __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
                        cuFloatComplex *output) {
   using cufinufft::spreadinterp::eval_kernel_vec_horner;
@@ -148,14 +164,14 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
     z_bins = near_bins(tile_z, end_z, grid.bin_size, grid.nz, grid.bins_z);
   }
 
-  // Staged weights for one batch: kx[j][local] is the weight of staged point j
-  // for cell tile_x + local, and likewise for y and z. Rows are padded to an odd
-  // number of floats so that the staging lanes, which write one `local` of many
-  // consecutive points at once, hit distinct shared-memory banks.
+  // Staged weights for one batch: kx[j][local] and ky[j][local] are the weights
+  // of staged point j for cell tile_x + local (likewise y), and kz[j][local] is
+  // the z weight already multiplied by the point strength. Rows are padded to an
+  // odd number of floats so that the staging lanes, which write one `local` of
+  // many consecutive points at once, hit distinct shared-memory banks.
   __shared__ float kx[STAGE_POINTS][TILE_X + 1];
   __shared__ float ky[STAGE_POINTS][TILE_Y + 1];
-  __shared__ float kz[STAGE_POINTS][TILE_Z + 1];
-  __shared__ float2 strength[STAGE_POINTS];
+  __shared__ float2 kz[STAGE_POINTS][TILE_Z + 1];
   __syncthreads();
 
   const int linear_tid = threadIdx.x + TILE_X * (threadIdx.y + TILE_Y * threadIdx.z);
@@ -198,20 +214,19 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
             eval_kernel_vec_horner<float, WIDTH>(ker, float(start) - rescaled, 2.0);
             if (stage_dim == 0) {
               stage_tile_weights<TILE_X>(kx[stage_point], tile_x, start, grid.nx, ker);
-              strength[stage_point] = make_float2(p.strength.x, p.strength.y);
             } else if (stage_dim == 1) {
               stage_tile_weights<TILE_Y>(ky[stage_point], tile_y, start, grid.ny, ker);
             } else {
-              stage_tile_weights<TILE_Z>(kz[stage_point], tile_z, start, grid.nz, ker);
+              stage_tile_weights<TILE_Z>(kz[stage_point], tile_z, start, grid.nz, ker,
+                                         make_float2(p.strength.x, p.strength.y));
             }
           }
           __syncthreads();
           for (int j = 0; j < staged; ++j) {
-            const float weight =
-                kx[j][threadIdx.x] * ky[j][threadIdx.y] * kz[j][threadIdx.z];
-            const float2 s = strength[j];
-            real += s.x * weight;
-            imag += s.y * weight;
+            const float weight = kx[j][threadIdx.x] * ky[j][threadIdx.y];
+            const float2 z = kz[j][threadIdx.z];
+            real += z.x * weight;
+            imag += z.y * weight;
           }
           __syncthreads();
         }
