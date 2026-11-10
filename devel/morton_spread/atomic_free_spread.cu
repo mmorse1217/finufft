@@ -83,12 +83,25 @@ __device__ __forceinline__ NearBins near_bins(int tile_begin, int tile_end,
 
 // Return the support coefficient for this cell, or -1 if the point does not
 // cover it. Grid sizes are at least WIDTH, so at most one coefficient matches.
-// The modulo reduces by any number of grid periods. This is why this baseline
-// does not need the multi-period correction that place_support() in the
-// optimized kernel requires for lane groups near the far edge of the grid.
-__device__ int coefficient_index(int cell, int support_start, int grid_size) {
-  int offset = (cell - support_start) % grid_size;
-  if (offset < 0) offset += grid_size;
+//
+// The two conditional corrections handle the common case where the difference
+// is at most one grid period away. The loops preserve the multi-period behavior
+// of the old `% grid_size` reduction, matching the place_support() correction
+// in the optimized kernel for seam inputs. This baseline therefore never
+// divides, even when a point sits exactly on the periodic boundary.
+//
+// `#pragma unroll 1` keeps NVVM from recognizing the constant-stride loops and
+// synthesizing a division to compute their trip count. Without it, the compiler
+// reintroduces the divide that this function is meant to remove.
+__device__ __forceinline__ int coefficient_index(int cell, int support_start,
+                                                 int grid_size) {
+  int offset = cell - support_start;
+  offset += (offset < 0) ? grid_size : 0;
+  offset -= (offset >= grid_size) ? grid_size : 0;
+#pragma unroll 1
+  while (offset < 0) offset += grid_size;
+#pragma unroll 1
+  while (offset >= grid_size) offset -= grid_size;
   return offset < WIDTH ? offset : -1;
 }
 

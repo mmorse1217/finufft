@@ -157,6 +157,41 @@ uniform (+6.4%), 12.69 -> 12.77 ms clustered (+0.6%), and 1.575 -> 1.644 ms spar
 variant measured ~2-3% instead, but this source keeps the same reduction as the library so
 the two implementations match.
 
+## Profiling the atomic-free baseline
+
+`profile_atomic_free_spread.py` rebuilds the line-info binary, runs the benchmark,
+captures Nsight Compute reports for four canonical shapes (`uniform`, `clustered`,
+`sparse`, `dense`), exports raw/detail/source views, and writes a digest plus CSVs:
+
+```bash
+./devel/morton_spread/profile_atomic_free_spread.py
+# re-analyze an existing capture without touching the GPU:
+./devel/morton_spread/profile_atomic_free_spread.py --analyze-only build/gpu/traces/af_profile_<stamp>
+# choose cases or skip stages:
+./devel/morton_spread/profile_atomic_free_spread.py --cases uniform,clustered --skip-build
+```
+
+The default output is `build/gpu/traces/af_profile_<timestamp>/`. Start with
+`summary.md`; `summary.json` and `summary_metrics.csv` are the machine-readable
+counterparts. `reports/<case>.ncu-rep` is the original report, `ncu/<case>.raw.csv`
+contains every raw metric, and `analysis/<case>/` holds the derived tables:
+
+- `source_hotspots.csv` — every source line by instructions and PC samples, with its
+  source-file/line, SASS-PC count, and top stall reason;
+- `source_stalls.csv` — source line x stall reason;
+- `source_groups.csv` — heuristic grouping into support-index/modulo, Horner/FMA,
+  weight/select/accumulate, fold, ceil, bin iteration, point load, and branch;
+- `sass_opcodes.csv` / `sass_opcode_families.csv` — exact and family-level SASS mix;
+- `stalls.csv` — warp-state cycles per issued instruction and shares;
+- `metrics_details.csv` — every detail-section metric in long form.
+
+The profiler targets exactly `spread` from `atomic_free_spread.cu`; it deliberately
+does not match the reference library's `spread_output_driven`. NCU uses unlocked
+clocks and kernel replay, so its duration is not a benchmark median. Source
+instructions/samples are deduplicated by `(kernel, SASS PC)`, keeping the first
+source correlation, because Nsight repeats PCs under inline definitions and call
+sites. The semantic groups are a source-text heuristic, not compiler metadata.
+
 ## Source naming
 
 The current v11ab source uses descriptive identifiers. Historical notes and older
