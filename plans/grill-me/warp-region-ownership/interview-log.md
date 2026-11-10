@@ -236,6 +236,117 @@
 - **New question:** Strictly behavior-preserving first, or include the compact
   partial-grid change in the same series?
 
+### Turn 11 — the copied exp_a design is rejected as the starting point
+
+- **State:** Needs confirmation (concise redesign scope and tolerance)
+- **User critique:** The code looks copied from `exp_a_cartesian.cu` to recover
+  performance without thinking about design or modularity; function names and loop
+  patterns are similar; a more concise design should exist.
+- **Acknowledgment:** Correct. The current kernel is a direct port of exp_a's
+  9-lane staging, 30-float padded record, window placement, fast-path vote,
+  degenerate fallback, and active-tile machinery. Those were exp_a's solutions to
+  its own constraints, not requirements of our one-warp-per-region design.
+- **Proposal:** A concise redesign:
+  - stage the six kernel values from `eval_kernel_vec_horner`, not a 9x6 table and
+    a 30-float padded record;
+  - one lane per source, 32 sources per staging group, all lanes active;
+  - scan with a per-cell `tap_value`, removing `place_support`, window reads,
+    padding, the fast-path vote, and the degenerate fallback;
+  - move the active-region plan to the host, where the bin offsets already exist,
+    removing the detection/compaction kernels and blocking host copy;
+  - compact partial grids `[split][active_slot][local_cell]`.
+- **Classification:** Decision (prototype the concise redesign first), Open
+  (performance tolerance).
+- **New question:** Confirm the prototype scope and tolerance: staging+scan first,
+  then host plan/compact partials; no worse than 5% on uniform/clustered/sparse
+  and dense at most 2.0 ms.
+
+### Turn 12 — host active planning and the method-3 comparison
+
+- **State:** Needs confirmation (measurement contract and prototype scope)
+- **User question:** Why plan active regions on the host? Is that a dishonest
+  comparison with method 3?
+- **Answer:** The motivation is the host already has the bin offsets after the CPU
+  sort; it is not to move work outside the measured region. But the concern is
+  valid: excluding the plan from `spread` while comparing to method 3 `execute`
+  would be misleading. The plan will be computed on the host **inside**
+  `launch_spread`, so the `spread` interval includes the plan, upload, kernel,
+  memset, and reduction. The bench will print a plan/kernel/reduce breakdown and
+  the end-to-end `prep + spread` total; the kernel-only NCU number is labelled as
+  microarchitecture, not the headline comparison.
+- **Classification:** Decision (measurement contract), Open (whether the host plan
+  is faster than the current GPU detection/compaction).
+- **New question:** Confirm the measurement contract and the prototype scope.
+
+### Turn 13 — three implementation steps, then a full reprofile
+
+- **State:** Ready for execution
+- **User instruction:** Implement each concise-redesign step in its own worker
+  subagent, then reprofile and present the full profile results for review.
+- **Plan:** 5a kernel-value staging + tap scan (worker 1); 5b host active plan
+  measured inside `launch_spread` (worker 2); 5c compact partial grids (worker
+  3). Validate and bench after each; full profile after 5c.
+- **Classification:** Decision.
+- **Next action:** Delegate 5a to worker 1.
+
+### Turn 14 — step 5a tap scan rejected
+
+- **State:** Needs confirmation (5a' revision)
+- **Step 5a result:** Correct (9/9, 25/25) but outside tolerance. Uniform
+  16.70 → 19.47 ms (+16.6%), clustered 16.43 → 17.72 ms (+7.8%), sparse
+  2.24 → 3.13 ms (+39.7%), dense 1.94 → 2.31 ms (+19.1%).
+- **Profile:** `build/gpu/traces/af_profile_20261110_185628/`. Uniform warp
+  instructions 754.6M → 1,130.7M. Support-index group 45.35%; top lines are the
+  tap return (27.59%), `tap +=` (17.69%), the accumulator FMAs (22.64%), and the
+  start normalization (11.27%). FFMA 192.7M → 295.9M because the tap scan has no
+  coverage early-out.
+- **Diagnosis:** The staging simplification worked (Horner/FMA 3.8%), but the
+  per-cell tap repeats support-wrap arithmetic 8× and always executes the 32-cell
+  accumulation even when a lane group is outside the support. The kernel is
+  issue/compute-bound (80% issue slots, 75.6% FMA, 64% ALU).
+- **Decision:** Reject 5a. Keep the simple `StagedSource`/one-lane staging, but
+  restore three `SupportPlacement` calls, the coverage early-out, and 2/2/4 window
+  loads (5a'). Do not proceed to 5b/5c on the tap kernel.
+- **Classification:** Decision (5a rejected, 5a' next), Fact (profile).
+- **New question:** Approve 5a' as the next worker step?
+
+### Turn 15 — Change A approved; reprofile after it
+
+- **State:** Ready for execution (Change A)
+- **User instruction:** Do Change A in a subagent and reprofile.
+- **Scope:** Change A only: keep the simple `StagedSource`/one-lane staging,
+  replace the per-cell tap scan with three `SupportPlacement` calls, a coverage
+  early-out, and 2/2/4 window loads. Leave active-region detection, splits,
+  full-grid partials, reduction, public API, and the bench untouched. Change B
+  (host plan) and Change C (compact partials) wait until Change A is reviewed.
+- **Classification:** Decision.
+- **Next action:** Worker implements Change A; validate 9/9 + 25/25; full profile.
+
+### Turn 16 — Change A profiled: partial, not accepted
+
+- **State:** Needs confirmation (A.1 staging-group experiment or sparse trade-off)
+- **Change A result:** 9/9 + 25/25. Uniform 16.70 → 18.15 ms (+8.7%),
+  clustered 16.43 → 14.50 ms (−11.8%), sparse 2.24 → 2.82 ms (+25.9%),
+  dense 1.94 → 1.77 ms (−8.5%). Translation unit 783 lines, down from 1005.
+- **Profile:** `build/gpu/traces/af_profile_20261110_192025/`.
+  - Uniform: 751.9M instructions (similar to Phase 2), but IPC 2.40 vs 2.55,
+    occupancy 43.35% vs 47.73%, active threads/warp 18.45 vs 20.34. The general
+    `place_support` path is hot (lines 160–187, especially 173), because the
+    32-source staging group makes the non-wrapping vote fail often.
+  - Sparse: 141.6M instructions vs 106.8M. Horner/FMA is 28.86% of instructions
+    vs 5.65% in Phase 2. Small bins leave most lanes idle with one-lane staging;
+    Phase 2's nine-lane staging used 27 lanes for three sources.
+- **Assessment:** Change A recovered most of the tap regression and improved
+  clustered/dense, but uniform is still outside tolerance and sparse is much
+  worse. The uniform issue is the staging-group size / fast-path hit rate; the
+  sparse issue is the one-lane staging parallelism for small bins.
+- **Decision:** Try A.1 (`STAGING_GROUP_SIZE = 13` or 16) first. If uniform
+  returns to tolerance and sparse remains the only outlier, decide explicitly
+  whether to accept the sparse regression or add a parallel small-bin staging
+  path. Do not proceed to B/C yet.
+- **Classification:** Decision (A.1), Open (sparse trade-off).
+- **New question:** Approve A.1, or accept the sparse regression and proceed?
+
 ## Decision history
 
 ### D1 — Preserve the glossary's `tile` definition; add local ownership terms
@@ -366,15 +477,103 @@
 - **Confidence:** High on the goal; Medium on how much to change in the first
   series.
 
+### D10 — Prototype the concise redesign before modularizing the copied code
+
+- **Status:** Decided; performance tolerance Open
+- **Decision:** Build the concise staging+scan design, then move the active-region
+  policy to the host and compact the partial grids. The header-extraction plan is
+  the fallback if the concise scan loses too much performance.
+- **Rationale:** The current 1005-line kernel is exp_a's incidental complexity,
+  not essential complexity. Staging kernel values directly, one lane per source
+  with 32 sources, and per-cell tap placement removes the 9-lane mapping, the
+  30-float padding, the window/fast-path/degenerate scan variants, and the GPU
+  active-region metadata. The result should be both smaller and easier to reason
+  about.
+- **Alternatives rejected:** Extract the copied code into headers first (treats the
+  symptom, keeps the accidental complexity); stop at the current working kernel.
+- **Confidence:** High on simplicity; Medium on whether the tap scan matches the
+  window scan's performance.
+
+### D11 — Host active plan is measured inside `launch_spread`
+
+- **Status:** Decided
+- **Decision:** Compute the active-region plan on the host from the host bin
+  offsets, but inside the timed `launch_spread`, so `spread` includes plan,
+  upload, kernel, memset, and reduction. Report a plan/kernel/reduce breakdown.
+  The headline is `prep + spread` versus method 3 `setpts + execute`; kernel-only
+  NCU is microarchitecture only.
+- **Rationale:** The host already owns the sorted bin table. Hiding the plan in
+  prep would make the kernel-only comparison misleading. Measuring it in place
+  keeps the implementation simple and the comparison honest.
+- **Alternatives rejected:** Compute the plan in prep and compare kernel-only to
+  method 3 execute (dishonest); keep the GPU detection/compaction purely to keep
+  the timing unchanged (more code and a blocking copy).
+- **Confidence:** High on the contract; Medium on whether the host plan beats the
+  current GPU plan in wall time.
+
+### D12 — Implement the concise redesign in three worker steps
+
+- **Status:** Decided
+- **Decision:** Step 5a staging+tap scan, 5b host active plan, 5c compact partial
+  grids; each in a separate worker subagent; validate and bench after each; full
+  profile at the end.
+- **Rationale:** Keeps the changes attributable, catches performance regressions
+  early, and gives a clean handoff for review.
+- **Alternatives rejected:** One large worker change (hard to attribute);
+  modularize the copied exp_a code first (the user rejected that direction).
+- **Confidence:** High.
+
+### D13 — Reject the tap scan; revise to window/coverage (5a')
+
+- **Status:** Decided
+- **Decision:** Keep the concise staging (`StagedSource`, one lane per source,
+  32 sources, `eval_kernel_vec_horner`) but replace per-cell `tap_value` with
+  three `SupportPlacement` calls, an early-out when any axis is uncovered, and
+  2/2/4 window loads.
+- **Rationale:** The tap scan adds ~376M integer instructions and loses the FFMA
+  early-out; it is 16.6% slower on uniform and 39.7% on sparse. The window scan
+  amortizes support placement over the lane group and skips empty lane groups.
+- **Alternatives rejected:** Continue to 5b/5c on the tap kernel (host plan and
+  compact partials cannot recover a 16–40% scan regression); revert entirely to
+  the exp_a port (keeps the 30-float/9-lane/coefficient-table complexity).
+- **Confidence:** High on rejecting 5a; Medium on whether 5a' hits the 5%
+  tolerance without the fast-path vote.
+
+### D14 — Change A only, then reprofile
+
+- **Status:** Decided
+- **Decision:** Implement the window/coverage scan (Change A) and profile it
+  before deciding on Changes B and C.
+- **Rationale:** Change A is the performance gate. If it does not restore the
+  scan, the host plan and compact partials cannot recover the regression. The user
+  wants to review the profile before approving the remaining changes.
+- **Alternatives rejected:** Implement A+B+C in one pass (harder to attribute);
+  keep the tap scan (known slower).
+- **Confidence:** High on the order; Medium on whether Change A alone hits the 5%
+  tolerance without the non-wrapping fast path.
+
+### D15 — Change A is partial; try a smaller staging group before B/C
+
+- **Status:** Decided
+- **Decision:** Run A.1 with `STAGING_GROUP_SIZE = 13` or 16 and re-bench uniform
+  and sparse. Do not proceed to the host plan/compact partials until the
+  scan/staging trade-off is settled.
+- **Rationale:** Uniform's regression is consistent with the 32-source
+  non-wrapping vote failing often. Sparse's regression is consistent with
+  one-lane staging being under-parallel for small bins. A smaller group may fix
+  uniform but will not fix sparse; the sparse trade-off must be decided
+  explicitly.
+- **Alternatives rejected:** Proceed to B/C on a version that is still 8.7%
+  slower on uniform and 25.9% slower on sparse.
+- **Confidence:** High on the diagnosis; Medium on whether 13/16 recovers uniform.
+
 ## Unresolved questions
 
-1. Is the refactor strictly behavior-preserving first, or may the compact
-   partial-grid change (R5) land in the same series?
-2. How many files: five headers + one .cu, or five headers + two .cu
-   (`spread_kernel.cu`, `spread_launch.cu`)? Splitting .cu files requires build
-   script changes.
-3. Are host tests for the pure geometry/support/cursor modules required?
-4. Is the F0 prototype in scope for the `CandidateBins` move?
-5. Do we apply glossary renames now (`STAGING_GROUP_SIZE`,
-   `scan_one_staged_source`, `reduce_splits`) or keep current names to minimize
-   churn?
+1. Does A.1 with `STAGING_GROUP_SIZE = 13` or 16 recover uniform to within 5%?
+2. If sparse remains 25% slower, accept the one-lane staging regression for
+   simplicity, or add a parallel small-bin staging path?
+3. After A.1, approve Change B (host plan) and Change C (compact partials), or
+   stop at the concise scan.
+4. Are host tests for the pure geometry/cursor modules required in the concise
+   prototype?
+5. Is the F0 prototype in scope for the `CandidateBins` move?

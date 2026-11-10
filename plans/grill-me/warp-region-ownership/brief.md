@@ -1,7 +1,7 @@
 # Atomic-free spread: warp-owned 8×8×8 regions with 16 cells per lane
 
-> Status: Needs confirmation (performance acceptable; readability refactor scope open)
-> Last updated: Turn 10 (code-quality refactor proposal)
+> Status: Ready for execution (Change A: window/coverage scan)
+> Last updated: Turn 15 (Change A handoff)
 
 ## Outcome
 
@@ -1041,6 +1041,460 @@ run-to-run noise.
    currently includes the shared header and uses `detail::CandidateBins`.
 5. Do we rename to glossary terms now, or keep the current names to minimize churn?
 
+## Concise redesign (preferred over extracting the current code)
+
+The current kernel is a direct port of exp_a's staging, scan, and active-tile
+machinery. That was the fastest route to performance after the earlier failure,
+but it inherited exp_a's assumptions without re-deriving them for our simpler
+one-warp-per-region design:
+
+- nine lanes per source with three sources per warp iteration,
+- a 9x6 polynomial table and a 30-float padded record,
+- `place_support` / `place_support_nowrap` / window reads / a fast-path vote,
+- a separate degenerate-grid periodic-tap fallback,
+- GPU active-region detection and compaction plus a blocking host copy.
+
+A more concise design drops those assumptions. The hot path becomes small enough
+to read in one screen, and the active-region policy moves to the host where the
+bin table already exists.
+
+### 1. Stage kernel values, not a polynomial table
+
+`eval_kernel_vec_horner` already computes the six kernel values for one source and
+dimension. Stage those values directly:
+
+```cpp
+struct StagedSource {
+  int start[3];
+  float kernel[3][WIDTH];
+  float2 strength;
+};
+constexpr int STAGING_GROUP_SIZE = 32;
+```
+
+Size: 92 bytes of payload, 96 with alignment; 32 sources = 3.0 KB per warp,
+6.1 KB per two-warp threadblock, 61 KB at 10 blocks/SM. Fits under the 65.5 KB
+shared-memory budget; if occupancy is tight, use 30 sources per staging group.
+
+One lane stages one source, and all 32 lanes are active:
+
+```cpp
+if (lane >= count) return;
+const Point p = sources[begin + lane];
+StagedSource& s = staging[lane];
+s.strength = p.strength;
+stage_axis(s, 0, p.x, grid.nx);
+stage_axis(s, 1, p.y, grid.ny);
+stage_axis(s, 2, p.z, grid.nz);
+```
+
+```cpp
+const float folded = fold_rescale(coordinate, grid_size);
+const float start_f = ceilf(folded - SUPPORT_OVERHANG);
+source.start[axis] = int(start_f);
+eval_kernel_vec_horner(source.kernel[axis], start_f - folded, 2.0);
+```
+
+This removes the 9-lane mapping, `prepare_two_coefficients`, the 9x6 table, the
+30-float padding layout, and the per-source slot constants. It also uses the warp
+far better: the current design processes three sources per warp iteration, while
+one lane per source processes 32. The warp-level Horner work per source should
+drop substantially.
+
+### 2. Scan with a per-cell tap, not window placement
+
+```cpp
+__device__ float tap_value(const float* kernel, int start, int cell,
+                           int grid_size) {
+  int tap = cell - start;
+  tap += (tap < 0) ? grid_size : 0;
+  tap -= (tap >= grid_size) ? grid_size : 0;
+  return (tap < WIDTH) ? kernel[tap] : 0.0f;
+}
+```
+
+```cpp
+const StagedSource& s = staging[j];
+float x[LANE_CELLS_X], y[LANE_CELLS_Y], z[LANE_CELLS_Z];
+for lx: x[lx] = tap_value(s.kernel[0], s.start[0], group.x + lx, grid.nx);
+for ly: y[ly] = tap_value(s.kernel[1], s.start[1], group.y + ly, grid.ny);
+for lz: z[lz] = tap_value(s.kernel[2], s.start[2], group.z + lz, grid.nz);
+accumulate_cell_group(acc, x, y, z, s.strength);
+```
+
+This removes `place_support`, `place_support_nowrap`, the window reads, the
+padding, the `whole_batch_nonwrapping` vote, and the entire degenerate-grid
+fallback. It handles every grid size at least `WIDTH` uniformly, including the
+6x6x6 case. The cost is more per-cell integer work than the window path; whether
+that is a net win is a measurement question, not a design assumption.
+
+### 3. Move the active-region policy to the host
+
+The CPU sort already builds `bin_offsets` on the host. The active-region plan can
+be computed there:
+
+```cpp
+struct ActiveRegionPlan {
+  std::vector<int> regions;  // host list, uploaded once per case
+  int split_count;
+};
+ActiveRegionPlan plan_active_regions(const int* host_bin_offsets, Grid grid);
+```
+
+- Sum the candidate-bin counts per warp region on the host; mark non-empty
+  regions active.
+- Choose `split_count` on the host with the same heuristic.
+- Upload the active list once per case; reuse it across timed runs.
+- Remove `detect_active_regions`, `compact_active_regions`, `active_flags`, the
+  `active_count` device buffer, the blocking host copy, and the host-side
+  allocation churn.
+
+The plan is on the host because the bin table is already there, **not** because it
+is convenient to move work outside the measured region. `launch_spread` takes the
+host bin offsets as well as the device bin offsets, computes the plan inside the
+timed call, uploads the active list, launches the kernel, and reduces. The
+benchmark's `spread` interval therefore includes the host plan, the upload, the
+kernel, the memset, and the reduction. The bench prints a `plan`/`kernel`/`reduce`
+breakdown and the end-to-end `prep + spread` total; the kernel-only NCU capture is
+labelled as microarchitecture, not the headline comparison.
+
+If the host plan is slower than the current GPU detection/compaction, keep the GPU
+plan or compute the host plan once per case and report the amortized cost. Do not
+compare a warmed plan against method 3's full execute without saying so.
+
+### API sketch
+
+```cpp
+// spread_geometry.cuh
+struct WarpRegion  { int x, y, z, nx, ny, nz; };
+struct LaneCellGroup { int x, y, z; };
+struct CandidateBins { int first, count, bins; };
+
+WarpRegion make_warp_region(int x, int y, int z, Grid grid);
+WarpRegion warp_region_from_id(int region_id, Grid grid);
+LaneCellGroup lane_cell_group(int lane);
+CandidateBins candidate_bins(int begin, int end, int bin_size,
+                             int grid_size, int bins);
+
+class CandidateBinCursor {
+ public:
+  CandidateBinCursor(WarpRegion region, Grid grid);
+  bool next(int& bin_id);
+};
+
+class SourceRangeCursor {
+ public:
+  SourceRangeCursor(WarpRegion region, Grid grid, const int* bin_offsets);
+  bool next(int& begin, int& end);
+};
+```
+
+```cpp
+// spread_staging.cuh
+constexpr int STAGING_GROUP_SIZE = 32;
+
+struct StagedSource {
+  int start[3];
+  float kernel[3][WIDTH];
+  float2 strength;
+};
+
+void stage_sources(StagedSource* staging, const Point* sources, int begin,
+                   int count, int lane, Grid grid);
+```
+
+```cpp
+// spread_scan.cuh
+struct CellAccumulator {
+  float2 cell[LANE_CELLS_X][LANE_CELLS_Y][LANE_CELLS_Z];
+};
+
+float tap_value(const float* kernel, int start, int cell, int grid_size);
+void scan_staging_group(CellAccumulator& acc, const StagedSource* staging,
+                        int count, Grid grid, LaneCellGroup group);
+void store_cell_group_global(const CellAccumulator& acc, cuFloatComplex* output,
+                             Grid grid, WarpRegion region, LaneCellGroup group);
+void store_cell_group_local(const CellAccumulator& acc,
+                            cuFloatComplex* region_slice, WarpRegion region,
+                            LaneCellGroup group);
+```
+
+```cpp
+// spread_active_regions.cuh
+enum class LaunchPath { FullGrid, ActiveSingleSplit, ActiveSplit };
+
+struct ActiveRegionPlan {
+  std::vector<int> regions;
+  int split_count;
+  LaunchPath path;
+};
+
+ActiveRegionPlan plan_active_regions(const int* host_bin_offsets, Grid grid);
+void reduce_split_slices(const cuFloatComplex* partial, int split_count,
+                         const int* active_regions, int active_count, Grid grid,
+                         cuFloatComplex* output);
+```
+
+```cpp
+// public launch
+auto launch_spread(const Point* points, const int* device_bin_offsets,
+                   const int* host_bin_offsets, Grid grid,
+                   cuFloatComplex* output) -> void;
+```
+
+### Measurement contract
+
+| measurement | includes | compared with |
+|---|---|---|
+| `prep` | generate, upload, bin assignment, copy, CPU sort, upload sorted | method 3 `setpts` |
+| `spread` | host active plan, active-list upload, spread kernel, output memset, split reduction | method 3 `execute` |
+| `prep + spread` | all of the above | method 3 `setpts + execute` |
+| kernel-only NCU | `spread` kernel only | microarchitecture only; not a headline speedup |
+
+The plan is recomputed inside `launch_spread` so the `spread` interval is honest.
+If it is later cached, report both the cold and amortized costs. Never move the
+plan into `prep` and then compare the remaining kernel time to method 3's full
+execute without labelling the difference.
+
+### 4. Compact partial grids
+
+When `split_count > 1`, use
+`partial[split][active_slot][local_cell]` instead of
+`partial[split][global_cell]`. The spread kernel stores its warp region's local
+512 cells; the reduction sums local cells and maps to the global output index
+once. This removes the 67–536 MB full-grid partial allocation, the global index
+math in the split store, and the allocation-outlier risk.
+
+### Resulting kernel shape
+
+```cpp
+__global__ void spread(const Point* points, const int* bin_offsets, Grid grid,
+                       cuFloatComplex* output, const int* active_regions,
+                       int split_count, int active_count, int work_count) {
+  __shared__ StagedSource staging[WARPS][STAGING_GROUP_SIZE];
+
+  const int work_id = blockIdx.x * WARPS_PER_THREADBLOCK + (threadIdx.x >> 5);
+  if (work_id >= work_count) return;
+  const int region_slot = work_id / split_count;
+  const int split_index = work_id - region_slot * split_count;
+  const int region_id = active_regions ? active_regions[region_slot] : work_id;
+  const WarpRegion region = warp_region_from_id(region_id, grid);
+  if (!valid(region)) return;
+
+  const LaneCellGroup group = lane_cell_group(threadIdx.x & 31);
+  CellAccumulator acc = {};
+  SourceRangeCursor cursor(region, grid, bin_offsets);
+  for (int begin, end; cursor.next(begin, end);) {
+    for (int base = begin + split_index * STAGING_GROUP_SIZE;
+         base < end; base += split_count * STAGING_GROUP_SIZE) {
+      const int count = min(STAGING_GROUP_SIZE, end - base);
+      stage_sources(staging[warp], points + base, count, threadIdx.x & 31, grid);
+      __syncwarp();
+      scan_staging_group(acc, staging[warp], count, grid, group);
+      __syncwarp();
+    }
+  }
+
+  if (split_count > 1) {
+    cuFloatComplex* region_slice =
+        output + (split_index * active_count + region_slot) * WARP_REGION_CELLS;
+    store_cell_group_local(acc, region_slice, region, group);
+  } else {
+    store_cell_group_global(acc, output, grid, region, group);
+  }
+}
+```
+
+That is the whole algorithm: stage, sync, scan, sync, store. The current version
+spends most of its lines on the staging layout and support-placement machinery.
+
+Reduction:
+
+```cpp
+__global__ void reduce_split_slices(const cuFloatComplex* partial, int split_count,
+                                    const int* active_regions, int active_count,
+                                    Grid grid, cuFloatComplex* output) {
+  const long long total = (long long)active_count * WARP_REGION_CELLS;
+  for (long long task = ...; task < total; task += stride) {
+    const int slot = task / WARP_REGION_CELLS;
+    const int local = task % WARP_REGION_CELLS;
+    const WarpRegion region = warp_region_from_id(active_regions[slot], grid);
+    const int lx = local % WARP_REGION_X;
+    const int ly = (local / WARP_REGION_X) % WARP_REGION_Y;
+    const int lz = local / (WARP_REGION_X * WARP_REGION_Y);
+    if (lx >= region.nx || ly >= region.ny || lz >= region.nz) continue;
+    const int x = region.x + lx, y = region.y + ly, z = region.z + lz;
+    const long long index = x + (long long)grid.nx * (y + (long long)grid.ny * z);
+    float2 value = split_value(partial, 0, slot, local);
+    for (int split = 1; split < split_count; ++split)
+      value += split_value(partial, split, slot, local);
+    output[index] = make_cuFloatComplex(value.x, value.y);
+  }
+}
+```
+
+### Code-size estimate
+
+| module | estimated lines |
+|---|---:|
+| `spread_geometry.cuh` (region, lane group, candidate bins, cursor) | ~150 |
+| `spread_staging.cuh` (`StagedSource`, stage, tap value) | ~80 |
+| `spread_scan.cuh` (accumulator, scan, store) | ~80 |
+| `spread_active_regions.{cuh,cu}` (host plan, reduce) | ~150 |
+| `atomic_free_spread.cu` (kernel + launch) | ~150 |
+| **hot path total** | **~100** |
+| **all modules** | **~600** |
+
+The current translation unit is ~1005 lines, with the hot path spread across
+`prepare_two_coefficients`, `place_support`, two scan variants, and a template
+dispatch. The concise version is not just fewer files; it has fewer concepts.
+
+### Performance hypothesis and risk
+
+- **Staging should get faster.** One lane per source with 32 sources uses all 32
+  lanes; the current nine-lane/three-source staging leaves the warp underused and
+  processes only three sources per iteration.
+- **The scan may get slightly slower.** Eight per-cell tap computations may cost
+  more integer instructions than three `place_support` calls plus window reads.
+  There is no fast-path vote and no degenerate fallback, so the branch and
+  code-size pressure is lower. The net is a measurement question.
+- **The host plan removes the sparse metadata cost (~0.2 ms, ~9%)** and the
+  blocking host copy.
+- **Compact partial grids remove the allocation outliers** (dense 4.17 ms max vs
+  1.94 ms median).
+
+If the tap scan is slower, add a window fast path behind a `SupportPath` enum
+only after profiling. Do not start with it.
+
+### Step 5a result — rejected
+
+Step 5a (kernel-value staging + per-cell tap scan) is correct but outside the
+performance tolerance. Capture:
+`build/gpu/traces/af_profile_20261110_185628/`.
+
+| case | Phase 2 | step 5a | delta | exp_a |
+|---|---:|---:|---:|---:|
+| uniform | 16.699 ms | **19.470 ms** | **+16.6%** | 10.912 ms |
+| clustered | 16.433 ms | **17.719 ms** | **+7.8%** | 11.232 ms |
+| sparse | 2.239 ms | **3.128 ms** | **+39.7%** | 1.393 ms |
+| dense | 1.938 ms | **2.309 ms** | **+19.1%** | n/a |
+
+| metric | Phase 2 | step 5a |
+|---|---:|---:|
+| uniform warp instructions | 754.6M | **1,130.7M** |
+| clustered warp instructions | 824.2M | **1,132.5M** |
+| sparse warp instructions | 106.8M | **175.4M** |
+| dense warp instructions | 61.2M | **113.4M** |
+| uniform FMA pipe | 54.59% | 75.55% |
+| uniform ALU pipe | 40.48% | 64.04% |
+| uniform issue slots busy | 63.89% | 80.05% |
+| uniform IPC | 2.55 | 3.20 |
+| uniform no-eligible | 34.29% | 16.27% |
+| uniform FFMA instructions | 192.7M | **295.9M** |
+
+Uniform source groups: support index / modulo **45.35%**, weight / select /
+accumulate 29.03%, other 21.20%, Horner/FMA 3.81%. The top lines are the tap
+return (27.59%), `tap += (tap < 0) ? grid_size : 0` (17.69%), the two accumulator
+FMAs (22.64% total), and the start normalization (11.27%).
+
+Assessment:
+
+- **The staging simplification worked.** Horner/FMA drops to 3.8%; staging is not
+  the problem. The simple `StagedSource` and one-lane-per-source staging should be
+  kept.
+- **The per-cell tap scan is the mistake.** It repeats support-wrap arithmetic for
+  every one of the 8 lane-group cells instead of amortizing it over the lane
+  group. It also has no coverage early-out, so it executes all 32 accumulator FMAs
+  even when the lane group is outside the support: FFMA rises from 192.7M to
+  295.9M.
+- **The kernel is now issue/compute-bound,** not memory-bound: 80% issue slots,
+  75.6% FMA, 64% ALU. More occupancy or fewer barriers will not help.
+
+Step 5a is rejected. The revised concise scan (5a') keeps the simple staging but
+restores:
+
+1. three `SupportPlacement` calls per source for the x/y/z lane groups,
+2. an early-out when any axis has zero covered cells,
+3. 2/2/4 window loads from the six staged kernel values, with a bounds check or a
+   small padded row instead of per-cell tap arithmetic.
+
+That keeps the 30-float/9-lane/coefficient-table machinery deleted while
+restoring the support amortization and the FFMA early-out. Implement 5a' before
+5b/5c; do not proceed to the host plan or compact partials on the tap kernel.
+
+### Change A result — partial, not yet accepted
+
+Change A (window/coverage scan with the simple staging) is correct. Capture:
+`build/gpu/traces/af_profile_20261110_192025/`. Translation unit: 783 lines,
+down from 1005 (−22%).
+
+| case | Phase 2 | Change A | delta | exp_a | A / exp_a |
+|---|---:|---:|---:|---:|---:|
+| uniform | 16.699 ms | **18.154 ms** | **+8.7%** | 10.912 ms | 1.66× |
+| clustered | 16.433 ms | **14.496 ms** | **−11.8%** | 11.232 ms | 1.29× |
+| sparse | 2.239 ms | **2.818 ms** | **+25.9%** | 1.393 ms | 2.02× |
+| dense | 1.938 ms | **1.774 ms** | **−8.5%** | n/a | n/a |
+
+| metric | uniform | clustered | sparse | dense |
+|---|---:|---:|---:|---:|
+| warp instructions | 751.9M | 819.4M | 141.6M | 56.1M |
+| compute % | 54.13 | 76.44 | 69.80 | 50.60 |
+| L1/TEX % | 42.50 | 75.81 | 38.52 | 51.27 |
+| IPC | 2.40 | 3.08 | 2.82 | 2.23 |
+| achieved occupancy % | 43.35 | 55.29 | 55.76 | 34.03 |
+| active threads/warp | 18.45 | 12.62 | 14.58 | 18.76 |
+| no eligible % | 35.64 | 21.74 | 28.33 | 35.04 |
+
+Uniform source groups: other/kernel setup 43.24%, weight/select/accumulate
+25.06%, support index/modulo 24.97%, Horner/FMA 5.77%. The hot lines are the
+general `place_support` path (`atomic_free_spread.cu:160–187`, especially the
+`wraps_high`/`min` line at 173), `window_value` at 202, and the accumulator at
+281/282. Uniform is slower than Phase 2 despite almost the same instruction
+count: IPC 2.40 vs 2.55, occupancy 43.35% vs 47.73%, active threads/warp 18.45
+vs 20.34. The general `place_support` path has more branches and divergence.
+
+Sparse source groups: other 37.99%, **Horner/FMA 28.86%**, weight/select/
+accumulate 13.47%, support index 10.47%, bin iteration 4.98%. Sparse is the
+clearest trade-off: Phase 2 had Horner/FMA 5.65%. The one-lane-per-source staging
+does three full Horner evaluations for a three-source bin, while Phase 2's
+nine-lane staging used 27 lanes for three sources. Small bins cannot fill the
+warp with the one-lane staging, so sparse pays much more staging Horner work.
+
+Assessment:
+
+- Change A recovered most of the tap regression and improved clustered and
+dense. The simple `StagedSource` staging and window scan are a real improvement
+  in code size and structure.
+- Uniform is still outside tolerance. The 32-source staging group makes the
+  per-batch non-wrapping vote fail often: one wrapping support pushes the whole
+  batch onto the general `place_support` path. A smaller staging group (13 or 16)
+  is a cheap experiment and may recover uniform.
+- Sparse is outside tolerance for a different reason: small bins leave most lanes
+  idle during staging, so the one-lane-per-source staging is much less parallel
+  than Phase 2's nine-lane staging. Reducing the staging group size will not fix
+  this. The options are to accept the sparse regression for simplicity, or
+  reintroduce a small-bin parallel staging path.
+- Do not proceed to Change B/C until this trade-off is settled. The host plan
+  and compact partials will not recover an 8.7% uniform or 25.9% sparse scan/
+  staging regression.
+
+Proposed next experiment (A.1): set `STAGING_GROUP_SIZE = 13` or 16, re-bench
+uniform and sparse. If uniform returns to tolerance and sparse remains the only
+outlier, decide explicitly whether the sparse regression is acceptable or whether
+staging needs a parallel small-bin path.
+
+### Validation
+
+- Prototype on a branch/worktree; keep the current kernel as the reference until
+  the concise version passes the full matrix, the 25-case sweep, forced split
+  counts, and the edge grids.
+- Agree on a performance tolerance before starting. Suggested: no worse than 5%
+  on uniform/clustered/sparse, dense no worse than 2.0 ms, and a clear code-size
+  reduction. If the tap scan loses more than that, stop and keep the window path
+  as an opt-in fast path.
+- Profile uniform/clustered/sparse/dense after the staging+scan change and again
+  after the host-plan/compact-partial change.
+
 ## Milestones and next actions
 
 - [Done] Step 0: design and implement the warp-owned kernel.
@@ -1055,10 +1509,20 @@ run-to-run noise.
   16.43 ms, sparse 2.24 ms, dense 1.94 ms.
 - [Done] Step 4: the combined kernel is accepted as the new best atomic-free
   baseline; the one-warp-per-region structure no longer needs to be revisited.
-- [In progress] Step 5: readability and modularity refactor (R0–R6). Performance
-  and behavior are held constant except for the deliberate compact-partial-grid
-  change in R5.
-- [Open] Step 6: after the refactor, return to performance: x-run batching,
-  double-buffered staging, or a larger clustered split count.
-- [Open] Next action: agree on the refactor scope: strictly behavior-preserving
-  first, or include R5 in the same series; one .cu or two; host tests; F0 scope.
+- [Rejected] Step 5a: kernel-value staging + per-cell tap scan. Correct, but
+  +16.6% uniform, +7.8% clustered, +39.7% sparse, +19.1% dense. Profile at
+  `build/gpu/traces/af_profile_20261110_185628/`.
+- [Done, partial] Change A: window/coverage scan. 9/9 + 25/25; profile at
+  `build/gpu/traces/af_profile_20261110_192025/`. Uniform 18.15 ms (+8.7%),
+  clustered 14.50 ms (−11.8%), sparse 2.82 ms (+25.9%), dense 1.77 ms (−8.5%).
+  Translation unit 783 lines, down from 1005.
+- [In progress] Change A.1: try `STAGING_GROUP_SIZE = 13` or 16 to improve the
+  non-wrapping vote hit rate on uniform; re-bench uniform and sparse.
+- [Open] Decide the sparse trade-off: accept the one-lane staging regression, or
+  add a parallel small-bin staging path. Do not proceed to B/C before this.
+- [Open] Change B: move the active-region plan to the host, measured inside
+  `launch_spread`, and remove GPU detection/compaction. Only after A.1.
+- [Open] Change C: compact partial grids and local-cell reduction. Only after
+  A.1.
+- [Open] Next action: run A.1 in a worker or decide to accept the sparse
+  regression.

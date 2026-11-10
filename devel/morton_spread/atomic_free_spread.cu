@@ -16,11 +16,16 @@
 // split_index = work_id % split_count. Inactive regions are zeroed by the host
 // memset and are never touched by the kernel or the reduction.
 //
-// Sources are staged in shared memory in exp_a's 30-float record form: three
-// support starts, the strength, and six Horner kernel coefficients per
-// dimension. Nine lanes cooperate on one source, so three sources share one
-// warp iteration, and each lane then places the support against its own 2x2x4
-// cell group with min/max interval arithmetic instead of per-cell weights.
+// Sources are staged in shared memory as one record per source: three support
+// starts, six kernel values per dimension, and the strength. One lane stages one
+// source, so a 32-source staging group uses every lane of the warp. The hot scan
+// places each staged support against the lane group once, then reads the 2/2/4
+// covered kernel values as a window. A warp-wide vote selects a non-wrapping
+// placement fast path when the warp region is interior and every staged support
+// is inside the grid. Grids narrow enough that a support can cover a group prefix
+// and suffix at the same time keep the per-cell periodic tap fallback.
+// Staging is warp-private: the kernel has no block-wide barrier, only the
+// __syncwarp() around the single staging buffer.
 //
 // For simplicity, binning and sorting are done on the CPU after a GPU kernel
 // computes the bin IDs. The latter ensures bin assignment uses the exact same
@@ -67,212 +72,134 @@ __global__ void assign_bins(const Point *points, int count, Grid grid, int *bin_
   bin_ids[i] = bx + grid.bins_x * (by + grid.bins_y * bz);
 }
 
-// The nine polynomial coefficients of one kernel value, one row per Horner term
-// and one column per kernel value index 0..WIDTH-1. Copied verbatim from
-// exp_a_cartesian.cu: the kernel is evaluated as a degree-8 polynomial in the
-// Horner argument 2 * (support_start - folded) + (WIDTH - 1), which is
-// eval_kernel_vec_horner()'s exact fold + Horner scheme, so the spread matches
-// cuFINUFFT bit-for-bit per source. Nine staging lanes of one dimension load
-// three columns from constant memory into registers, and the same table is
-// copied to shared memory so the second coefficient set (index + 3) can be
-// evaluated with a dynamic column index without a constant-memory replay.
-__device__ __constant__ float KERNEL_COEFFICIENT_TABLE[9][WIDTH] = {
-    {2.0875119883113444E-03, 1.5741818314646622E-01, 8.2446837122968719E-01,
-     8.2446837122968786E-01, 1.5741818314646619E-01, 2.0875119883208707E-03},
-    {7.2383827471879060E-03, 2.0903648995439425E-01, 3.2052935784357611E-01,
-     -3.2052935784357595E-01, -2.0903648995439431E-01, -7.2383827471776199E-03},
-    {1.0180085126333447E-02, 9.2337811484268992E-02, -1.0253741712233815E-01,
-     -1.0253741712233826E-01, 9.2337811484268992E-02, 1.0180085126343148E-02},
-    {7.3669955501269495E-03, 4.9102900025223368E-03, -5.1302324979469585E-02,
-     5.1302324979469453E-02, -4.9102900025223412E-03, -7.3669955501178205E-03},
-    {2.7444270008043898E-03, -8.0004810696545064E-03, 5.2920367975572286E-03,
-     5.2920367975572606E-03, -8.0004810696545012E-03, 2.7444270008144416E-03},
-    {3.2622379114949579E-04, -1.8514138516535774E-03, 3.8520985619444484E-03,
-     -3.8520985619445560E-03, 1.8514138516535451E-03, -3.2622379114026316E-04},
-    {-1.2239646122606804E-04, 2.2750660293439196E-04, -1.2702072030321002E-04,
-     -1.2702072030313421E-04, 2.2750660293438364E-04, -1.2239646121695212E-04},
-    {-4.6695893922773253E-05, 1.1717219021522327E-04, -1.8098268625867290E-04,
-     1.8098268625856663E-04, -1.1717219021521502E-04, 4.6695893931712934E-05},
-    {-1.5875418082722892E-06, 7.2147850129502829E-07, -7.0930078290747281E-08,
-     -7.0930078325137639E-08, 7.2147850125572373E-07, -1.5875417996328233E-06}};
+// A source staged in shared memory for the window scan (and the narrow-grid tap
+// fallback). One lane writes one record: the three integer support starts, the
+// six kernel values of each dimension evaluated at that source's support start,
+// and the strength.
+struct StagedSource {
+  int start[3];
+  float kernel[3][WIDTH];
+  float2 strength;
+};
 
-// Sources staged together in one shared-memory batch, and the float slots each
-// staged source occupies. Nine staging lanes cover a source's 18 coefficients
-// (two per lane), so three sources share one warp iteration and 13 leaves
-// three-point iterations with one or two points in the last one.
-constexpr int MAX_POINTS_PER_BATCH = 13;
-static_assert(MAX_POINTS_PER_BATCH <= 32);
+// One staging group per warp. 32 sources keeps every lane busy while staging;
+// each record is 96 bytes with alignment, so a two-warp threadblock uses 6.1 KB
+// of shared memory.
+constexpr int STAGING_GROUP_SIZE = 32;
+static_assert(STAGING_GROUP_SIZE <= 32);
+static_assert(sizeof(StagedSource) == 96);
 
-// 30-float staged-source layout, copied from exp_a_cartesian.cu:
-//   0..2    support starts x, y, z (int bits, rewritten in place by
-//           prepare_two_coefficients; the raw pass leaves folded coordinates
-//           here first)
-//   3..4    strength real, imag
-//   5..10   six x kernel coefficients, index = support coefficient offset
-//   11      zero pad: the x post-pad doubles as the y pre-pad
-//   12..17  six y kernel coefficients
-//   18..20  zero pads: the z pre-pads
-//   21..26  six z kernel coefficients
-//   27..29  zero pads: the z post-pads
-// The pads let the scan load a lane group's coefficients with one dynamic base
-// and no range selects: x needs one post-pad plus two selects, y needs only
-// slots 11 and 18 as pads, and z reads four contiguous slots from base
-// 21 + offset - local_cell_offset in [18, 26].
-constexpr int VALUES_PER_POINT = 30;
-constexpr int SUPPORT_START_SLOT = 0;   // 0..2
-constexpr int STRENGTH_SLOT = 3;        // 3..4
-constexpr int X_COEFFICIENT_SLOT = 5;   // 5..10
-constexpr int X_Y_PAD_SLOT = 11;
-constexpr int Y_COEFFICIENT_SLOT = 12;  // 12..17
-constexpr int Z_COEFFICIENT_SLOT = 21;  // 21..26
-constexpr int Z_PADDING_BEFORE = 3;     // 18..20
-constexpr int Z_PADDING_AFTER = 3;      // 27..29
-static_assert(X_Y_PAD_SLOT == X_COEFFICIENT_SLOT + WIDTH);
-static_assert(Y_COEFFICIENT_SLOT == X_Y_PAD_SLOT + 1);
-static_assert(Z_COEFFICIENT_SLOT == Y_COEFFICIENT_SLOT + WIDTH + Z_PADDING_BEFORE);
-static_assert(VALUES_PER_POINT == Z_COEFFICIENT_SLOT + WIDTH + Z_PADDING_AFTER);
-static_assert((VALUES_PER_POINT * int(sizeof(float))) % 8 == 0);  // int2 metadata load
-
-// Raw pass for one batch: lanes 0..count-1 issue all the global loads of the
-// batch at once, so the warp waits on one round of loads instead of `count`
-// serialized ones. Coordinates and strength land in slots 0..4; the coefficient
-// pass fills in the support starts and coefficients afterwards. Point is AoS
-// here (exp_a keeps four parallel arrays), so each lane's five floats are a
-// 20-byte strided gather; a 13-source batch still spans only a few 128-byte
-// lines of the sorted point table.
-__device__ __forceinline__ void stage_raw_points(const Point *__restrict__ sources,
-                                                int first_point_index,
-                                                int staged_point_count, int lane,
-                                                float *__restrict__ staging) {
-  if (lane < staged_point_count) {
-    const Point point = sources[first_point_index + lane];
-    float *const staged_point = staging + lane * VALUES_PER_POINT;
-    staged_point[SUPPORT_START_SLOT] = point.x;
-    staged_point[SUPPORT_START_SLOT + 1] = point.y;
-    staged_point[SUPPORT_START_SLOT + 2] = point.z;
-    staged_point[STRENGTH_SLOT] = point.strength.x;
-    staged_point[STRENGTH_SLOT + 1] = point.strength.y;
-  }
-}
-
-// Two coefficients for one staged source/dimension. The primary coefficient
-// index k comes from the register-resident nine-term set, and k+3 from the
-// shared copy, so nine lanes cover a source's 18 coefficients and three sources
-// share one warp iteration (lanes 27..31 are idle). Each lane folds the same
-// broadcast coordinate and rewrites the support start slot with the same int
-// value, which is a benign write race, not a divergence.
-__device__ __forceinline__ void prepare_two_coefficients(
-    float *__restrict__ staged_point, int grid_size_dimension,
-    int support_start_slot, int coefficient_slot, int second_coefficient_index,
-    const float *__restrict__ kernel_coefficients,
-    const float (*__restrict__ second_kernel_coefficients)[WIDTH]) {
+// Evaluate the six kernel values of one dimension and record where its support
+// starts on the periodic fine grid. fold_rescale returns [0, grid_size), so the
+// support start is in [-SUPPORT_OVERHANG, grid_size - SUPPORT_OVERHANG], and the
+// Horner argument start_f - folded is in [-SUPPORT_OVERHANG,
+// -SUPPORT_OVERHANG + 1], exactly the interval eval_kernel_vec_horner expects.
+__device__ __forceinline__ void stage_axis(float *kernel, int &start,
+                                           float coordinate, int grid_size) {
+  using cufinufft::spreadinterp::eval_kernel_vec_horner;
   using cufinufft::spreadinterp::fold_rescale;
-  const float folded_coordinate =
-      fold_rescale(staged_point[support_start_slot], grid_size_dimension);
-  const float support_start_float =
-      ceilf(folded_coordinate - (float)SUPPORT_OVERHANG);
-  const int support_start_int = (int)support_start_float;
-  const float horner_argument =
-      __fmaf_rn(2.f, support_start_float - folded_coordinate, (float)(WIDTH - 1));
-  reinterpret_cast<int *>(staged_point)[support_start_slot] = support_start_int;
-
-  float coefficient_value = kernel_coefficients[8];
-  #pragma unroll
-  for (int horner_term = 7; horner_term >= 0; horner_term--)
-    coefficient_value = __fmaf_rn(horner_argument, coefficient_value,
-                                  kernel_coefficients[horner_term]);
-  staged_point[coefficient_slot] = coefficient_value;
-
-  float second_coefficient_value = second_kernel_coefficients[8][second_coefficient_index];
-  #pragma unroll
-  for (int horner_term = 7; horner_term >= 0; horner_term--)
-    second_coefficient_value = __fmaf_rn(
-        horner_argument, second_coefficient_value,
-        second_kernel_coefficients[horner_term][second_coefficient_index]);
-  staged_point[coefficient_slot + 3] = second_coefficient_value;
+  const float folded = fold_rescale(coordinate, grid_size);
+  const float start_f = ceilf(folded - (float)SUPPORT_OVERHANG);
+  start = (int)start_f;
+  eval_kernel_vec_horner<float, WIDTH>(kernel, start_f - folded, 2.0);
 }
 
-// Support placement of a source in the frame of a group_size-cell lane group
-// starting at lane_group_start, periodic in fine_grid_size_dimension. Returns
-// the number of group cells the support covers (0, 1, ..., group_size), the
-// kernel coefficient index of the first covered cell, and the local cell where
-// coverage starts, so cell local_cell_offset + k uses coefficient
-// support_coefficient_offset + k for k < group_cell_count.
-//
-// The support start can be a whole period or more below the lane group: a
-// source folded near 0 has support_start = -SUPPORT_OVERHANG while a lane group
-// near the high edge of the grid starts at grid_size - 2. The first add handles
-// the common one-period case branchlessly and the loop handles the remaining
-// periods for lane groups near the far edge. This matches the multi-period
-// reduction in the library's owned-spread implementation.
-__device__ __forceinline__ void place_support(int support_start,
-                                              int fine_grid_size_dimension,
-                                              int lane_group_start,
-                                              int group_size,
-                                              int &group_cell_count,
-                                              int &support_coefficient_offset,
-                                              int &local_cell_offset) {
+// Stage one source per lane. Lanes at or past count return from this helper
+// only; the caller still executes its __syncwarp() with the whole warp.
+__device__ __forceinline__ void stage_sources(
+    StagedSource *__restrict__ staging, const Point *__restrict__ sources,
+    int begin, int count, int lane, Grid grid) {
+  if (lane >= count) return;
+  const Point point = sources[begin + lane];
+  StagedSource &staged = staging[lane];
+  staged.strength = make_float2(point.strength.x, point.strength.y);
+  stage_axis(staged.kernel[0], staged.start[0], point.x, grid.nx);
+  stage_axis(staged.kernel[1], staged.start[1], point.y, grid.ny);
+  stage_axis(staged.kernel[2], staged.start[2], point.z, grid.nz);
+}
+
+// Kernel value of one output cell in one dimension. start is the source's
+// support start normalized to [0, grid_size) by the scan. A cell inside the grid
+// is also in [0, grid_size), so cell - start is in (-grid_size, grid_size) and
+// one conditional add folds it into [0, grid_size). A clipped edge cell
+// (cell >= grid_size) has no output, and a tap outside [0, WIDTH) means the
+// support does not reach the cell; both read as zero. This is correct for every
+// grid size at least WIDTH, including the 6x6x6 case where a support wraps
+// around the whole period.
+__device__ __forceinline__ float tap_value(const float *kernel, int start,
+                                           int cell, int grid_size) {
+  int tap = cell - start;
+  tap += (tap < 0) ? grid_size : 0;
+  // A clipped edge cell has no output, and a tap outside the support is zero.
+  // Both tests are selects so the kernel load stays predicated, not branched.
+  return (cell < grid_size && tap < WIDTH) ? kernel[tap] : 0.0f;
+}
+
+// A source's support coverage of one lane-group axis. The support covers
+// cell_count contiguous local cells starting at local_cell_offset; local cell
+// local_cell_offset + k reads kernel[coefficient_offset + k].
+struct SupportPlacement {
+  int cell_count;
+  int coefficient_offset;
+  int local_cell_offset;
+};
+
+// Place one axis of a source support against a lane group, periodic in
+// grid_size. The support start can be below the lane group when a source folds
+// near zero and the lane group sits near the high grid edge; the conditional adds
+// below fold that offset into one period. On a normal-width grid the covered
+// cells are one contiguous run: either from local cell 0 through the high edge of
+// the group, or from a local offset through the end of the group.
+__device__ __forceinline__ SupportPlacement place_support(
+    int support_start, int grid_size, int lane_group_start, int group_size) {
   int relative_support_start = support_start - lane_group_start;
-  relative_support_start += fine_grid_size_dimension & (relative_support_start >> 31);
-  if (relative_support_start < 0) {
-    relative_support_start += fine_grid_size_dimension;
-    while (relative_support_start < 0)
-      relative_support_start += fine_grid_size_dimension;
-  }
-  // group_cell_count / support_coefficient_offset / local_cell_offset below are
-  // selects; ptxas lowers them to SEL/ISETP with no branch.
+  // The window paths only run on non-narrow dimensions (x/y >= 7, z >= 9), where
+  // support_start - lane_group_start is never below -2 * grid_size. Two
+  // conditional adds are therefore enough; they are branchless, unlike the
+  // reference loop.
+  relative_support_start += grid_size & (relative_support_start >> 31);
+  relative_support_start += grid_size & (relative_support_start >> 31);
+
+  // These results are selects, not branches.
   const bool below_group = relative_support_start < group_size;
   const bool wraps_high =
-      relative_support_start >= fine_grid_size_dimension - (WIDTH - 1);
+      relative_support_start >= grid_size - (WIDTH - 1);
   const int wrapped_cell_count =
-      WIDTH - (fine_grid_size_dimension - relative_support_start);
-  group_cell_count = below_group
-                         ? (group_size - relative_support_start)
-                         : (wraps_high ? (wrapped_cell_count < group_size
-                                              ? wrapped_cell_count
-                                              : group_size)
-                                       : 0);
-  support_coefficient_offset =
+      WIDTH - (grid_size - relative_support_start);
+  SupportPlacement placement;
+  placement.cell_count =
+      below_group
+          ? (group_size - relative_support_start)
+          : (wraps_high ? min(wrapped_cell_count, group_size) : 0);
+  placement.coefficient_offset =
       below_group ? 0
-                  : (wraps_high ? (fine_grid_size_dimension - relative_support_start) : 0);
-  local_cell_offset = below_group ? relative_support_start : 0;
+                  : (wraps_high ? (grid_size - relative_support_start) : 0);
+  placement.local_cell_offset = below_group ? relative_support_start : 0;
+  return placement;
 }
 
-// Fast path for a support interval and a lane group that do not wrap around the
-// periodic fine-grid boundary. The overlap is a plain interval intersection, so
-// no modulo and no below_group/wraps_high predicates are needed.
-__device__ __forceinline__ void place_support_nowrap(int support_start,
-                                                    int lane_group_start,
-                                                    int group_size,
-                                                    int &group_cell_count,
-                                                    int &support_coefficient_offset,
-                                                    int &local_cell_offset) {
+// Non-wrapping fast path: plain interval intersection. Valid only when neither
+// the support nor the lane group crosses a periodic grid boundary.
+__device__ __forceinline__ SupportPlacement place_support_nowrap(
+    int support_start, int lane_group_start, int group_size) {
   const int intersection_begin = max(support_start, lane_group_start);
   const int intersection_end =
       min(support_start + WIDTH, lane_group_start + group_size);
-  group_cell_count = max(intersection_end - intersection_begin, 0);
-  support_coefficient_offset = intersection_begin - support_start;
-  local_cell_offset = intersection_begin - lane_group_start;
+  SupportPlacement placement;
+  placement.cell_count = max(intersection_end - intersection_begin, 0);
+  placement.coefficient_offset = intersection_begin - support_start;
+  placement.local_cell_offset = intersection_begin - lane_group_start;
+  return placement;
 }
 
-// Periodic tap index of grid cell `cell` in the support of a source that starts
-// at `support_start`, or -1 when the support does not reach the cell.
-//
-// fold_rescale returns [0, grid_size), so support_start = ceil(folded -
-// ceil(WIDTH / 2)) is in [-ceil(WIDTH / 2), grid_size - ceil(WIDTH / 2)]. This
-// is only called for cells in [0, grid_size), so cell - support_start is in
-// (-grid_size, 2 * grid_size) and one conditional add plus one conditional
-// subtract reduce it to [0, grid_size) with no loop and no division. Grid sizes
-// are at least WIDTH, so at most one tap matches. The one-period bound needs a
-// per-cell reference point, which is why the window path above (whose lane
-// group can sit near the far edge of the grid) uses the multi-period loop in
-// place_support instead.
-__device__ __forceinline__ int periodic_tap_index(int cell, int support_start,
-                                                  int grid_size) {
-  int offset = cell - support_start;
-  offset += (offset < 0) ? grid_size : 0;
-  offset -= (offset >= grid_size) ? grid_size : 0;
-  return offset < WIDTH ? offset : -1;
+// Kernel value at group-local cell `local` of a placement window. The window
+// base is coefficient_offset - local_cell_offset, so cells outside the covered
+// run fall before index 0 or past the six staged values and read as zero. The
+// bounds check replaces the old padded coefficient rows.
+__device__ __forceinline__ float window_value(const float *kernel, int base,
+                                              int local) {
+  const int index = base + local;
+  return (index >= 0 && index < WIDTH) ? kernel[index] : 0.0f;
 }
 
 // The output region owned by one warp, clipped to the fine grid. nx, ny, nz are
@@ -328,8 +255,7 @@ struct CellAccumulator {
 __device__ __forceinline__ void accumulate_cell_group(
     CellAccumulator &acc, const float (&x_kernel_values)[LANE_CELLS_X],
     const float (&y_kernel_values)[LANE_CELLS_Y],
-    const float (&z_kernel_values)[LANE_CELLS_Z], float strength_real,
-    float strength_imag) {
+    const float (&z_kernel_values)[LANE_CELLS_Z], float2 strength) {
   float xy_weights[LANE_CELLS_X][LANE_CELLS_Y];
   #pragma unroll
   for (int lx = 0; lx < LANE_CELLS_X; ++lx)
@@ -339,12 +265,12 @@ __device__ __forceinline__ void accumulate_cell_group(
 
   // Scale z by the source strength once per lane group, so each of the 16 cell
   // updates is a single FMA per component instead of a strength * xy * z
-  // multiply. exp_a keeps the z coefficients raw and scales here as well.
+  // multiply.
   float2 strength_scaled_z[LANE_CELLS_Z];
   #pragma unroll
   for (int lz = 0; lz < LANE_CELLS_Z; ++lz)
-    strength_scaled_z[lz] = make_float2(strength_real * z_kernel_values[lz],
-                                        strength_imag * z_kernel_values[lz]);
+    strength_scaled_z[lz] = make_float2(strength.x * z_kernel_values[lz],
+                                        strength.y * z_kernel_values[lz]);
 
   #pragma unroll
   for (int lx = 0; lx < LANE_CELLS_X; ++lx)
@@ -357,174 +283,125 @@ __device__ __forceinline__ void accumulate_cell_group(
       }
 }
 
-// Accumulate one staged source into this lane's cell group with exp_a's window
-// reads: support placement, then six-plus-six-plus-six kernel coefficients
-// loaded as three contiguous runs (six shared loads per dimension, each a warp
-// broadcast). Kept out of line so the scan can issue two sources back to back
-// and overlap their shared loads (ILP).
-//
-// The window reads hold the covered cells as one contiguous interval of the lane
-// group. That needs grid_size > WIDTH + LANE_CELLS - 2: at or below that, the
-// support can cover a group prefix and a group suffix at the same time (at
-// grid_size == WIDTH it tiles the whole period), and one dynamic coefficient
-// base cannot express the rotation. Such degenerate grids take
-// scan_one_staged_point_periodic below.
-template <bool SUPPORTS_DO_NOT_WRAP>
-__device__ __forceinline__ void scan_one_staged_point(
-    const float *__restrict__ staged_point, Grid grid, int lane_group_x_start,
-    int lane_group_y_start, int lane_group_z_start, CellAccumulator &acc) {
-  // Support starts were written as int bits by prepare_two_coefficients. The
-  // record stride is 120 bytes, a multiple of 8, so this int2 load is aligned.
-  const int2 support_start_xy = *reinterpret_cast<const int2 *>(staged_point);
-  const int support_start_z = reinterpret_cast<const int *>(staged_point)[2];
-  const float strength_real = staged_point[STRENGTH_SLOT];
-  const float strength_imag = staged_point[STRENGTH_SLOT + 1];
+// Shared per-source accumulation for the two window paths. The support covers a
+// contiguous run of cells on each axis; if any axis covers none of this lane
+// group, the whole 2x2x4 contribution is zero, so return before any shared load
+// or FMA. This is the coverage early-out that the per-cell tap scan lacked.
+__device__ __forceinline__ void accumulate_staged_source(
+    CellAccumulator &acc, const StagedSource &staged, SupportPlacement x,
+    SupportPlacement y, SupportPlacement z) {
+  if (x.cell_count == 0 || y.cell_count == 0 || z.cell_count == 0) return;
 
-  int group_cell_count_x, support_coefficient_offset_x, local_cell_offset_x;
-  int group_cell_count_y, support_coefficient_offset_y, local_cell_offset_y;
-  int group_cell_count_z, support_coefficient_offset_z, local_cell_offset_z;
-  if constexpr (SUPPORTS_DO_NOT_WRAP) {
-    place_support_nowrap(support_start_xy.x, lane_group_x_start, LANE_CELLS_X,
-                         group_cell_count_x, support_coefficient_offset_x,
-                         local_cell_offset_x);
-    place_support_nowrap(support_start_xy.y, lane_group_y_start, LANE_CELLS_Y,
-                         group_cell_count_y, support_coefficient_offset_y,
-                         local_cell_offset_y);
-    place_support_nowrap(support_start_z, lane_group_z_start, LANE_CELLS_Z,
-                         group_cell_count_z, support_coefficient_offset_z,
-                         local_cell_offset_z);
-  } else {
-    place_support(support_start_xy.x, grid.nx, lane_group_x_start, LANE_CELLS_X,
-                  group_cell_count_x, support_coefficient_offset_x,
-                  local_cell_offset_x);
-    place_support(support_start_xy.y, grid.ny, lane_group_y_start, LANE_CELLS_Y,
-                  group_cell_count_y, support_coefficient_offset_y,
-                  local_cell_offset_y);
-    place_support(support_start_z, grid.nz, lane_group_z_start, LANE_CELLS_Z,
-                  group_cell_count_z, support_coefficient_offset_z,
-                  local_cell_offset_z);
-  }
-  if (!(group_cell_count_x && group_cell_count_y && group_cell_count_z)) return;
-
-  // x has a single pad (slot 11 serves as the y pre-pad), so its two values use
-  // selects instead of a shifted base.
-  const float x_kernel_value_0 =
-      staged_point[X_COEFFICIENT_SLOT + support_coefficient_offset_x];
-  const float x_kernel_value_1 =
-      staged_point[X_COEFFICIENT_SLOT + 1 + support_coefficient_offset_x];
-  const float x_kernel_values[LANE_CELLS_X] = {
-      (local_cell_offset_x == 0) ? x_kernel_value_0 : 0.f,
-      (local_cell_offset_x == 0) ? x_kernel_value_1 : x_kernel_value_0};
-  // y needs no pre-pad beyond slot 11, so one shifted base gives both values.
-  const int y_coefficient_base =
-      Y_COEFFICIENT_SLOT + support_coefficient_offset_y - local_cell_offset_y;
-  const float y_kernel_values[LANE_CELLS_Y] = {staged_point[y_coefficient_base],
-                                              staged_point[y_coefficient_base + 1]};
-  // The z row has three zero pre-pads and three zero post-pads, so the
-  // coefficient for group cell local_z is simply the slot at
-  // 21 + support_coefficient_offset_z - local_cell_offset_z + local_z and the
-  // lane-group shift needs no per-value selects.
-  const int z_coefficient_base =
-      Z_COEFFICIENT_SLOT + support_coefficient_offset_z - local_cell_offset_z;
-  const float z_kernel_values[LANE_CELLS_Z] = {
-      staged_point[z_coefficient_base], staged_point[z_coefficient_base + 1],
-      staged_point[z_coefficient_base + 2], staged_point[z_coefficient_base + 3]};
-
-  accumulate_cell_group(acc, x_kernel_values, y_kernel_values, z_kernel_values,
-                        strength_real, strength_imag);
-}
-
-// Degenerate-grid scan: per-cell periodic tap placement.
-//
-// Used when a grid dimension is too short for the window reads above, i.e.
-// grid_size <= WIDTH + LANE_CELLS - 2 (x and y: 6, z: 8). Every cell then looks
-// up its own tap index instead of reading a window, so a wrapped support costs
-// selects rather than a different layout. Those grids are at most a few cells
-// wide (the bench's 6x6x6 and 6x9x13 cases), so this path is never hot; it is
-// also correct for the wide dimensions of the same launch, which is why one flag
-// selects it for the whole scan.
-__device__ __forceinline__ void scan_one_staged_point_periodic(
-    const float *__restrict__ staged_point, Grid grid, int lane_group_x_start,
-    int lane_group_y_start, int lane_group_z_start, CellAccumulator &acc) {
-  const int2 support_start_xy = *reinterpret_cast<const int2 *>(staged_point);
-  const int support_start_z = reinterpret_cast<const int *>(staged_point)[2];
-  const float strength_real = staged_point[STRENGTH_SLOT];
-  const float strength_imag = staged_point[STRENGTH_SLOT + 1];
-
-  // Per-cell taps: a cell the support does not reach keeps a zero weight.
+  // Group cell c reads kernel[base + c]; window_value zeroes the cells outside
+  // the covered run on either side.
+  const int x_base = x.coefficient_offset - x.local_cell_offset;
+  const int y_base = y.coefficient_offset - y.local_cell_offset;
+  const int z_base = z.coefficient_offset - z.local_cell_offset;
   float x_kernel_values[LANE_CELLS_X];
   float y_kernel_values[LANE_CELLS_Y];
   float z_kernel_values[LANE_CELLS_Z];
-  int covered_x = 0, covered_y = 0, covered_z = 0;
   #pragma unroll
-  for (int lx = 0; lx < LANE_CELLS_X; ++lx) {
-    const int tap = periodic_tap_index(lane_group_x_start + lx, support_start_xy.x,
-                                       grid.nx);
-    x_kernel_values[lx] =
-        (tap >= 0) ? staged_point[X_COEFFICIENT_SLOT + tap] : 0.f;
-    covered_x += (tap >= 0);
-  }
+  for (int lx = 0; lx < LANE_CELLS_X; ++lx)
+    x_kernel_values[lx] = window_value(staged.kernel[0], x_base, lx);
   #pragma unroll
-  for (int ly = 0; ly < LANE_CELLS_Y; ++ly) {
-    const int tap = periodic_tap_index(lane_group_y_start + ly, support_start_xy.y,
-                                       grid.ny);
-    y_kernel_values[ly] =
-        (tap >= 0) ? staged_point[Y_COEFFICIENT_SLOT + tap] : 0.f;
-    covered_y += (tap >= 0);
-  }
+  for (int ly = 0; ly < LANE_CELLS_Y; ++ly)
+    y_kernel_values[ly] = window_value(staged.kernel[1], y_base, ly);
   #pragma unroll
-  for (int lz = 0; lz < LANE_CELLS_Z; ++lz) {
-    const int tap =
-        periodic_tap_index(lane_group_z_start + lz, support_start_z, grid.nz);
-    z_kernel_values[lz] =
-        (tap >= 0) ? staged_point[Z_COEFFICIENT_SLOT + tap] : 0.f;
-    covered_z += (tap >= 0);
-  }
-  // A dimension the support misses entirely zeroes every cell.
-  if (!(covered_x && covered_y && covered_z)) return;
+  for (int lz = 0; lz < LANE_CELLS_Z; ++lz)
+    z_kernel_values[lz] = window_value(staged.kernel[2], z_base, lz);
 
-  accumulate_cell_group(acc, x_kernel_values, y_kernel_values, z_kernel_values,
-                        strength_real, strength_imag);
+  accumulate_cell_group(acc, x_kernel_values, y_kernel_values,
+                        z_kernel_values, staged.strength);
 }
 
-// Accumulate every staged source of the current batch. Two sources per
-// iteration let the compiler overlap their shared loads and FMAs.
-template <bool SUPPORTS_DO_NOT_WRAP, bool PERIODIC_TAPS>
-__device__ __forceinline__ void scan_staged_batch(
-    const float *staging, int staged_point_count, Grid grid,
-    int lane_group_x_start, int lane_group_y_start, int lane_group_z_start,
-    CellAccumulator &acc) {
-  int staged_point_slot = 0;
-  for (; staged_point_slot + 1 < staged_point_count; staged_point_slot += 2) {
+// General periodic window scan: three support placements against this lane
+// group, then the covered kernel values.
+__device__ __forceinline__ void scan_one_staged_source(
+    const StagedSource &staged, Grid grid, int lane_group_x_start,
+    int lane_group_y_start, int lane_group_z_start, CellAccumulator &acc) {
+  const SupportPlacement x =
+      place_support(staged.start[0], grid.nx, lane_group_x_start, LANE_CELLS_X);
+  const SupportPlacement y =
+      place_support(staged.start[1], grid.ny, lane_group_y_start, LANE_CELLS_Y);
+  const SupportPlacement z =
+      place_support(staged.start[2], grid.nz, lane_group_z_start, LANE_CELLS_Z);
+  accumulate_staged_source(acc, staged, x, y, z);
+}
+
+// Non-wrapping window scan for a batch whose supports and warp region are all
+// inside the grid. Interval intersection replaces the periodic placement.
+__device__ __forceinline__ void scan_one_staged_source_nowrap(
+    const StagedSource &staged, int lane_group_x_start, int lane_group_y_start,
+    int lane_group_z_start, CellAccumulator &acc) {
+  const SupportPlacement x =
+      place_support_nowrap(staged.start[0], lane_group_x_start, LANE_CELLS_X);
+  const SupportPlacement y =
+      place_support_nowrap(staged.start[1], lane_group_y_start, LANE_CELLS_Y);
+  const SupportPlacement z =
+      place_support_nowrap(staged.start[2], lane_group_z_start, LANE_CELLS_Z);
+  accumulate_staged_source(acc, staged, x, y, z);
+}
+
+// Hot path: general periodic support placement for every staged source.
+__device__ __forceinline__ void scan_staging_group(
+    CellAccumulator &acc, const StagedSource *__restrict__ staging, int count,
+    Grid grid, int lane_group_x_start, int lane_group_y_start,
+    int lane_group_z_start) {
+  for (int j = 0; j < count; ++j)
+    scan_one_staged_source(staging[j], grid, lane_group_x_start,
+                           lane_group_y_start, lane_group_z_start, acc);
+}
+
+// Hot path for interior batches: non-wrapping support placement.
+__device__ __forceinline__ void scan_staging_group_nowrap(
+    CellAccumulator &acc, const StagedSource *__restrict__ staging, int count,
+    int lane_group_x_start, int lane_group_y_start, int lane_group_z_start) {
+  for (int j = 0; j < count; ++j)
+    scan_one_staged_source_nowrap(staging[j], lane_group_x_start,
+                                  lane_group_y_start, lane_group_z_start, acc);
+}
+
+// Narrow-grid fallback: per-cell periodic taps. A support can cover a lane-group
+// prefix and suffix at the same time when grid_size <= WIDTH + LANE_CELLS - 2,
+// which one contiguous placement window cannot express. These grids are tiny
+// (e.g. 6x6x6), so this path is not hot.
+__device__ __forceinline__ void scan_staging_group_tap(
+    CellAccumulator &acc, const StagedSource *__restrict__ staging, int count,
+    Grid grid, int lane_group_x_start, int lane_group_y_start,
+    int lane_group_z_start) {
+  for (int j = 0; j < count; ++j) {
+    const StagedSource &staged = staging[j];
+    // Normalize each support start into one period. The staged start is in
+    // [-SUPPORT_OVERHANG, grid_size - SUPPORT_OVERHANG], so this also lets
+    // tap_value fold with a single conditional add.
+    const int start_x =
+        staged.start[0] + ((staged.start[0] < 0) ? grid.nx : 0);
+    const int start_y =
+        staged.start[1] + ((staged.start[1] < 0) ? grid.ny : 0);
+    const int start_z =
+        staged.start[2] + ((staged.start[2] < 0) ? grid.nz : 0);
+    float x_kernel_values[LANE_CELLS_X];
+    float y_kernel_values[LANE_CELLS_Y];
+    float z_kernel_values[LANE_CELLS_Z];
     #pragma unroll
-    for (int pair = 0; pair < 2; ++pair) {
-      const float *staged_point =
-          staging + (staged_point_slot + pair) * VALUES_PER_POINT;
-      if constexpr (PERIODIC_TAPS)
-        scan_one_staged_point_periodic(staged_point, grid, lane_group_x_start,
-                                       lane_group_y_start, lane_group_z_start,
-                                       acc);
-      else
-        scan_one_staged_point<SUPPORTS_DO_NOT_WRAP>(
-            staged_point, grid, lane_group_x_start, lane_group_y_start,
-            lane_group_z_start, acc);
-    }
-  }
-  if (staged_point_slot < staged_point_count) {
-    const float *staged_point = staging + staged_point_slot * VALUES_PER_POINT;
-    if constexpr (PERIODIC_TAPS)
-      scan_one_staged_point_periodic(staged_point, grid, lane_group_x_start,
-                                     lane_group_y_start, lane_group_z_start, acc);
-    else
-      scan_one_staged_point<SUPPORTS_DO_NOT_WRAP>(
-          staged_point, grid, lane_group_x_start, lane_group_y_start,
-          lane_group_z_start, acc);
+    for (int lx = 0; lx < LANE_CELLS_X; ++lx)
+      x_kernel_values[lx] = tap_value(staged.kernel[0], start_x,
+                                      lane_group_x_start + lx, grid.nx);
+    #pragma unroll
+    for (int ly = 0; ly < LANE_CELLS_Y; ++ly)
+      y_kernel_values[ly] = tap_value(staged.kernel[1], start_y,
+                                      lane_group_y_start + ly, grid.ny);
+    #pragma unroll
+    for (int lz = 0; lz < LANE_CELLS_Z; ++lz)
+      z_kernel_values[lz] = tap_value(staged.kernel[2], start_z,
+                                      lane_group_z_start + lz, grid.nz);
+    accumulate_cell_group(acc, x_kernel_values, y_kernel_values,
+                          z_kernel_values, staged.strength);
   }
 }
 
 // Write this lane's cell group, skipping cells past the clipped warp-region
-// extent. Cells outside the grid are scanned with garbage support placement and
-// are never stored.
+// extent. Cells outside the grid scan as zero weights and are never stored.
 __device__ __forceinline__ void store_cell_group(
     const CellAccumulator &acc, cuFloatComplex *output, Grid grid,
     WarpRegion region, LaneCellGroup cell_group) {
@@ -681,36 +558,6 @@ __global__ void sum_splits(const cuFloatComplex *__restrict__ partial,
   }
 }
 
-// Coefficient-staging geometry for one lane, loop-invariant over a whole launch:
-// lanes 0..26 split into three groups of nine, one group per staged source slot,
-// and within a group lane % 3 picks the kernel coefficient index while lane / 3
-// picks the dimension. Lanes 27..31 are idle during coefficient preparation but
-// still participate in every __syncwarp().
-struct StagingLane {
-  int grid_size_dimension;
-  int support_start_slot;
-  int coefficient_slot;
-  int kernel_coefficient_index;
-};
-
-__device__ __forceinline__ StagingLane make_staging_lane(int lane, Grid grid) {
-  const int coefficient_lane = lane % 9;
-  const int dimension = coefficient_lane / 3;
-  const int kernel_coefficient_index = coefficient_lane % 3;
-  const int grid_size_dimension = (dimension == 0)
-                                      ? grid.nx
-                                      : ((dimension == 1) ? grid.ny : grid.nz);
-  const int support_start_slot = SUPPORT_START_SLOT + dimension;
-  const int coefficient_slot =
-      (dimension == 0)
-          ? (X_COEFFICIENT_SLOT + kernel_coefficient_index)
-          : (dimension == 1)
-                ? (Y_COEFFICIENT_SLOT + kernel_coefficient_index)
-                : (Z_COEFFICIENT_SLOT + kernel_coefficient_index);
-  return StagingLane{grid_size_dimension, support_start_slot, coefficient_slot,
-                     kernel_coefficient_index};
-}
-
 // Scan and accumulate the sources of one warp region and store every cell of that
 // region into region_output. region_output is either the final grid (single-split
 // paths) or this split's slice of the partial grid (split path). The caller has
@@ -725,110 +572,65 @@ __device__ __forceinline__ void spread_region(
     const Point *__restrict__ points, const int *__restrict__ bin_offsets,
     Grid grid, WarpRegion region, LaneCellGroup cell_group,
     cuFloatComplex *__restrict__ region_output, int split_index, int split_count,
-    int lane, float *__restrict__ warp_staging,
-    const float (&kernel_coefficients)[9],
-    const float (*second_kernel_coefficients)[WIDTH],
-    const StagingLane &staging_lane) {
+    int lane, StagedSource *__restrict__ warp_staging) {
   const int lane_group_x_start = region.x + cell_group.x;
   const int lane_group_y_start = region.y + cell_group.y;
   const int lane_group_z_start = region.z + cell_group.z;
   // Only a fully interior warp region can use the branch-free support path. A
-  // clipped region keeps lane groups past the grid edge, whose support
-  // placement is meaningless but never stored.
+  // clipped region keeps lane groups past the grid edge, whose placement is
+  // meaningless but never stored.
   const bool warp_region_inside_grid = region.nx == WARP_REGION_X &&
                                        region.ny == WARP_REGION_Y &&
                                        region.nz == WARP_REGION_Z;
-  // A dimension whose period is at most WIDTH + LANE_CELLS - 2 makes the
-  // contiguous coefficient window ambiguous (see scan_one_staged_point_periodic).
-  // This is a whole-launch property, so it is loop-invariant and warp-uniform.
+  // A dimension at or below this width can wrap a support over both ends of the
+  // lane group, which the contiguous window placement cannot express. This is a
+  // whole-launch property, so it is loop-invariant and warp-uniform.
   const bool narrow_grid = grid.nx <= WIDTH + LANE_CELLS_X - 2 ||
                            grid.ny <= WIDTH + LANE_CELLS_Y - 2 ||
                            grid.nz <= WIDTH + LANE_CELLS_Z - 2;
 
   CellAccumulator acc = {};
 
-  // Zero the padded coefficient slots once per warp. Neither the raw pass nor the
-  // coefficient pass ever writes these slots again, so scan_one_staged_point can
-  // rely on them staying zero for the whole kernel: the x/y/z dynamic coefficient
-  // bases depend on that (a base may point at a pad when the lane group covers
-  // fewer than LANE_CELLS_* cells of the support).
-  for (int point_slot = lane; point_slot < MAX_POINTS_PER_BATCH; point_slot += 32) {
-    float *const staged_point = warp_staging + point_slot * VALUES_PER_POINT;
-    staged_point[X_Y_PAD_SLOT] = 0.f;
-    #pragma unroll
-    for (int pad = 0; pad < Z_PADDING_BEFORE; ++pad)
-      staged_point[Z_COEFFICIENT_SLOT - Z_PADDING_BEFORE + pad] = 0.f;
-    #pragma unroll
-    for (int pad = 0; pad < Z_PADDING_AFTER; ++pad)
-      staged_point[Z_COEFFICIENT_SLOT + WIDTH + pad] = 0.f;
-  }
-  __syncwarp();
-
-  const int point_batch_stride = split_count * MAX_POINTS_PER_BATCH;
-
+  const int staging_group_stride = split_count * STAGING_GROUP_SIZE;
   SourceRangeCursor cursor(region, grid, bin_offsets);
   int begin, end;
   while (cursor.next(begin, end)) {
-    for (int first_point_index = begin + split_index * MAX_POINTS_PER_BATCH;
-         first_point_index < end; first_point_index += point_batch_stride) {
-      const int staged_point_count =
-          min(MAX_POINTS_PER_BATCH, end - first_point_index);
-      stage_raw_points(points, first_point_index, staged_point_count, lane,
-                       warp_staging);
+    for (int base = begin + split_index * STAGING_GROUP_SIZE; base < end;
+         base += staging_group_stride) {
+      const int count = min(STAGING_GROUP_SIZE, end - base);
+      stage_sources(warp_staging, points, base, count, lane, grid);
       __syncwarp();
-
-      // Coefficient pass: nine lanes per source rewrite the three support starts
-      // in place as ints and evaluate the source's 18 kernel coefficients.
-      if (lane < 27) {
-        const int point_slot = lane / 9;
-        float *staged_point = warp_staging + point_slot * VALUES_PER_POINT;
-        for (int slot = point_slot; slot < staged_point_count;
-             slot += 3, staged_point += 3 * VALUES_PER_POINT)
-          prepare_two_coefficients(
-              staged_point, staging_lane.grid_size_dimension,
-              staging_lane.support_start_slot, staging_lane.coefficient_slot,
-              staging_lane.kernel_coefficient_index + 3, kernel_coefficients,
-              second_kernel_coefficients);
-      }
-      __syncwarp();
-
-      // One warp-wide decision per batch: when the warp region is interior and
-      // every staged source has a non-wrapping support, the whole batch uses the
-      // branch-free min/max support path; otherwise it uses the general periodic
-      // path. The vote runs for all lanes, including lanes past count.
+      // One warp-wide vote per staging group: if the region is interior and every
+      // staged support is inside the grid, use non-wrapping placement for the
+      // whole batch. Lanes past count vote true, and all lanes join the vote, so
+      // the decision is uniform across the warp.
       bool support_inside_grid = true;
-      if (lane < staged_point_count) {
-        const int *const support_start_bits =
-            reinterpret_cast<const int *>(warp_staging + lane * VALUES_PER_POINT);
-        const int support_start_x = support_start_bits[SUPPORT_START_SLOT];
-        const int support_start_y = support_start_bits[SUPPORT_START_SLOT + 1];
-        const int support_start_z = support_start_bits[SUPPORT_START_SLOT + 2];
+      if (lane < count) {
+        const StagedSource &staged = warp_staging[lane];
         support_inside_grid =
-            support_start_x >= 0 && support_start_y >= 0 && support_start_z >= 0 &&
-            support_start_x + WIDTH <= grid.nx &&
-            support_start_y + WIDTH <= grid.ny &&
-            support_start_z + WIDTH <= grid.nz;
+            staged.start[0] >= 0 && staged.start[1] >= 0 &&
+            staged.start[2] >= 0 &&
+            staged.start[0] + WIDTH <= grid.nx &&
+            staged.start[1] + WIDTH <= grid.ny &&
+            staged.start[2] + WIDTH <= grid.nz;
       }
-      const bool whole_batch_nonwrapping =
-          warp_region_inside_grid && __all_sync(0xffffffff, support_inside_grid);
+      const bool whole_group_nonwrapping =
+          warp_region_inside_grid &&
+          __all_sync(0xffffffffu, support_inside_grid);
 
       if (narrow_grid) {
-        // Degenerate narrow dimension: per-cell periodic tap placement. Checked
-        // first because a narrow z dimension can still be fully interior.
-        scan_staged_batch<false, true>(warp_staging, staged_point_count, grid,
-                                       lane_group_x_start, lane_group_y_start,
-                                       lane_group_z_start, acc);
-      } else if (whole_batch_nonwrapping) {
-        scan_staged_batch<true, false>(warp_staging, staged_point_count, grid,
-                                       lane_group_x_start, lane_group_y_start,
-                                       lane_group_z_start, acc);
+        scan_staging_group_tap(acc, warp_staging, count, grid,
+                               lane_group_x_start, lane_group_y_start,
+                               lane_group_z_start);
+      } else if (whole_group_nonwrapping) {
+        scan_staging_group_nowrap(acc, warp_staging, count, lane_group_x_start,
+                                  lane_group_y_start, lane_group_z_start);
       } else {
-        scan_staged_batch<false, false>(warp_staging, staged_point_count, grid,
-                                        lane_group_x_start, lane_group_y_start,
-                                        lane_group_z_start, acc);
+        scan_staging_group(acc, warp_staging, count, grid, lane_group_x_start,
+                           lane_group_y_start, lane_group_z_start);
       }
       // Staging invariant: every lane finishes reading the single shared buffer
-      // before the next batch overwrites slots 0..26 of its records.
+      // before the next staging group overwrites it.
       __syncwarp();
     }
   }
@@ -849,36 +651,13 @@ __global__ __launch_bounds__(THREADS_PER_THREADBLOCK, MIN_THREADBLOCKS_PER_SM)
 void spread(const Point *points, const int *bin_offsets, Grid grid,
             cuFloatComplex *output, const int *active_regions, int split_count,
             int work_count) {
-  // One single-buffered staging group per warp: MAX_POINTS_PER_BATCH 30-float
-  // staged-source records plus the shared coefficient copy. The buffer is
-  // 16-byte aligned so the 120-byte record stride keeps the int2 support-start
-  // load aligned.
-  __shared__ __align__(16) float staged_point_values[WARPS_PER_THREADBLOCK]
-                                                     [MAX_POINTS_PER_BATCH]
-                                                     [VALUES_PER_POINT];
-  __shared__ float second_kernel_coefficients[9][WIDTH];
+  // One single-buffered staging group per warp. Each work item owns one warp
+  // region, so the buffer is warp-private and needs only __syncwarp().
+  __shared__ __align__(16) StagedSource staging[WARPS_PER_THREADBLOCK]
+                                                 [STAGING_GROUP_SIZE];
 
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
-  const StagingLane staging_lane = make_staging_lane(lane, grid);
-
-  float kernel_coefficients[9] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  if (lane < 27) {
-    #pragma unroll
-    for (int kernel_term = 0; kernel_term < 9; kernel_term++)
-      kernel_coefficients[kernel_term] =
-          KERNEL_COEFFICIENT_TABLE[kernel_term]
-                                  [staging_lane.kernel_coefficient_index];
-  }
-  for (int table_entry = threadIdx.x; table_entry < 9 * WIDTH;
-       table_entry += blockDim.x)
-    second_kernel_coefficients[table_entry / WIDTH][table_entry % WIDTH] =
-        KERNEL_COEFFICIENT_TABLE[table_entry / WIDTH][table_entry % WIDTH];
-  // The only threadblock-wide barrier in the kernel: it makes the shared
-  // coefficient copy complete for every warp. It runs before the work-item
-  // bounds check below, so no warp can miss it. Everything after it is
-  // warp-local, so the early returns cannot strand a threadblock barrier.
-  __syncthreads();
 
   const int work_id = int(blockIdx.x) * WARPS_PER_THREADBLOCK + warp;
   if (work_id >= work_count) return;
@@ -905,8 +684,7 @@ void spread(const Point *points, const int *bin_offsets, Grid grid,
 
   spread_region(points, bin_offsets, grid, region, lane_cell_group(lane),
                 region_output, split_index, split_count, lane,
-                &staged_point_values[warp][0][0], kernel_coefficients,
-                second_kernel_coefficients, staging_lane);
+                &staging[warp][0]);
 }
 
 }  // namespace
@@ -949,9 +727,9 @@ void launch_spread(const Point *points, const int *bin_offsets, Grid grid,
                         cudaMemcpyDeviceToHost),
              "cudaMemcpy(active_count)");
 
-  // exp_a's split heuristic: aim for about 2048 work items when few regions are
-  // active (clustered and dense inputs), otherwise 512, and never exceed 32.
-  // Uniform and sparse inputs stay at split_count == 1.
+  // Split heuristic: aim for about 2048 work items when few regions are active
+  // (clustered and dense inputs), otherwise 512, and never exceed 32. Uniform
+  // and sparse inputs stay at split_count == 1.
   const int split_target = host_active_count < 512 ? 2048 : 512;
   int split_count = 1;
   while (split_count < 32 && host_active_count * split_count < split_target)
