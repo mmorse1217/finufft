@@ -25,6 +25,9 @@
 namespace atomic_free_spread {
 namespace {
 
+// Align float rows for vector loads; padding spreads cells across bank groups.
+constexpr int WEIGHT_STRIDE = STAGE_POINTS + 4;
+
 // A flattened Cartesian bin ID, with x varying fastest.
 __global__ void assign_bins(const Point *points, int count, Grid grid, int *bin_ids) {
   using cufinufft::spreadinterp::fold_rescale;
@@ -36,15 +39,15 @@ __global__ void assign_bins(const Point *points, int count, Grid grid, int *bin_
   bin_ids[i] = bx + grid.bins_x * (by + grid.bins_y * bz);
 }
 
-// Fill dest[0..COUNT) with the weights for cells tile_begin + local. The row is
-// zero outside the source support.
+// Fill dest[local][point] for cells tile_begin + local, zero outside the support.
 template<int COUNT>
-__device__ __forceinline__ void stage_tile_weights(float *dest, int tile_begin,
+__device__ __forceinline__ void stage_tile_weights(float (*dest)[WEIGHT_STRIDE],
+                                                   int point, int tile_begin,
                                                    int start, int fine_size,
                                                    const float *ker) {
   #pragma unroll
   for (int local = 0; local < COUNT; ++local)
-    dest[local] = 0.0f;
+    dest[local][point] = 0.0f;
 
   // start is in [-HALO, fine_size - HALO]; one add normalizes it.
   start += (start < 0) ? fine_size : 0;
@@ -55,19 +58,20 @@ __device__ __forceinline__ void stage_tile_weights(float *dest, int tile_begin,
     cell -= (cell >= fine_size) ? fine_size : 0;
     const int local = cell - tile_begin;
     if (local >= 0 && local < COUNT)
-      dest[local] = ker[k];
+      dest[local][point] = ker[k];
   }
 }
 
 // Same, pre-scaled by the point strength, for the dimension the cell loop reads
 // as one float2 instead of loading the strength separately.
 template<int COUNT>
-__device__ __forceinline__ void stage_tile_weights(float2 *dest, int tile_begin,
+__device__ __forceinline__ void stage_tile_weights(float2 (*dest)[STAGE_POINTS],
+                                                   int point, int tile_begin,
                                                    int start, int fine_size,
                                                    const float *ker, float2 strength) {
   #pragma unroll
   for (int local = 0; local < COUNT; ++local)
-    dest[local] = make_float2(0.0f, 0.0f);
+    dest[local][point] = make_float2(0.0f, 0.0f);
 
   start += (start < 0) ? fine_size : 0;
 
@@ -77,7 +81,7 @@ __device__ __forceinline__ void stage_tile_weights(float2 *dest, int tile_begin,
     cell -= (cell >= fine_size) ? fine_size : 0;
     const int local = cell - tile_begin;
     if (local >= 0 && local < COUNT)
-      dest[local] = make_float2(ker[k] * strength.x, ker[k] * strength.y);
+      dest[local][point] = make_float2(ker[k] * strength.x, ker[k] * strength.y);
   }
 }
 
@@ -85,8 +89,8 @@ __device__ __forceinline__ void stage_tile_weights(float2 *dest, int tile_begin,
 // group's z cells and each z value serves its x cells, so a point costs
 // GROUP_X + GROUP_Y + GROUP_Z shared loads for GROUP_X * GROUP_Y * GROUP_Z cells.
 __device__ __forceinline__ void accumulate_batch(
-    const float (*kx)[TILE_X + 1], const float (*ky)[TILE_Y + 1],
-    const float2 (*kz)[TILE_Z + 1], int staged, int x0, int y0, int z0,
+    const float (*kx)[WEIGHT_STRIDE], const float (*ky)[WEIGHT_STRIDE],
+    const float2 (*kz)[STAGE_POINTS], int staged, int x0, int y0, int z0,
     float2 (&acc)[GROUP_X][GROUP_Y][GROUP_Z]) {
   for (int j = 0; j < staged; ++j) {
     float weight[GROUP_X][GROUP_Y];
@@ -94,11 +98,11 @@ __device__ __forceinline__ void accumulate_batch(
     for (int gx = 0; gx < GROUP_X; ++gx)
       #pragma unroll
       for (int gy = 0; gy < GROUP_Y; ++gy)
-        weight[gx][gy] = kx[j][x0 + gx] * ky[j][y0 + gy];
+        weight[gx][gy] = kx[x0 + gx][j] * ky[y0 + gy][j];
 
     float2 z[GROUP_Z];
     #pragma unroll
-    for (int gz = 0; gz < GROUP_Z; ++gz) z[gz] = kz[j][z0 + gz];
+    for (int gz = 0; gz < GROUP_Z; ++gz) z[gz] = kz[z0 + gz][j];
 
     #pragma unroll
     for (int gx = 0; gx < GROUP_X; ++gx)
@@ -159,14 +163,12 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
     z_bins = detail::near_bins(tile_z, end_z, grid.bin_size, grid.nz, grid.bins_z);
   }
 
-  // Staged weights for one batch: kx[j][local] and ky[j][local] are the weights
-  // of staged point j for cell tile_x + local (likewise y), and kz[j][local] is
-  // the z weight already multiplied by the point strength. Rows are padded to an
-  // odd number of floats so that the staging lanes, which write one `local` of
-  // many consecutive points at once, hit distinct shared-memory banks.
-  __shared__ float kx[STAGE_POINTS][TILE_X + 1];
-  __shared__ float ky[STAGE_POINTS][TILE_Y + 1];
-  __shared__ float2 kz[STAGE_POINTS][TILE_Z + 1];
+  // Keep consecutive points contiguous so the scan can use vector loads.
+  // kx[local][j] is point j's weight for tile_x + local (likewise y); kz also
+  // includes the strength. Only x/y need padding: z reads are warp broadcasts.
+  __shared__ __align__(16) float kx[TILE_X][WEIGHT_STRIDE];
+  __shared__ __align__(16) float ky[TILE_Y][WEIGHT_STRIDE];
+  __shared__ __align__(16) float2 kz[TILE_Z][STAGE_POINTS];
   __syncthreads();
 
   const int linear_tid =
@@ -213,11 +215,11 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
             float ker[WIDTH];
             eval_kernel_vec_horner<float, WIDTH>(ker, float(start) - rescaled, 2.0);
             if (stage_dim == 0) {
-              stage_tile_weights<TILE_X>(kx[stage_point], tile_x, start, grid.nx, ker);
+              stage_tile_weights<TILE_X>(kx, stage_point, tile_x, start, grid.nx, ker);
             } else if (stage_dim == 1) {
-              stage_tile_weights<TILE_Y>(ky[stage_point], tile_y, start, grid.ny, ker);
+              stage_tile_weights<TILE_Y>(ky, stage_point, tile_y, start, grid.ny, ker);
             } else {
-              stage_tile_weights<TILE_Z>(kz[stage_point], tile_z, start, grid.nz, ker,
+              stage_tile_weights<TILE_Z>(kz, stage_point, tile_z, start, grid.nz, ker,
                                          make_float2(p.strength.x, p.strength.y));
             }
           }
