@@ -184,15 +184,23 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
 
   for (int z_bin_index = 0; z_bin_index < z_bins.count; ++z_bin_index) {
     const int bz = z_bins[z_bin_index];
+    // Skip accumulation when a bin's periodic support misses this warp's z slice.
+    int dz = tile_z + z0 - bz * grid.bin_size;
+    if (dz + GROUP_Z <= -HALO) dz += grid.nz;
+    if (dz + GROUP_Z > grid.nz - HALO) dz -= grid.nz;
+    const bool covered_z = dz < min(grid.bin_size, grid.nz - bz * grid.bin_size) + HALO;
     for (int y_bin_index = 0; y_bin_index < y_bins.count; ++y_bin_index) {
       const int by = y_bins[y_bin_index];
-      for (int x_bin_index = 0; x_bin_index < x_bins.count; ++x_bin_index) {
+      for (int x_bin_index = 0; x_bin_index < x_bins.count;) {
         const int bx = x_bins[x_bin_index];
+        // Adjacent x bins form one contiguous point range; stop at the seam.
+        const int run = min(x_bins.count - x_bin_index, grid.bins_x - bx);
+        x_bin_index += run;
         const int bin = bx + grid.bins_x * (by + grid.bins_y * bz);
         const int bin_begin = bin_offsets[bin];
-        const int bin_end = bin_offsets[bin + 1];
+        const int bin_end = bin_offsets[bin + run];
         // This loop carries the block's barriers, so every thread must run it;
-        // only the staging body is conditional.
+        // only staging and accumulation are conditional.
         for (int base = bin_begin; base < bin_end; base += STAGE_POINTS) {
           const int staged = min(STAGE_POINTS, bin_end - base);
           if (is_stager && stage_point < staged) {
@@ -214,7 +222,7 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
             }
           }
           __syncthreads();
-          accumulate_batch(kx, ky, kz, staged, x0, y0, z0, acc);
+          if (covered_z) accumulate_batch(kx, ky, kz, staged, x0, y0, z0, acc);
           __syncthreads();
         }
       }
