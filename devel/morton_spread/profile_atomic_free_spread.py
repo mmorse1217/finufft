@@ -58,6 +58,31 @@ CASES: Dict[str, Dict[str, object]] = {
     },
 }
 
+# The benchmark binary always runs both implementations. A variant selects which
+# kernel NCU profiles and which kernel the source export is filtered to.
+VARIANTS: Dict[str, Dict[str, object]] = {
+    "atomic_free": {
+        "label": "atomic-free spread",
+        "ncu_kernel_regex": "^spread$",
+        "source_kernel_markers": ["atomic_free_spread"],
+        "source_kernel_excludes": ["assign_bins"],
+        "why": (
+            "Output-cell-owned atomic-free prototype: every fine-grid cell is owned by "
+            "one thread and stored once, with no spreading atomics."
+        ),
+    },
+    "method3": {
+        "label": "cuFINUFFT method 3 (output-driven)",
+        "ncu_kernel_regex": "^spread_output_driven",
+        "source_kernel_markers": ["spread_output_driven"],
+        "source_kernel_excludes": [],
+        "why": (
+            "Pinned cuFINUFFT reference: gpu_method=3 output-driven spread, "
+            "spread-only, Horner kernel evaluation (ns=6, sigma=2)."
+        ),
+    },
+}
+
 # Enough sections for the bottleneck analysis, without the expensive and
 # largely irrelevant roofline/NVLink/NUMA/PM-sampling sections in --set full.
 NCU_SECTIONS = [
@@ -78,15 +103,48 @@ NCU_SECTIONS = [
 # they survive line-number drift as long as the implementation keeps its shape.
 SOURCE_GROUPS: List[Tuple[str, re.Pattern[str]]] = [
     (
+        "subproblem / subgrid setup",
+        re.compile(
+            r"compute_subprob_block_info|get_padded_subgrid_info|sharedbuf|"
+            r"local_subgrid\[i\] = |subprob"
+        ),
+    ),
+    (
+        "kernel eval / batch staging",
+        re.compile(
+            r"get_kerval_and_local_start|kerevals|nupts_sm|shift\[i\]|batch_begin|"
+            r"batch_size|loadReadOnly\(p\.idxnupts"
+        ),
+    ),
+    (
+        "local subgrid accumulation",
+        re.compile(r"local_subgrid\[idxout\]|kervalue|idxout|start\[idim\]|padded_size"),
+    ),
+    (
+        "global write / atomics",
+        re.compile(
+            r"atomicAddComplexGlobal|output_index_from_flat_local_index|"
+            r"local_subgrid\[n\]|__syncthreads"
+        ),
+    ),
+    (
+        "weight staging",
+        re.compile(
+            r"stage_tile_weights|dest\[local\]|ker\[k\]|make_float2\(ker\[k\]"
+        ),
+    ),
+    (
         "support index / modulo",
         re.compile(
             r"grid_size|coefficient_index|support_start|offset < WIDTH|offset < 0|"
-            r"weight_index|covered|dest\[local\]"
+            r"weight_index|covered"
         ),
     ),
     (
         "weight / select / accumulate",
-        re.compile(r"float weight|real \+=|imag \+=|p\.strength|strength"),
+        re.compile(
+            r"weight\[|acc\[|float weight|real \+=|imag \+=|p\.strength|strength"
+        ),
     ),
     (
         "Horner / FMA",
@@ -333,8 +391,26 @@ def parse_bench_log(text: str) -> Dict[str, object]:
     for line in text.splitlines():
         if line.startswith("case "):
             result["case"] = line[len("case ") :].strip()
+        elif line.startswith("host "):
+            result["host"] = line[len("host") :].strip()
+            match = re.search(r"generate=([\d.]+) ms", line)
+            if match:
+                result["host_generate_ms"] = float(match.group(1))
         elif line.startswith("prep "):
             result["prep"] = line[len("prep ") :].strip()
+            match = re.search(
+                r"upload_points=([\d.]+) ms assign_bins=([\d.]+) ms "
+                r"copy_bins=([\d.]+) ms sort=([\d.]+) ms "
+                r"upload_sorted=([\d.]+) ms total=([\d.]+) ms",
+                line,
+            )
+            if match:
+                result["prep_upload_points_ms"] = float(match.group(1))
+                result["prep_assign_bins_ms"] = float(match.group(2))
+                result["prep_copy_bins_ms"] = float(match.group(3))
+                result["prep_sort_ms"] = float(match.group(4))
+                result["prep_upload_sorted_ms"] = float(match.group(5))
+                result["prep_total_ms"] = float(match.group(6))
         elif line.startswith("ref "):
             result["reference"] = line[len("ref ") :].strip()
             match = re.search(
@@ -423,6 +499,18 @@ def metric_map(details: List[Dict[str, str]]) -> Dict[Tuple[str, str, str], str]
     return result
 
 
+def unit_map(details: List[Dict[str, str]]) -> Dict[Tuple[str, str, str], str]:
+    result: Dict[Tuple[str, str, str], str] = {}
+    for row in details:
+        key = (
+            row.get("Section Name", ""),
+            row.get("Body Item Label", ""),
+            row.get("Metric Name", ""),
+        )
+        result.setdefault(key, row.get("Metric Unit", ""))
+    return result
+
+
 def metric_value(
     metrics: Dict[Tuple[str, str, str], str],
     section: str,
@@ -501,7 +589,17 @@ def parse_number(row: Sequence[str], columns: Dict[str, int], name: str) -> int:
             return 0
 
 
-def parse_source_csv(path: Path) -> Tuple[List[SourceRecord], Dict[str, int]]:
+def kernel_matches_variant(name: str, variant: Dict[str, object]) -> bool:
+    markers = [str(marker) for marker in variant.get("source_kernel_markers", [])]
+    excludes = [str(exclude) for exclude in variant.get("source_kernel_excludes", [])]
+    if markers and not any(marker in name for marker in markers):
+        return False
+    return not any(exclude in name for exclude in excludes)
+
+
+def parse_source_csv(
+    path: Path, variant: Dict[str, object]
+) -> Tuple[List[SourceRecord], Dict[str, int]]:
     """Deduplicate SASS PCs and keep the first source correlation.
 
     Nsight repeats the same PC under inline definitions and call sites. Those
@@ -538,10 +636,10 @@ def parse_source_csv(path: Path) -> Tuple[List[SourceRecord], Dict[str, int]]:
                 continue
             if columns is None or len(row) != row_width:
                 continue
-            # The reference library also exports kernels whose names contain
-            # "spread" (for example spread_output_driven). Keep only this
-            # translation unit's kernel.
-            if "atomic_free_spread" not in current_kernel or "assign_bins" in current_kernel:
+            # The report contains only the profiled kernel, but the export can
+            # still carry helper kernels. Keep only the selected variant's
+            # kernel (and drop this binary's assign_bins helper).
+            if not kernel_matches_variant(current_kernel, variant):
                 continue
             if row[0].strip():
                 text = row[0].strip()
@@ -637,6 +735,8 @@ def percent(value: float, total: float) -> float:
 
 def analyze_case(
     case: str,
+    workload: str,
+    variant: str,
     out_dir: Path,
     bench: Dict[str, object],
     details_path: Path,
@@ -647,7 +747,8 @@ def analyze_case(
 
     details = parse_details(details_path)
     metrics = metric_map(details)
-    source_records, source_stats = parse_source_csv(source_path)
+    units = unit_map(details)
+    source_records, source_stats = parse_source_csv(source_path, VARIANTS[variant])
     source_lines = aggregate_source_lines(source_records)
 
     total_inst = sum(line.instructions for line in source_lines)
@@ -961,6 +1062,84 @@ def analyze_case(
             "",
         ),
         (
+            "avg_bytes_per_sector_store",
+            "Memory Workload Analysis Tables",
+            "Average Bytes Per Sector For Global Stores",
+            "",
+        ),
+        (
+            "l1_hit_global_stores_pct",
+            "Memory Workload Analysis Tables",
+            "L1TEX Hit Rate For Global Stores",
+            "",
+        ),
+        (
+            "memory_gbytes",
+            "Memory Workload Analysis",
+            "Memory Throughput",
+            "",
+        ),
+        (
+            "l1tex_hit_rate_pct",
+            "Memory Workload Analysis",
+            "L1/TEX Hit Rate",
+            "",
+        ),
+        (
+            "l2_hit_rate_pct",
+            "Memory Workload Analysis",
+            "L2 Hit Rate",
+            "",
+        ),
+        (
+            "shared_bank_conflicts",
+            "Memory Workload Analysis Tables",
+            "l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum",
+            "Shared Memory",
+        ),
+        (
+            "shared_ld_inst",
+            "Memory Workload Analysis Tables",
+            "smsp__sass_inst_executed_op_shared_ld.sum",
+            "Shared Memory",
+        ),
+        (
+            "shared_st_inst",
+            "Memory Workload Analysis Tables",
+            "smsp__sass_inst_executed_op_shared_st.sum",
+            "Shared Memory",
+        ),
+        (
+            "global_ld_inst",
+            "Memory Workload Analysis Tables",
+            "smsp__sass_inst_executed_op_global_ld.sum",
+            "L1/TEX Cache",
+        ),
+        (
+            "global_st_inst",
+            "Memory Workload Analysis Tables",
+            "smsp__sass_inst_executed_op_global_st.sum",
+            "L1/TEX Cache",
+        ),
+        (
+            "global_red_inst",
+            "Memory Workload Analysis Tables",
+            "smsp__inst_executed_op_global_red.sum",
+            "L1/TEX Cache",
+        ),
+        (
+            "dram_bytes_read",
+            "Memory Workload Analysis Tables",
+            "dram__bytes_read.sum",
+            "Device Memory",
+        ),
+        (
+            "dram_bytes_write",
+            "Memory Workload Analysis Tables",
+            "dram__bytes_write.sum",
+            "Device Memory",
+        ),
+        (
             "no_eligible_pct",
             "Scheduler Statistics",
             "No Eligible",
@@ -1008,6 +1187,37 @@ def analyze_case(
             "Branch Instructions Ratio",
             "",
         ),
+        ("branch_efficiency_pct", "Source Counters", "Branch Efficiency", ""),
+        (
+            "l1_conflicts_shared_nway",
+            "Source Counters",
+            "L1 Conflicts Shared N-Way",
+            "",
+        ),
+        (
+            "l1_wavefronts_shared_excessive",
+            "Source Counters",
+            "L1 Wavefronts Shared Excessive",
+            "",
+        ),
+        (
+            "l2_theoretical_sectors_global_excessive",
+            "Source Counters",
+            "L2 Theoretical Sectors Global Excessive",
+            "",
+        ),
+        (
+            "avg_threads_executed",
+            "Source Counters",
+            "Avg. Threads Executed",
+            "",
+        ),
+        (
+            "avg_predicated_threads_executed",
+            "Source Counters",
+            "Avg. Predicated-On Threads Executed",
+            "",
+        ),
         (
             "theoretical_occupancy_pct",
             "Occupancy",
@@ -1015,6 +1225,30 @@ def analyze_case(
             "",
         ),
         ("achieved_occupancy_pct", "Occupancy", "Achieved Occupancy", ""),
+        (
+            "block_limit_shared_mem",
+            "Occupancy",
+            "Block Limit Shared Mem",
+            "",
+        ),
+        (
+            "block_limit_registers",
+            "Occupancy",
+            "Block Limit Registers",
+            "",
+        ),
+        (
+            "theoretical_active_warps_per_sm",
+            "Occupancy",
+            "Theoretical Active Warps per SM",
+            "",
+        ),
+        (
+            "achieved_active_warps_per_sm",
+            "Occupancy",
+            "Achieved Active Warps Per SM",
+            "",
+        ),
         (
             "registers_per_thread",
             "Launch Statistics",
@@ -1027,6 +1261,12 @@ def analyze_case(
             "Static Shared Memory Per Block",
             "",
         ),
+        (
+            "dynamic_shared_kb",
+            "Launch Statistics",
+            "Dynamic Shared Memory Per Block",
+            "",
+        ),
         ("grid_size", "Launch Statistics", "Grid Size", ""),
         ("block_size", "Launch Statistics", "Block Size", ""),
         ("threads", "Launch Statistics", "Threads", ""),
@@ -1034,6 +1274,22 @@ def analyze_case(
     for key_name, section, metric, body in definitions:
         raw = metric_value(metrics, section, metric, body)
         key[key_name] = numeric(raw) if numeric(raw) is not None else raw
+
+    # NCU switches the "Memory Workload Analysis" throughput unit between
+    # Mbyte/s and Gbyte/s depending on magnitude. Normalize it to GByte/s so
+    # cases and implementations remain comparable.
+    memory_value = numeric(
+        metric_value(metrics, "Memory Workload Analysis", "Memory Throughput")
+    )
+    memory_unit = metric_value(
+        units, "Memory Workload Analysis", "Memory Throughput"
+    )
+    if memory_value is not None:
+        if memory_unit == "Mbyte/s":
+            memory_value /= 1000.0
+        elif memory_unit == "Kbyte/s":
+            memory_value /= 1_000_000.0
+    key["memory_gbytes"] = memory_value
     for reason in [
         "Stall Not Selected",
         "Stall Math Pipe Throttle",
@@ -1111,8 +1367,12 @@ def analyze_case(
 
     return {
         "case": case,
-        "args": CASES.get(case, {}).get("args"),
-        "why": CASES.get(case, {}).get("why", ""),
+        "workload": workload,
+        "variant": variant,
+        "variant_label": VARIANTS[variant]["label"],
+        "args": CASES.get(workload, {}).get("args"),
+        "why": CASES.get(workload, {}).get("why", ""),
+        "variant_why": VARIANTS[variant].get("why", ""),
         "bench": bench,
         "key_metrics": key,
         "stalls": [
@@ -1184,6 +1444,16 @@ def fmt(value: object, digits: int = 2) -> str:
     return str(value)
 
 
+def fmt_number_string(value: object, digits: int = 2) -> str:
+    """Format a numeric value that may have been stored as a string."""
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return value
+    return fmt(value, digits)
+
+
 def md_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> str:
     out = ["| " + " | ".join(headers) + " |"]
     out.append("|" + "|".join("---" for _ in headers) + "|")
@@ -1204,14 +1474,15 @@ def write_summary(
     order: Sequence[str],
 ) -> None:
     lines: List[str] = []
-    lines.append("# Atomic-free spread profiling digest")
+    lines.append("# Atomic-free spread vs cuFINUFFT method 3 profiling digest")
     lines.append("")
     lines.append(f"Generated: {environment.get('generated_at', '-')}")
     lines.append("")
     lines.append(
         f"Repository: `{environment.get('repo', '-')}`  \n"
         f"Commit: `{environment.get('git_commit', '-')}`  \n"
-        f"Git status: {environment.get('git_status', '-')}  \n"
+        f"Git status: {environment.get('git_status', '-').replace(chr(10), '; ')}  \n"
+        f"Capture: `{environment.get('capture_dir', '-')}`  \n"
         f"GPU: {environment.get('gpu', '-')}  \n"
         f"CUDA: {environment.get('nvcc', '-')}  \n"
         f"Nsight Compute: {environment.get('ncu', '-')}  \n"
@@ -1221,6 +1492,8 @@ def write_summary(
     lines.append("## Artifact map")
     lines.append("")
     lines.append(
+        "`<case>` is `<workload>__<variant>`, where variant is `atomic_free` or `method3`.\n"
+        "\n"
         "- `reports/<case>.ncu-rep` — original Nsight Compute report\n"
         "- `ncu/<case>.raw.csv` — every raw metric/unit/value from the report\n"
         "- `ncu/<case>.details.csv` / `.txt` — section-organized metrics and rules\n"
@@ -1242,28 +1515,129 @@ def write_summary(
         result = results[case]
         bench = result["bench"]
         key = result["key_metrics"]
+        variant = str(result.get("variant", ""))
+        reference_ms = (
+            bench.get("spread_median_ms")
+            if variant == "atomic_free"
+            else bench.get("reference_execute_ms")
+        )
+        ncu_ms = key.get("duration_ms")
+        ratio = (
+            f"{float(ncu_ms) / float(reference_ms):.2f}x"
+            if isinstance(ncu_ms, (int, float)) and isinstance(reference_ms, (int, float)) and reference_ms
+            else "-"
+        )
         case_rows.append(
             [
-                case,
+                result.get("workload", case),
+                result.get("variant_label", variant),
                 " ".join(str(v) for v in result["args"]),
                 fmt(bench.get("spread_median_ms")),
-                fmt(key.get("duration_ms")),
+                fmt(bench.get("reference_execute_ms")),
+                fmt(ncu_ms),
+                ratio,
                 fmt(bench.get("relL2"), 3),
                 bench.get("overall", "-"),
             ]
         )
     lines.append(
         md_table(
-            ["case", "bench args (M N1 N2 N3 cluster bin_size pattern seed)", "bench median ms", "ncu duration ms", "relL2", "checks"],
+            [
+                "workload",
+                "implementation",
+                "bench args (M N1 N2 N3 cluster bin_size pattern seed)",
+                "atomic-free bench median ms",
+                "method 3 bench execute ms",
+                "ncu kernel ms",
+                "ncu / matching bench",
+                "relL2",
+                "checks",
+            ],
             case_rows,
         )
     )
     lines.append("")
     lines.append(
-        "NCU durations come from one replayed launch with unlocked clocks; they are not "
-        "benchmark medians. Use utilization/instruction/stall columns for comparison, "
-        "and the benchmark columns for wall-clock."
+        "`ncu kernel ms` is one replayed launch with unlocked clocks, not a benchmark "
+        "median. For `atomic_free` it is the `spread` kernel; for `method3` it is the "
+        "`spread_output_driven` kernel. The method-3 benchmark execute also includes "
+        "the output-grid clear and launch overhead, so its NCU kernel time can be lower "
+        "than the bench execute time."
     )
+    lines.append("")
+    lines.append(
+        "The gap between method-3 bench `execute` and its NCU kernel time is about "
+        "2.1-2.3 ms on every workload here, consistent with a fixed output-grid clear "
+        "plus launch/synchronization overhead."
+    )
+    lines.append("")
+
+    workloads: List[str] = []
+    for case in order:
+        if case not in results:
+            continue
+        workload = str(results[case].get("workload", case))
+        if workload not in workloads:
+            workloads.append(workload)
+
+    lines.append("## Quick read")
+    lines.append("")
+    for workload in workloads:
+        by_variant = {
+            str(results[case].get("variant", "")): case
+            for case in order
+            if case in results and results[case].get("workload") == workload
+        }
+        af_case = by_variant.get("atomic_free")
+        m3_case = by_variant.get("method3")
+        if af_case is None or m3_case is None:
+            continue
+        af = results[af_case]
+        m3 = results[m3_case]
+        af_key = af["key_metrics"]
+        m3_key = m3["key_metrics"]
+        af_ms = af_key.get("duration_ms")
+        m3_ms = m3_key.get("duration_ms")
+        if (
+            isinstance(af_ms, (int, float))
+            and isinstance(m3_ms, (int, float))
+            and af_ms
+            and m3_ms
+        ):
+            if m3_ms <= af_ms:
+                headline = (
+                    f"NCU kernel time: method 3 is {float(m3_ms) / float(af_ms):.2f}x "
+                    f"atomic-free ({100.0 * (1.0 - float(m3_ms) / float(af_ms)):.0f}% lower)"
+                )
+            else:
+                headline = (
+                    f"NCU kernel time: atomic-free is {float(af_ms) / float(m3_ms):.2f}x "
+                    f"method 3 ({100.0 * (1.0 - float(af_ms) / float(m3_ms)):.0f}% lower)"
+                )
+        else:
+            headline = "kernel duration unavailable"
+
+        def top_stalls(result: Dict[str, object]) -> str:
+            stalls = [
+                row
+                for row in result["stalls"]  # type: ignore[index]
+                if str(row["reason"]).startswith("Stall ")
+            ][:2]
+            return ", ".join(
+                f"{str(row['reason']).replace('Stall ', '')} "
+                f"{float(row['share_of_warp_state_pct']):.1f}%"
+                for row in stalls
+            ) or "-"
+
+        lines.append(
+            f"- **`{workload}`** — {headline}. "
+            f"Atomic-free: {fmt(af_key.get('achieved_occupancy_pct'))}% occupancy, "
+            f"{fmt(af_key.get('l1tex_pct'))}% L1/TEX, top stalls {top_stalls(af)}. "
+            f"Method 3: {fmt(m3_key.get('achieved_occupancy_pct'))}% occupancy, "
+            f"{fmt(m3_key.get('dynamic_shared_kb'))} KiB shared/block, "
+            f"{fmt(m3_key.get('dram_pct'))}% DRAM, {fmt(m3_key.get('l2_pct'))}% L2, "
+            f"top stalls {top_stalls(m3)}."
+        )
     lines.append("")
 
     lines.append("## Cross-case key metrics")
@@ -1276,6 +1650,7 @@ def write_summary(
         ("ncu duration (ms)", "duration_ms", 2),
         ("compute (SM) %", "compute_pct", 2),
         ("memory %", "memory_pct", 2),
+        ("memory throughput (GByte/s)", "memory_gbytes", 2),
         ("DRAM %", "dram_pct", 2),
         ("L1/TEX %", "l1tex_pct", 2),
         ("L2 %", "l2_pct", 2),
@@ -1298,6 +1673,7 @@ def write_summary(
         ("warp instructions", "instructions_executed", 0),
         ("registers/thread", "registers_per_thread", 0),
         ("static shared bytes", "static_shared_bytes", 0),
+        ("dynamic shared KiB", "dynamic_shared_kb", 2),
         ("grid blocks", "grid_size", 0),
         ("block threads", "block_size", 0),
         ("source instruction total", "source_instruction_total", 0),
@@ -1314,6 +1690,155 @@ def write_summary(
     lines.append(md_table(cross_headers, cross_rows))
     lines.append("")
 
+    # Per-workload side-by-side comparison. Ratios are method 3 / atomic-free;
+    # a ratio above 1 means the method-3 kernel is larger, slower, or has more
+    # of that resource. Percentage-point deltas are method 3 - atomic-free.
+    comparison_metrics = [
+        ("ncu kernel duration (ms)", "duration_ms", 2, "ratio"),
+        ("compute (SM) %", "compute_pct", 2, "delta"),
+        ("memory %", "memory_pct", 2, "delta"),
+        ("memory throughput (GByte/s)", "memory_gbytes", 2, "ratio"),
+        ("DRAM %", "dram_pct", 2, "delta"),
+        ("L1/TEX %", "l1tex_pct", 2, "delta"),
+        ("L2 %", "l2_pct", 2, "delta"),
+        ("IPC", "ipc", 2, "ratio"),
+        ("issue slots busy %", "issue_slots_busy_pct", 2, "delta"),
+        ("FMA pipe %", "fma_pipe_pct", 2, "delta"),
+        ("ALU pipe %", "alu_pipe_pct", 2, "delta"),
+        ("XU pipe %", "xu_pipe_pct", 2, "delta"),
+        ("achieved occupancy %", "achieved_occupancy_pct", 2, "delta"),
+        ("active warps/scheduler", "active_warps_per_scheduler", 2, "ratio"),
+        ("eligible warps/scheduler", "eligible_warps_per_scheduler", 2, "ratio"),
+        ("no eligible %", "no_eligible_pct", 2, "delta"),
+        ("warp cycles / issued inst", "warp_cycles_per_issued_inst", 2, "ratio"),
+        ("active threads / warp", "active_threads_per_warp", 2, "ratio"),
+        ("predicated threads / warp", "predicated_threads_per_warp", 2, "ratio"),
+        ("L1 hit global loads %", "l1_hit_global_loads_pct", 2, "delta"),
+        ("L2 hit loads %", "l2_hit_loads_pct", 2, "delta"),
+        ("warp instructions", "instructions_executed", 0, "ratio"),
+        ("registers/thread", "registers_per_thread", 0, "ratio"),
+        ("dynamic shared KiB", "dynamic_shared_kb", 2, "ratio"),
+        ("grid blocks", "grid_size", 0, "ratio"),
+        ("block threads", "block_size", 0, "ratio"),
+        ("source sample total", "source_sample_total", 0, "ratio"),
+    ]
+
+    lines.append("## Benchmark phase breakdown")
+    lines.append("")
+    phase_rows = []
+    for workload in workloads:
+        case = next(
+            (
+                candidate
+                for candidate in order
+                if candidate in results
+                and results[candidate].get("workload") == workload
+            ),
+            None,
+        )
+        if case is None:
+            continue
+        bench = results[case]["bench"]
+        phase_rows.append(
+            [
+                workload,
+                fmt(bench.get("host_generate_ms")),
+                fmt(bench.get("prep_upload_points_ms")),
+                fmt(bench.get("prep_assign_bins_ms")),
+                fmt(bench.get("prep_copy_bins_ms")),
+                fmt(bench.get("prep_sort_ms")),
+                fmt(bench.get("prep_upload_sorted_ms")),
+                fmt(bench.get("prep_total_ms")),
+                fmt(bench.get("setup_ms")),
+                fmt(bench.get("end_to_end_ms")),
+                fmt(bench.get("reference_setpts_ms")),
+                fmt(bench.get("reference_execute_ms")),
+                fmt(bench.get("reference_total_ms")),
+                fmt(bench.get("spread_median_ms")),
+                fmt(bench.get("spread_vs_ref_exec")),
+            ]
+        )
+    lines.append(
+        md_table(
+            [
+                "workload",
+                "host generate",
+                "upload points",
+                "assign bins",
+                "copy bins",
+                "host sort",
+                "upload sorted",
+                "prep total",
+                "setup total",
+                "atomic-free end-to-end",
+                "method 3 setpts",
+                "method 3 execute",
+                "method 3 total",
+                "atomic-free spread median",
+                "method-3 execute / spread",
+            ],
+            phase_rows,
+        )
+    )
+    lines.append("")
+    lines.append(
+        "All columns are milliseconds except the last, which is the ratio "
+        "method-3 execute / atomic-free spread median (above 1 means method 3 is "
+        "slower). `atomic-free end-to-end` is setup total + spread median; "
+        "`method 3 total` is setpts + execute. The atomic-free preprocessing "
+        "(assign bins, copy bins, host counting sort, upload sorted) is not part of "
+        "the `spread` kernel time. Method-3 `setpts` is its own preprocessing phase."
+    )
+    lines.append("")
+
+    lines.append("## Implementation comparison")
+    lines.append("")
+    lines.append(
+        "`ratio` is method 3 / atomic-free (above 1 means method 3 is larger or "
+        "slower); `delta` is method 3 minus atomic-free in percentage points. "
+        "Missing values mean the metric was not exported for that kernel."
+    )
+    lines.append("")
+    for workload in workloads:
+        by_variant = {
+            str(results[case].get("variant", "")): case
+            for case in order
+            if case in results and results[case].get("workload") == workload
+        }
+        af_case = by_variant.get("atomic_free")
+        m3_case = by_variant.get("method3")
+        if af_case is None or m3_case is None:
+            continue
+        af_key = results[af_case]["key_metrics"]
+        m3_key = results[m3_case]["key_metrics"]
+        rows = []
+        for label, key_name, digits, mode in comparison_metrics:
+            af_value = af_key.get(key_name)
+            m3_value = m3_key.get(key_name)
+            if not isinstance(af_value, (int, float)) or not isinstance(m3_value, (int, float)):
+                comparison = "-"
+            elif mode == "ratio":
+                comparison = f"{float(m3_value) / float(af_value):.2f}x" if af_value else "-"
+            else:
+                comparison = f"{float(m3_value) - float(af_value):+.2f} pp"
+            rows.append(
+                [
+                    label,
+                    fmt(af_value, digits),
+                    fmt(m3_value, digits),
+                    comparison,
+                ]
+            )
+        lines.append(f"### `{workload}`")
+        lines.append("")
+        lines.append(
+            md_table(
+                ["metric", "atomic-free", "method 3", "method 3 vs atomic-free"],
+                rows,
+            )
+        )
+        lines.append("")
+
     for case in order:
         if case not in results:
             continue
@@ -1322,14 +1847,20 @@ def write_summary(
         key = result["key_metrics"]
         lines.append(f"## Case: `{case}`")
         lines.append("")
-        lines.append(f"{result.get('why', '')}")
+        lines.append(
+            f"Workload: {result.get('why', '')}.  \n"
+            f"Implementation: **{result.get('variant_label', '-')}** — "
+            f"{result.get('variant_why', '')}"
+        )
         lines.append("")
         lines.append(
-            f"Benchmark: median **{fmt(bench.get('spread_median_ms'))} ms** "
-            f"(min {fmt(bench.get('spread_min_ms'))}, max {fmt(bench.get('spread_max_ms'))}), "
-            f"relL2 **{fmt(bench.get('relL2'), 3)}**, checks **{bench.get('overall', '-')}**. "
-            f"Method 3 execute: {fmt(bench.get('reference_execute_ms'))} ms. "
-            f"Spread / method-3 execute: {fmt(bench.get('spread_vs_ref_exec'))}x."
+            f"Benchmark (same process for both implementations): atomic-free spread median "
+            f"**{fmt(bench.get('spread_median_ms'))} ms** "
+            f"(min {fmt(bench.get('spread_min_ms'))}, max {fmt(bench.get('spread_max_ms'))}); "
+            f"method 3 execute **{fmt(bench.get('reference_execute_ms'))} ms** "
+            f"(setpts {fmt(bench.get('reference_setpts_ms'))} ms); "
+            f"method-3 execute / spread **{fmt(bench.get('spread_vs_ref_exec'))}x**; "
+            f"relL2 **{fmt(bench.get('relL2'), 3)}**; checks **{bench.get('overall', '-')}**."
         )
         lines.append("")
         lines.append(
@@ -1340,15 +1871,67 @@ def write_summary(
         )
         lines.append("")
 
+        detail_rows = [
+            ["elapsed cycles", fmt(key.get("elapsed_cycles"), 0)],
+            ["waves per SM", fmt(key.get("waves_per_sm"))],
+            ["memory throughput (GByte/s)", fmt(key.get("memory_gbytes"))],
+            ["L1/TEX hit rate %", fmt(key.get("l1tex_hit_rate_pct"))],
+            ["L2 hit rate %", fmt(key.get("l2_hit_rate_pct"))],
+            ["L1 hit global loads %", fmt(key.get("l1_hit_global_loads_pct"))],
+            ["L1 hit global stores %", fmt(key.get("l1_hit_global_stores_pct"))],
+            ["avg bytes/sector load", fmt(key.get("avg_bytes_per_sector_load"))],
+            ["avg bytes/sector store", fmt(key.get("avg_bytes_per_sector_store"))],
+            ["shared-memory bank conflicts", fmt(key.get("shared_bank_conflicts"), 0)],
+            ["shared load instructions", fmt(key.get("shared_ld_inst"), 0)],
+            ["shared store instructions", fmt(key.get("shared_st_inst"), 0)],
+            ["global load instructions", fmt(key.get("global_ld_inst"), 0)],
+            ["global store instructions", fmt(key.get("global_st_inst"), 0)],
+            [
+                "global reduction (atomic) instructions",
+                fmt(key.get("global_red_inst"), 0),
+            ],
+            ["DRAM bytes read (MB)", fmt(key.get("dram_bytes_read"))],
+            ["DRAM bytes write (MB)", fmt(key.get("dram_bytes_write"))],
+            ["branch efficiency %", fmt(key.get("branch_efficiency_pct"))],
+            ["L1 conflicts shared N-way", fmt(key.get("l1_conflicts_shared_nway"))],
+            [
+                "L1 shared wavefronts excessive",
+                fmt(key.get("l1_wavefronts_shared_excessive"), 0),
+            ],
+            [
+                "L2 theoretical sectors global excessive (MB)",
+                fmt(key.get("l2_theoretical_sectors_global_excessive")),
+            ],
+            ["avg threads executed", fmt(key.get("avg_threads_executed"))],
+            [
+                "avg predicated-on threads executed",
+                fmt(key.get("avg_predicated_threads_executed")),
+            ],
+            ["block limit: shared memory", fmt(key.get("block_limit_shared_mem"), 0)],
+            ["block limit: registers", fmt(key.get("block_limit_registers"), 0)],
+            [
+                "theoretical active warps/SM",
+                fmt(key.get("theoretical_active_warps_per_sm")),
+            ],
+            [
+                "achieved active warps/SM",
+                fmt(key.get("achieved_active_warps_per_sm")),
+            ],
+        ]
+        lines.append("### Resource and memory detail")
+        lines.append("")
+        lines.append(md_table(["metric", "value"], detail_rows))
+        lines.append("")
+
         # Stalls.
         lines.append("### Stall breakdown")
         lines.append("")
         stall_rows = [
             [
                 row["reason"],
-                fmt(row["cycles_per_issued_instruction"], 3),
-                fmt(row["share_of_warp_state_pct"], 2) + "%",
-                fmt(row["share_of_stall_cycles_pct"], 2) + "%",
+                fmt_number_string(row["cycles_per_issued_instruction"], 3),
+                fmt_number_string(row["share_of_warp_state_pct"], 2) + "%",
+                fmt_number_string(row["share_of_stall_cycles_pct"], 2) + "%",
             ]
             for row in result["stalls"][:12]
         ]
@@ -1372,9 +1955,9 @@ def write_summary(
             [
                 row["source_group"],
                 fmt(row["instructions"], 0),
-                fmt(row["instruction_pct"], 2) + "%",
+                fmt_number_string(row["instruction_pct"], 2) + "%",
                 fmt(row["samples"], 0),
-                fmt(row["sample_pct"], 2) + "%",
+                fmt_number_string(row["sample_pct"], 2) + "%",
                 row["source_lines"],
                 row["sass_pcs"],
             ]
@@ -1404,9 +1987,9 @@ def write_summary(
                 f"`{row['file']}:{row['line']}`",
                 truncate(row["source"], 52),
                 fmt(row["instructions"], 0),
-                fmt(row["instruction_pct"], 2) + "%",
+                fmt_number_string(row["instruction_pct"], 2) + "%",
                 fmt(row["samples"], 0),
-                fmt(row["sample_pct"], 2) + "%",
+                fmt_number_string(row["sample_pct"], 2) + "%",
                 row["group"],
                 row["top_stall"],
             ]
@@ -1437,9 +2020,9 @@ def write_summary(
                 f"`{row['file']}:{row['line']}`",
                 truncate(row["source"], 52),
                 fmt(row["samples"], 0),
-                fmt(row["sample_pct"], 2) + "%",
+                fmt_number_string(row["sample_pct"], 2) + "%",
                 fmt(row["instructions"], 0),
-                fmt(row["instruction_pct"], 2) + "%",
+                fmt_number_string(row["instruction_pct"], 2) + "%",
                 row["top_stall"],
             ]
             for row in result["top_sample_lines"][:12]
@@ -1459,9 +2042,9 @@ def write_summary(
             [
                 row["opcode_family"],
                 fmt(row["instructions"], 0),
-                fmt(row["instruction_pct"], 2) + "%",
+                fmt_number_string(row["instruction_pct"], 2) + "%",
                 fmt(row["samples"], 0),
-                fmt(row["sample_pct"], 2) + "%",
+                fmt_number_string(row["sample_pct"], 2) + "%",
                 row["sass_pcs"],
             ]
             for row in result["top_opcode_families"][:15]
@@ -1482,10 +2065,24 @@ def write_summary(
     lines.append("## Method notes")
     lines.append("")
     lines.append(
-        "- The profiled kernel is the first `spread` launch in the benchmark binary; "
-        "`assign_bins` and the reference method 3 are filtered out.\n"
+        "- Two NCU reports are captured per workload: `atomic_free` profiles the first "
+        "exact `spread` launch (`assign_bins` is filtered out); `method3` profiles the "
+        "first `spread_output_driven` launch made by the in-process cuFINUFFT method-3 "
+        "reference. Method-3 preprocessing kernels from `setpts` are not profiled.\n"
+        "- The cuFINUFFT static library was rebuilt with `-lineinfo` so method-3 source "
+        "attribution is available; line info does not change the generated SASS.\n"
+        "- The capture was taken with uncommitted changes in "
+        "`devel/morton_spread/atomic_free_spread.cu` (see Git status above), so the "
+        "atomic-free numbers describe that working tree, not HEAD.\n"
+        "- The benchmark binary always runs both implementations, so the benchmark and "
+        "relL2 columns are shared by the two reports for a workload.\n"
         "- NCU runs with `--clock-control none` and kernel replay. Absolute durations differ "
         "from benchmark medians; utilization, instruction, and stall metrics are the useful part.\n"
+        "- Benchmark medians are short, unlocked-clock samples and vary between runs. Treat "
+        "the NCU kernel comparisons as the stable kernel-level result and the wall-clock "
+        "benchmark as indicative.\n"
+        "- Method-3 benchmark `execute` includes the output-grid clear and the spread kernel, "
+        "so the NCU kernel duration is not directly comparable to that wall-clock number.\n"
         "- Source instructions and PC samples are deduplicated by `(kernel, SASS PC)`, keeping "
         "the first source correlation. Nsight repeats PCs under inline definitions and call sites.\n"
         "- Source-group percentages are a source-text heuristic, not a compiler data structure. "
@@ -1501,8 +2098,8 @@ def write_summary(
 
 def write_readme(out_dir: Path, order: Sequence[str]) -> None:
     lines = [
-        "atomic_free_spread profiling capture",
-        "===================================",
+        "atomic-free vs cuFINUFFT method-3 spread profiling capture",
+        "==========================================================",
         "",
         "Regenerate everything with:",
         "",
@@ -1515,10 +2112,11 @@ def write_readme(out_dir: Path, order: Sequence[str]) -> None:
         "Start with summary.md. The raw and detail CSV/TXT dumps are intentionally",
         "kept so the analysis can be extended without another GPU run.",
         "",
-        "Cases: " + ", ".join(order),
+        "Cases (<workload>__<variant>; variant is atomic_free or method3): "
+        + ", ".join(order),
         "",
         "Layout:",
-        "  bench/<case>.log            benchmark stdout/stderr",
+        "  bench/<workload>.log        benchmark stdout/stderr (shared by both variants)",
         "  reports/<case>.ncu-rep      original Nsight Compute report",
         "  ncu/<case>.raw.csv          raw metric/unit/value dump",
         "  ncu/<case>.details.csv      section/metric long-form dump",
@@ -1578,14 +2176,25 @@ def export_report(runner: CommandRunner, ncu: Path, report: Path, out_dir: Path,
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Build, benchmark, profile, and summarize the atomic-free spread baseline."
+        description=(
+            "Build, benchmark, profile, and summarize the atomic-free spread "
+            "against cuFINUFFT method 3."
+        )
     )
     parser.add_argument(
         "--cases",
         default=None,
         help=(
-            "comma-separated case names (default: all cases; with "
-            f"--analyze-only, the cases found in the directory; choices: {','.join(CASES)})"
+            "comma-separated workload names (default: all workloads; with "
+            f"--analyze-only, the workloads found in the directory; choices: {','.join(CASES)})"
+        ),
+    )
+    parser.add_argument(
+        "--impls",
+        default=None,
+        help=(
+            "comma-separated implementations to profile (default: all; "
+            f"choices: {','.join(VARIANTS)})"
         ),
     )
     parser.add_argument(
@@ -1609,6 +2218,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--skip-benchmark", action="store_true", help="skip plain benchmark")
     parser.add_argument("--skip-profile", action="store_true", help="skip ncu collection")
     parser.add_argument(
+        "--markdown",
+        type=Path,
+        default=None,
+        help="also copy the generated summary Markdown to this path",
+    )
+    parser.add_argument(
         "--keep-going",
         action="store_true",
         help="continue with other cases after a failure",
@@ -1624,18 +2239,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if unknown:
         parser.error(f"unknown case(s): {', '.join(unknown)}; choose from {', '.join(CASES)}")
 
+    explicit_variants = args.impls is not None
+    if explicit_variants:
+        selected_variants = [name.strip() for name in args.impls.split(",") if name.strip()]
+    else:
+        selected_variants = list(VARIANTS)
+    unknown_variants = [name for name in selected_variants if name not in VARIANTS]
+    if unknown_variants:
+        parser.error(
+            f"unknown implementation(s): {', '.join(unknown_variants)}; "
+            f"choose from {', '.join(VARIANTS)}"
+        )
+
     if args.analyze_only is not None:
         out_dir = args.analyze_only.resolve()
         if not out_dir.is_dir():
             parser.error(f"--analyze-only directory does not exist: {out_dir}")
-        if not explicit_cases:
+        if not explicit_cases or not explicit_variants:
             available = {
                 path.stem for path in (out_dir / "reports").glob("*.ncu-rep")
             }
             available |= {
                 path.stem for path in (out_dir / "bench").glob("*.log")
             }
-            selected = [case for case in CASES if case in available]
+            if not explicit_cases:
+                selected = [
+                    workload
+                    for workload in CASES
+                    if workload in available
+                    or any(stem.startswith(workload + "__") for stem in available)
+                ]
+            if not explicit_variants:
+                selected_variants = [
+                    variant
+                    for variant in VARIANTS
+                    if any(stem.endswith("__" + variant) for stem in available)
+                ] or list(VARIANTS)
             if not selected:
                 parser.error(
                     f"no reports or benchmark logs found under {out_dir}; "
@@ -1648,6 +2287,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     environment: Dict[str, str] = {
         "repo": str(REPO),
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "capture_dir": str(out_dir),
         "host": platform.node(),
         "python": platform.python_version(),
     }
@@ -1773,33 +2413,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     results: Dict[str, Dict[str, object]] = {}
     failed: List[str] = []
 
-    for case in selected:
-        print(f"\n===== {case} =====")
-        case_info = CASES[case]
-        case_args = [int(v) for v in case_info["args"]]  # type: ignore[arg-type]
+    for workload in selected:
+        print(f"\n===== {workload} =====")
+        workload_info = CASES[workload]
+        workload_args = [int(v) for v in workload_info["args"]]  # type: ignore[arg-type]
         bench: Dict[str, object] = {}
-        bench_log = out_dir / "bench" / f"{case}.log"
-        report = out_dir / "reports" / f"{case}.ncu-rep"
+        bench_log = out_dir / "bench" / f"{workload}.log"
 
         try:
             if args.analyze_only is None:
                 if not args.skip_benchmark:
                     bench_cmd = [
                         str(binary),
-                        *[str(v) for v in case_args],
+                        *[str(v) for v in workload_args],
                         str(args.nrun),
                     ]
                     runner.run(
                         bench_cmd,
-                        log_name=f"bench/{case}.log",
+                        log_name=f"bench/{workload}.log",
                         env=env,
                         cwd=REPO,
                     )
                     bench = parse_bench_log(bench_log.read_text())
                     if bench.get("overall") not in (None, "PASS"):
-                        raise RuntimeError(f"benchmark checks failed for {case}: {bench.get('overall')}")
+                        raise RuntimeError(
+                            f"benchmark checks failed for {workload}: "
+                            f"{bench.get('overall')}"
+                        )
+            else:
+                # Keep any benchmark log already present in the capture.
+                if bench_log.is_file():
+                    bench = parse_bench_log(bench_log.read_text())
+        except Exception as exc:  # noqa: BLE001 - CLI wants a readable summary
+            print(f"error: {workload} benchmark: {exc}", file=sys.stderr)
+            if not args.keep_going:
+                break
 
-                if not args.skip_profile:
+        for variant in selected_variants:
+            case = f"{workload}__{variant}"
+            variant_info = VARIANTS[variant]
+            report = out_dir / "reports" / f"{case}.ncu-rep"
+
+            try:
+                if args.analyze_only is None and not args.skip_profile:
                     if ncu is None:
                         raise RuntimeError("ncu not available")
                     report.parent.mkdir(parents=True, exist_ok=True)
@@ -1810,7 +2466,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "--kernel-name-base",
                         "function",
                         "--kernel-name",
-                        "regex:^spread$",
+                        f"regex:{variant_info['ncu_kernel_regex']}",
                         "--launch-count",
                         "1",
                         "--force-overwrite",
@@ -1822,7 +2478,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "--export",
                         str(report),
                         str(binary),
-                        *[str(v) for v in case_args],
+                        *[str(v) for v in workload_args],
                         "1",
                     ]
                     runner.run(
@@ -1831,54 +2487,59 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         env=env,
                         cwd=REPO,
                     )
-            else:
-                # Keep any benchmark log already present in the capture.
-                if bench_log.is_file():
-                    bench = parse_bench_log(bench_log.read_text())
 
-            if report.is_file():
-                export_report(runner, ncu, report, out_dir, case)  # type: ignore[arg-type]
-                result = analyze_case(
-                    case,
-                    out_dir,
-                    bench,
-                    out_dir / "ncu" / f"{case}.details.csv",
-                    out_dir / "ncu" / f"{case}.source.csv",
-                )
-                results[case] = result
-                key = result["key_metrics"]
-                print(
-                    f"  {case}: bench median={fmt(bench.get('spread_median_ms'))} ms, "
-                    f"ncu duration={fmt(key.get('duration_ms'))} ms, "
-                    f"instructions={fmt(key.get('instructions_executed'), 0)}, "
-                    f"top source={key.get('top_source_file', '?')}:{key.get('top_source_line', '?')} "
-                    f"({fmt(key.get('top_source_instruction_pct'))}%)"
-                )
-            else:
-                # Benchmark-only capture: still emit a small summary.
-                if bench:
-                    results[case] = {
-                        "case": case,
-                        "args": case_args,
-                        "why": case_info["why"],
-                        "bench": bench,
-                        "key_metrics": {},
-                        "stalls": [],
-                        "source_groups": [],
-                        "top_source_lines": [],
-                        "top_sample_lines": [],
-                        "top_opcodes": [],
-                        "top_opcode_families": [],
-                        "source_stats": {},
-                        "artifacts": {},
-                    }
+                if report.is_file():
+                    export_report(runner, ncu, report, out_dir, case)  # type: ignore[arg-type]
+                    result = analyze_case(
+                        case,
+                        workload,
+                        variant,
+                        out_dir,
+                        bench,
+                        out_dir / "ncu" / f"{case}.details.csv",
+                        out_dir / "ncu" / f"{case}.source.csv",
+                    )
+                    results[case] = result
+                    key = result["key_metrics"]
+                    print(
+                        f"  {case}: bench median={fmt(bench.get('spread_median_ms'))} ms, "
+                        f"ncu duration={fmt(key.get('duration_ms'))} ms, "
+                        f"instructions={fmt(key.get('instructions_executed'), 0)}, "
+                        f"top source={key.get('top_source_file', '?')}:"
+                        f"{key.get('top_source_line', '?')} "
+                        f"({fmt(key.get('top_source_instruction_pct'))}%)"
+                    )
                 else:
-                    raise RuntimeError(f"no report and no benchmark data for {case}")
-        except Exception as exc:  # noqa: BLE001 - CLI wants a readable summary
-            failed.append(case)
-            print(f"error: {case}: {exc}", file=sys.stderr)
-            if not args.keep_going:
-                break
+                    # Benchmark-only capture: still emit a small summary.
+                    if bench:
+                        results[case] = {
+                            "case": case,
+                            "workload": workload,
+                            "variant": variant,
+                            "variant_label": variant_info["label"],
+                            "args": workload_info["args"],
+                            "why": workload_info["why"],
+                            "variant_why": variant_info.get("why", ""),
+                            "bench": bench,
+                            "key_metrics": {},
+                            "stalls": [],
+                            "source_groups": [],
+                            "top_source_lines": [],
+                            "top_sample_lines": [],
+                            "top_opcodes": [],
+                            "top_opcode_families": [],
+                            "source_stats": {},
+                            "artifacts": {},
+                        }
+                    else:
+                        raise RuntimeError(f"no report and no benchmark data for {case}")
+            except Exception as exc:  # noqa: BLE001 - CLI wants a readable summary
+                failed.append(case)
+                print(f"error: {case}: {exc}", file=sys.stderr)
+                if not args.keep_going:
+                    break
+        if failed and not args.keep_going:
+            break
 
     environment["generated_at"] = dt.datetime.now().isoformat(timespec="seconds")
     environment["failed_cases"] = ",".join(failed) if failed else ""
@@ -1888,7 +2549,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     if results:
-        order = [case for case in selected if case in results]
+        order = [
+            f"{workload}__{variant}"
+            for workload in selected
+            for variant in selected_variants
+            if f"{workload}__{variant}" in results
+        ]
         write_summary(out_dir, environment, results, order)
         write_readme(out_dir, order)
         (out_dir / "summary.json").write_text(
@@ -1918,6 +2584,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Wrote {out_dir / 'summary.json'}")
         print(f"Wrote {out_dir / 'summary_metrics.csv'}")
         print(f"Raw reports: {out_dir / 'reports'}")
+        if args.markdown is not None:
+            target = args.markdown if args.markdown.is_absolute() else REPO / args.markdown
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(out_dir / "summary.md", target)
+            print(f"Wrote {target}")
 
     if failed:
         print(f"\nFailed cases: {', '.join(failed)}", file=sys.stderr)

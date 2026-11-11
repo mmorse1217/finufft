@@ -36,53 +36,48 @@ __global__ void assign_bins(const Point *points, int count, Grid grid, int *bin_
   bin_ids[i] = bx + grid.bins_x * (by + grid.bins_y * bz);
 }
 
-// Return the support coefficient for this cell, or -1 if the point does not
-// cover it. Grid sizes are at least WIDTH, so at most one coefficient matches.
-//
-// fold_rescale returns [0, grid_size), so support_start = ceil(px - HALO) is in
-// [-HALO, grid_size - HALO]. The kernel only calls this for cells in
-// [0, grid_size), so cell - support_start is always in
-// (-grid_size, 2 * grid_size). One conditional add and one conditional
-// subtract therefore reduce it to [0, grid_size); no loop or division is
-// needed. This one-period bound is specific to the per-cell reference point:
-// place_support() compares against a lane-group start, which can be near the
-// far edge of the grid and requires the multi-period correction.
-__device__ __forceinline__ int coefficient_index(int cell, int support_start,
-                                                 int grid_size) {
-  int offset = cell - support_start;
-  offset += (offset < 0) ? grid_size : 0;
-  offset -= (offset >= grid_size) ? grid_size : 0;
-  return offset < WIDTH ? offset : -1;
-}
-
-// Weight of this point for cell `cell`, or 0 when the point does not cover it.
-// coefficient_index() returns the position within the point's WIDTH kernel
-// values, or -1 when the point's support does not reach that cell.
-__device__ __forceinline__ float cell_weight(int cell, int start, int grid_size,
-                                             const float *ker) {
-  const int weight_index = coefficient_index(cell, start, grid_size);
-  const bool covered = cell < grid_size && weight_index >= 0;
-  return covered ? ker[weight_index] : 0.0f;
-}
-
-// Fill dest[0..COUNT) with the weights of the cells tile_begin + local.
+// Fill dest[0..COUNT) with the weights for cells tile_begin + local. The row is
+// zero outside the source support.
 template<int COUNT>
 __device__ __forceinline__ void stage_tile_weights(float *dest, int tile_begin,
-                                                   int start, int grid_size,
+                                                   int start, int fine_size,
                                                    const float *ker) {
+  #pragma unroll
   for (int local = 0; local < COUNT; ++local)
-    dest[local] = cell_weight(tile_begin + local, start, grid_size, ker);
+    dest[local] = 0.0f;
+
+  // start is in [-HALO, fine_size - HALO]; one add normalizes it.
+  start += (start < 0) ? fine_size : 0;
+
+  #pragma unroll
+  for (int k = 0; k < WIDTH; ++k) {
+    int cell = start + k;
+    cell -= (cell >= fine_size) ? fine_size : 0;
+    const int local = cell - tile_begin;
+    if (local >= 0 && local < COUNT)
+      dest[local] = ker[k];
+  }
 }
 
 // Same, pre-scaled by the point strength, for the dimension the cell loop reads
 // as one float2 instead of loading the strength separately.
 template<int COUNT>
 __device__ __forceinline__ void stage_tile_weights(float2 *dest, int tile_begin,
-                                                   int start, int grid_size,
+                                                   int start, int fine_size,
                                                    const float *ker, float2 strength) {
-  for (int local = 0; local < COUNT; ++local) {
-    const float weight = cell_weight(tile_begin + local, start, grid_size, ker);
-    dest[local] = make_float2(weight * strength.x, weight * strength.y);
+  #pragma unroll
+  for (int local = 0; local < COUNT; ++local)
+    dest[local] = make_float2(0.0f, 0.0f);
+
+  start += (start < 0) ? fine_size : 0;
+
+  #pragma unroll
+  for (int k = 0; k < WIDTH; ++k) {
+    int cell = start + k;
+    cell -= (cell >= fine_size) ? fine_size : 0;
+    const int local = cell - tile_begin;
+    if (local >= 0 && local < COUNT)
+      dest[local] = make_float2(ker[k] * strength.x, ker[k] * strength.y);
   }
 }
 
