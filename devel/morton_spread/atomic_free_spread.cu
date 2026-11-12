@@ -56,24 +56,28 @@ __device__ __forceinline__ void stage_tile_weights(T (*dest)[WEIGHT_STRIDE],
   }
 }
 
-// Add the staged batch to this thread's cell group. Each x-y product serves the
-// group's z cells and each z value serves its x cells, so a point costs
+// Add the staged batch to this thread's cell group. Each y-z product serves the
+// group's x cells and each x value serves its y-z cells, so a point costs
 // GROUP_X + GROUP_Y + GROUP_Z shared loads for GROUP_X * GROUP_Y * GROUP_Z cells.
+// For the 4x1x1 group, this halves the weight multiplies (four to two).
 __device__ __forceinline__ void accumulate_batch(
     const float (*kx)[WEIGHT_STRIDE], const float (*ky)[WEIGHT_STRIDE],
     const float2 (*kz)[WEIGHT_STRIDE], int staged, int x0, int y0, int z0,
     float2 (&acc)[GROUP_X][GROUP_Y][GROUP_Z]) {
   for (int j = 0; j < staged; ++j) {
-    float weight[GROUP_X][GROUP_Y];
+    float x[GROUP_X];
     #pragma unroll
-    for (int gx = 0; gx < GROUP_X; ++gx)
-      #pragma unroll
-      for (int gy = 0; gy < GROUP_Y; ++gy)
-        weight[gx][gy] = kx[x0 + gx][j] * ky[y0 + gy][j];
+    for (int gx = 0; gx < GROUP_X; ++gx) x[gx] = kx[x0 + gx][j];
 
-    float2 z[GROUP_Z];
+    float2 weight[GROUP_Y][GROUP_Z];
     #pragma unroll
-    for (int gz = 0; gz < GROUP_Z; ++gz) z[gz] = kz[z0 + gz][j];
+    for (int gy = 0; gy < GROUP_Y; ++gy)
+      #pragma unroll
+      for (int gz = 0; gz < GROUP_Z; ++gz) {
+        const float y = ky[y0 + gy][j];
+        const float2 z = kz[z0 + gz][j];
+        weight[gy][gz] = make_float2(y * z.x, y * z.y);
+      }
 
     #pragma unroll
     for (int gx = 0; gx < GROUP_X; ++gx)
@@ -81,8 +85,8 @@ __device__ __forceinline__ void accumulate_batch(
       for (int gy = 0; gy < GROUP_Y; ++gy)
         #pragma unroll
         for (int gz = 0; gz < GROUP_Z; ++gz) {
-          acc[gx][gy][gz].x += z[gz].x * weight[gx][gy];
-          acc[gx][gy][gz].y += z[gz].y * weight[gx][gy];
+          acc[gx][gy][gz].x += x[gx] * weight[gy][gz].x;
+          acc[gx][gy][gz].y += x[gx] * weight[gy][gz].y;
         }
   }
 }
