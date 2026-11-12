@@ -126,14 +126,14 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
   int y0 = threadIdx.y * GROUP_Y;
   int z0 = threadIdx.z * GROUP_Z;
 
-  __shared__ detail::NearBins x_bins, y_bins, z_bins;
+  __shared__ detail::NearBins shared_x_bins, shared_y_bins, shared_z_bins;
   if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
     const int end_x = min(tile_x + TILE_X, grid.nx);
     const int end_y = min(tile_y + TILE_Y, grid.ny);
     const int end_z = min(tile_z + TILE_Z, grid.nz);
-    x_bins = detail::near_bins(tile_x, end_x, grid.bin_size, grid.nx, grid.bins_x);
-    y_bins = detail::near_bins(tile_y, end_y, grid.bin_size, grid.ny, grid.bins_y);
-    z_bins = detail::near_bins(tile_z, end_z, grid.bin_size, grid.nz, grid.bins_z);
+    shared_x_bins = detail::near_bins(tile_x, end_x, grid.bin_size, grid.nx, grid.bins_x);
+    shared_y_bins = detail::near_bins(tile_y, end_y, grid.bin_size, grid.ny, grid.bins_y);
+    shared_z_bins = detail::near_bins(tile_z, end_z, grid.bin_size, grid.nz, grid.bins_z);
   }
 
   // Keep consecutive points contiguous so the scan can use vector loads.
@@ -145,6 +145,7 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
   __shared__ __align__(16) float ky_buffers[2][TILE_Y][WEIGHT_STRIDE];
   __shared__ __align__(16) float2 kz_buffers[2][TILE_Z][WEIGHT_STRIDE];
   __syncthreads();
+  const auto x_bins = shared_x_bins, y_bins = shared_y_bins, z_bins = shared_z_bins;
 
   const int linear_tid =
       threadIdx.x + BLOCK_X * (threadIdx.y + BLOCK_Y * threadIdx.z);
@@ -177,15 +178,18 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
         const int bin = bx + grid.bins_x * (by + grid.bins_y * bz);
         const int bin_begin = bin_offsets[bin];
         const int bin_end = bin_offsets[bin + run];
+        const Point *point = points + bin_begin + stage_point;
+        Point p{};
+        if (is_stager && bin_begin + stage_point < bin_end)
+          p = *point;
         // This loop carries the block's barriers, so every thread must run it;
         // only staging and accumulation are conditional.
-        for (int base = bin_begin; base < bin_end; base += STAGE_POINTS) {
+        for (int base = bin_begin; base < bin_end; base += STAGE_POINTS, point += STAGE_POINTS) {
           const int staged = min(STAGE_POINTS, bin_end - base);
           auto &kx = kx_buffers[buffer];
           auto &ky = ky_buffers[buffer];
           auto &kz = kz_buffers[buffer];
           if (is_stager && stage_point < staged) {
-            const Point p = points[base + stage_point];
             const float raw = stage_dim == 0 ? p.x : (stage_dim == 1 ? p.y : p.z);
             const int size =
                 stage_dim == 0 ? grid.nx : (stage_dim == 1 ? grid.ny : grid.nz);
@@ -203,6 +207,9 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
             }
           }
           __syncthreads();
+          // Fetch the next batch while this batch's weights are accumulated.
+          if (is_stager && base + STAGE_POINTS + stage_point < bin_end)
+            p = point[STAGE_POINTS];
           if (covered_z) {
             // Unroll full batches at compile time; keep partial batches compact.
             if (staged == STAGE_POINTS)
