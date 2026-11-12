@@ -11,15 +11,17 @@
 //
 // Usage: atomic_free_spread_bench
 //            [M [N1 [N2 [N3 [cluster [bin_size [pattern [seed [nrun
-//            [kernel]]]]]]]]]]
+//            [kernel [bin_sort]]]]]]]]]]]
 // cluster: 0 = uniform points, 1 = eight tight clusters.
 // pattern: 0 = uniform/cluster (default), 1 = seam and out-of-domain points,
 //          2 = exact grid nodes and near-node offsets, 3 = one dense cluster.
 //          Patterns 1-3 ignore cluster and use seed for reproducible selection.
 // nrun: timed spread runs after two warm-ups (default 5; median reported).
 // kernel: 0 = atomic-free baseline (default), 1 = F0 point-owned spread.
+// bin_sort: 0 = CPU fallback, 1 = stable radix GPU bin sort (default).
 
 #include "atomic_free_spread.cuh"
+#include "gpu_bin_sort.cuh"
 
 #include <cuda_runtime.h>
 #include <cufinufft.h>
@@ -31,8 +33,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <numeric>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #define CUDA_CHECK(call) do {                                                        \
@@ -219,6 +224,18 @@ ReferenceResult run_reference(const HostPoints &host, int nx, int ny, int nz,
   CUDA_CHECK(cudaMemset(reference_grid.get(), 0xFF,
                         (size_t)num_cells * sizeof(cuFloatComplex)));
 
+  // Warm up cuFINUFFT's lazy kernel loading, plan allocations, and the GPU
+  // clocks before timing setpts/execute. Without this, the short setpts phase
+  // is dominated by first-call and clock-state noise.
+  FINUFFT_CHECK(cufinufftf_setpts(plan, count, dx.get(), dy.get(), dz.get(), 0, nullptr,
+                                  nullptr, nullptr));
+  FINUFFT_CHECK(cufinufftf_execute(plan, dc.get(), reference_grid.get()));
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Repoison after the warmup so the timed execute's coverage check is meaningful.
+  CUDA_CHECK(cudaMemset(reference_grid.get(), 0xFF,
+                        (size_t)num_cells * sizeof(cuFloatComplex)));
+
   ReferenceResult result;
   CudaTimer timer;
   timer.begin();
@@ -252,6 +269,26 @@ bool is_unwritten_sentinel(const cuFloatComplex &value) {
 
 const char *pass_fail(bool pass) { return pass ? "PASS" : "FAIL"; }
 
+bool same_float_bits(float a, float b) {
+  std::uint32_t a_bits = 0, b_bits = 0;
+  std::memcpy(&a_bits, &a, sizeof(a_bits));
+  std::memcpy(&b_bits, &b, sizeof(b_bits));
+  return a_bits == b_bits;
+}
+
+bool same_point_bits(const Point &a, const Point &b) {
+  return same_float_bits(a.x, b.x) && same_float_bits(a.y, b.y) &&
+         same_float_bits(a.z, b.z) && same_float_bits(a.strength.x, b.strength.x) &&
+         same_float_bits(a.strength.y, b.strength.y);
+}
+
+bool same_points(const std::vector<Point> &a, const std::vector<Point> &b) {
+  if (a.size() != b.size()) return false;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    if (!same_point_bits(a[i], b[i])) return false;
+  return true;
+}
+
 void launch_selected_spread(int kernel, const Point *points,
                             const int *bin_offsets, Grid grid,
                             cuFloatComplex *output) {
@@ -264,7 +301,7 @@ void launch_selected_spread(int kernel, const Point *points,
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int run_benchmark(int argc, char **argv) {
   int count = argc > 1 ? std::atoi(argv[1]) : 10000;
   int nx = argc > 2 ? std::atoi(argv[2]) : 32;
   int ny = argc > 3 ? std::atoi(argv[3]) : 32;
@@ -275,16 +312,18 @@ int main(int argc, char **argv) {
   int seed = argc > 8 ? std::atoi(argv[8]) : 42;
   int nrun = argc > 9 ? std::atoi(argv[9]) : 5;
   int kernel = argc > 10 ? std::atoi(argv[10]) : 0;
-  if (argc > 11 || count <= 0 || nx < atomic_free_spread::WIDTH ||
+  int bin_sort = argc > 11 ? std::atoi(argv[11]) : 1;
+  if (argc > 12 || count <= 0 || nx < atomic_free_spread::WIDTH ||
       ny < atomic_free_spread::WIDTH || nz < atomic_free_spread::WIDTH ||
       (cluster != 0 && cluster != 1) || bin_size <= 0 ||
       (pattern < 0 || pattern > 3) || nrun <= 0 ||
-      (kernel != 0 && kernel != 1)) {
+      (kernel != 0 && kernel != 1) || bin_sort < 0 || bin_sort > 1) {
     std::fprintf(stderr,
                  "Usage: %s [M [N1 [N2 [N3 [cluster [bin_size [pattern [seed "
-                 "[nrun [kernel]]]]]]]]]]\n"
+                 "[nrun [kernel [bin_sort]]]]]]]]]]]\n"
                  "M, bin_size, and nrun must be positive; grid dimensions >= %d; "
-                 "cluster is 0 or 1; pattern is 0..3; kernel is 0 or 1.\n",
+                 "cluster is 0 or 1; pattern is 0..3; kernel is 0 or 1; "
+                 "bin_sort is 0 (CPU fallback) or 1 (stable radix GPU bin sort).\n",
                  argv[0], atomic_free_spread::WIDTH);
     return 1;
   }
@@ -311,6 +350,16 @@ int main(int argc, char **argv) {
   DeviceBuffer<int> device_offsets((size_t)(num_bins + 1));
   DeviceBuffer<cuFloatComplex> device_output((size_t)num_cells);
 
+  // GPU mode keeps the original points and writes a separate sorted array; the
+  // host path reuses device_points for the uploaded sorted sources.
+  std::unique_ptr<DeviceBuffer<Point>> device_sorted_sources;
+  std::unique_ptr<gpu_bin_sort::BinSorter> bin_sorter;
+  if (bin_sort != 0) {
+    device_sorted_sources = std::make_unique<DeviceBuffer<Point>>((size_t)count);
+    bin_sorter = std::make_unique<gpu_bin_sort::BinSorter>(
+        count, (int)num_bins);
+  }
+
   const auto upload_points_start = Clock::now();
   CUDA_CHECK(cudaMemcpy(device_points.get(), host.points.data(), count * sizeof(Point),
                         cudaMemcpyHostToDevice));
@@ -329,52 +378,166 @@ int main(int argc, char **argv) {
   const double assign_bins_ms = bin_timer.end();
 
   std::vector<int> bin_ids((size_t)count);
-  const auto copy_bins_start = Clock::now();
-  CUDA_CHECK(cudaMemcpy(bin_ids.data(), device_bin_ids.get(), count * sizeof(int),
-                        cudaMemcpyDeviceToHost));
-  const double copy_bins_ms = elapsed_ms(copy_bins_start);
+  std::vector<int> offsets((size_t)(num_bins + 1), 0);
+  std::vector<Point> sorted((size_t)count);
+  double copy_bins_ms = 0.0;
+  double sort_ms = 0.0;
+  double upload_sorted_ms = 0.0;
+  double gpu_bin_sort_ms = 0.0;
+  bool bins_valid = true;
+  bool table_valid = true;
+  bool offsets_exact = true;
+  bool sorted_exact = true;
+  bool binsort_exact_valid = true;
 
-  long long invalid_bin_ids = 0;
-  for (int bin : bin_ids)
-    if (bin < 0 || bin >= num_bins) ++invalid_bin_ids;
-  const bool bins_valid = invalid_bin_ids == 0;
-  if (!bins_valid) {
-    std::fprintf(stderr, "assign_bins produced %lld bin IDs outside [0, %lld).\n",
-                 invalid_bin_ids, num_bins);
-    return 1;
+  if (bin_sort != 0) {
+    // Warm up CUB's lazy kernel loading and the GPU clocks before timing.
+    CUDA_CHECK(bin_sorter->run(
+        device_points.get(), device_bin_ids.get(), count, device_offsets.get(),
+        device_sorted_sources->get()));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // The GPU path writes device_offsets and the sorted sources directly. Time
+    // the same number of repetitions as the spread and report the median.
+    std::vector<double> prep_sort_ms;
+    prep_sort_ms.reserve((size_t)nrun);
+    for (int run = 0; run < nrun; ++run) {
+      CudaTimer sort_timer;
+      sort_timer.begin();
+      CUDA_CHECK(bin_sorter->run(
+          device_points.get(), device_bin_ids.get(), count, device_offsets.get(),
+          device_sorted_sources->get()));
+      const double milliseconds = sort_timer.end();
+      prep_sort_ms.push_back(milliseconds);
+    }
+    std::sort(prep_sort_ms.begin(), prep_sort_ms.end());
+    gpu_bin_sort_ms = prep_sort_ms[prep_sort_ms.size() / 2];
+
+    // Validate a fresh, untimed run after poisoning the outputs. Stale data from
+    // the warmup or a previous timed run cannot mask a missing write.
+    CUDA_CHECK(cudaMemset(device_offsets.get(), 0xFF,
+                          offsets.size() * sizeof(int)));
+    CUDA_CHECK(cudaMemset(device_sorted_sources->get(), 0xFF,
+                          (size_t)count * sizeof(Point)));
+    CUDA_CHECK(bin_sorter->run(
+        device_points.get(), device_bin_ids.get(), count, device_offsets.get(),
+        device_sorted_sources->get()));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Validation copies and the host reference run outside the timed region.
+    CUDA_CHECK(cudaMemcpy(bin_ids.data(), device_bin_ids.get(), count * sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(offsets.data(), device_offsets.get(),
+                          offsets.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(sorted.data(), device_sorted_sources->get(),
+                          count * sizeof(Point), cudaMemcpyDeviceToHost));
+
+    long long invalid_bin_ids = 0;
+    for (int bin : bin_ids)
+      if (bin < 0 || bin >= num_bins) ++invalid_bin_ids;
+    bins_valid = invalid_bin_ids == 0;
+    if (!bins_valid) {
+      std::fprintf(stderr, "assign_bins produced %lld bin IDs outside [0, %lld).\n",
+                   invalid_bin_ids, num_bins);
+      return 1;
+    }
+
+    // CPU stable-sort reference.
+    std::vector<int> reference_offsets((size_t)(num_bins + 1), 0);
+    for (int bin : bin_ids) ++reference_offsets[bin + 1];
+    std::partial_sum(reference_offsets.begin(), reference_offsets.end(),
+                     reference_offsets.begin());
+    std::vector<int> reference_cursor = reference_offsets;
+    std::vector<Point> reference_sorted((size_t)count);
+    for (int i = 0; i < count; ++i) {
+      const int position = reference_cursor[bin_ids[i]]++;
+      reference_sorted[position] = host.points[i];
+    }
+
+    offsets_exact = offsets == reference_offsets;
+    sorted_exact = same_points(sorted, reference_sorted);
+    binsort_exact_valid = offsets_exact && sorted_exact;
+  } else {
+    const auto copy_bins_start = Clock::now();
+    CUDA_CHECK(cudaMemcpy(bin_ids.data(), device_bin_ids.get(), count * sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    copy_bins_ms = elapsed_ms(copy_bins_start);
+
+    long long invalid_bin_ids = 0;
+    for (int bin : bin_ids)
+      if (bin < 0 || bin >= num_bins) ++invalid_bin_ids;
+    bins_valid = invalid_bin_ids == 0;
+    if (!bins_valid) {
+      std::fprintf(stderr, "assign_bins produced %lld bin IDs outside [0, %lld).\n",
+                   invalid_bin_ids, num_bins);
+      return 1;
+    }
+
+    // Counting sort on the host. offsets[b]..offsets[b+1] is bin b's range.
+    // Repeat the host sort so the reported preparation time uses the same
+    // median-of-nrun treatment as the spread and is not a single scheduling
+    // outlier. The final repetition leaves offsets and sorted valid.
+    const auto run_host_sort = [&]() {
+      std::fill(offsets.begin(), offsets.end(), 0);
+      for (int bin : bin_ids) ++offsets[bin + 1];
+      std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
+      std::vector<int> cursor = offsets;
+      for (int i = 0; i < count; ++i)
+        sorted[cursor[bin_ids[i]]++] = host.points[i];
+    };
+    std::vector<double> prep_sort_ms;
+    prep_sort_ms.reserve((size_t)nrun);
+    for (int run = 0; run < nrun; ++run) {
+      const auto sort_start = Clock::now();
+      run_host_sort();
+      prep_sort_ms.push_back(elapsed_ms(sort_start));
+    }
+    std::sort(prep_sort_ms.begin(), prep_sort_ms.end());
+    sort_ms = prep_sort_ms[prep_sort_ms.size() / 2];
+
+    const auto upload_sorted_start = Clock::now();
+    CUDA_CHECK(cudaMemcpy(device_points.get(), sorted.data(), count * sizeof(Point),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_offsets.get(), offsets.data(),
+                          offsets.size() * sizeof(int), cudaMemcpyHostToDevice));
+    upload_sorted_ms = elapsed_ms(upload_sorted_start);
   }
 
-  // Counting sort on the host. offsets[b]..offsets[b+1] is bin b's range.
-  const auto sort_start = Clock::now();
-  std::vector<int> offsets((size_t)(num_bins + 1), 0);
-  for (int bin : bin_ids) ++offsets[bin + 1];
-  std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
-  std::vector<int> cursor = offsets;
-  std::vector<Point> sorted((size_t)count);
-  for (int i = 0; i < count; ++i) sorted[cursor[bin_ids[i]]++] = host.points[i];
-  const double sort_ms = elapsed_ms(sort_start);
-
-  bool table_valid = offsets.front() == 0 && offsets.back() == count;
+  table_valid = offsets.front() == 0 && offsets.back() == count;
   for (size_t i = 1; i < offsets.size(); ++i)
     if (offsets[i] < offsets[i - 1]) table_valid = false;
 
-  const auto upload_sorted_start = Clock::now();
-  CUDA_CHECK(cudaMemcpy(device_points.get(), sorted.data(), count * sizeof(Point),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(device_offsets.get(), offsets.data(),
-                        offsets.size() * sizeof(int), cudaMemcpyHostToDevice));
-  const double upload_sorted_ms = elapsed_ms(upload_sorted_start);
-
   const double prepare_ms = upload_points_ms + assign_bins_ms + copy_bins_ms +
-                            sort_ms + upload_sorted_ms;
+                            sort_ms + upload_sorted_ms + gpu_bin_sort_ms;
   const double setup_ms = generate_ms + prepare_ms;
   std::printf("host   generate=%.3f ms\n", generate_ms);
-  std::printf("prep   upload_points=%.3f ms assign_bins=%.3f ms copy_bins=%.3f ms "
-              "sort=%.3f ms upload_sorted=%.3f ms total=%.3f ms\n",
-              upload_points_ms, assign_bins_ms, copy_bins_ms, sort_ms,
-              upload_sorted_ms, prepare_ms);
+  if (bin_sort != 0) {
+    std::printf("prep   upload_points=%.3f ms assign_bins=%.3f ms "
+                "gpu_bin_sort=%.3f ms total=%.3f ms\n",
+                upload_points_ms, assign_bins_ms, gpu_bin_sort_ms, prepare_ms);
+    std::printf("sort   mode=radix\n");
+  } else {
+    std::printf("prep   upload_points=%.3f ms assign_bins=%.3f ms copy_bins=%.3f ms "
+                "sort=%.3f ms upload_sorted=%.3f ms total=%.3f ms\n",
+                upload_points_ms, assign_bins_ms, copy_bins_ms, sort_ms,
+                upload_sorted_ms, prepare_ms);
+    std::printf("sort   mode=cpu\n");
+  }
+  if (bin_sort == 1) {
+    std::printf("binsort exact offsets=%s sorted_sources=%s\n",
+                pass_fail(offsets_exact), pass_fail(sorted_exact));
+  }
+  if (!table_valid || !binsort_exact_valid) {
+    std::fprintf(stderr, "preparation validation failed; skipping spread\n");
+    return 1;
+  }
 
   const ReferenceResult reference = run_reference(host, nx, ny, nz, num_cells);
+  const Point *spread_points =
+      bin_sort != 0 ? device_sorted_sources->get() : device_points.get();
+  const int *spread_offsets = device_offsets.get();
 
   // Time warm-ups separately so the reported spread interval is a steady state.
   std::vector<double> spread_ms;
@@ -382,7 +545,7 @@ int main(int argc, char **argv) {
   CudaTimer spread_timer;
   for (int run = -2; run < nrun; ++run) {
     spread_timer.begin();
-    launch_selected_spread(kernel, device_points.get(), device_offsets.get(), grid,
+    launch_selected_spread(kernel, spread_points, spread_offsets, grid,
                            device_output.get());
     CUDA_CHECK(cudaGetLastError());
     const double milliseconds = spread_timer.end();
@@ -406,7 +569,7 @@ int main(int argc, char **argv) {
   // Correctness run: poison the output first so an unwritten cell is visible.
   CUDA_CHECK(cudaMemset(device_output.get(), 0xFF,
                         (size_t)num_cells * sizeof(cuFloatComplex)));
-  launch_selected_spread(kernel, device_points.get(), device_offsets.get(), grid,
+  launch_selected_spread(kernel, spread_points, spread_offsets, grid,
                          device_output.get());
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
@@ -487,12 +650,22 @@ int main(int argc, char **argv) {
               relative_l2, max_abs_error, max_relative_error, total_rel,
               unwritten_cells, nonfinite_cells, unwritten_reference_cells,
               nonfinite_reference_cells);
-  const bool all_valid = bins_valid && table_valid && coverage_valid && finite_valid &&
-                         reference_valid && total_valid && accuracy_valid;
+  const bool all_valid = bins_valid && table_valid && binsort_exact_valid &&
+                         coverage_valid && finite_valid && reference_valid &&
+                         total_valid && accuracy_valid;
   std::printf("check  bin_ids=%s table=%s coverage=%s finite=%s reference=%s "
               "total=%s accuracy=%s overall=%s\n",
               pass_fail(bins_valid), pass_fail(table_valid), pass_fail(coverage_valid),
               pass_fail(finite_valid), pass_fail(reference_valid), pass_fail(total_valid),
               pass_fail(accuracy_valid), pass_fail(all_valid));
   return all_valid ? 0 : 1;
+}
+
+int main(int argc, char **argv) {
+  try {
+    return run_benchmark(argc, argv);
+  } catch (const std::exception &error) {
+    std::fprintf(stderr, "error: %s\n", error.what());
+    return 1;
+  }
 }

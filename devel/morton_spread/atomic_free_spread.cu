@@ -1,26 +1,16 @@
-// Readable, atomic-free 3D type-1 spreading prototype: implementation.
-//
-// This is a standalone experiment, not part of the library build. It uses a
-// width-6 kernel (sigma=2, tolerance 1e-5), single precision, and periodic
-// boundaries. Each GPU thread owns a small box of output cells and writes each
-// one exactly once. There are no splits, partial grids, active-tile lists, or
-// spreading atomics.
-//
-// For simplicity, binning and sorting are done on the CPU after a GPU kernel
-// computes the bin IDs. The latter ensures bin assignment uses the exact same
-// GPU fold_rescale as spreading, including at floating-point boundaries.
-// This is a correctness/readability baseline, not an optimized implementation.
-//
-// This translation unit contains only the experiment's kernels and launch
-// wrappers. The entry point, timing, reference comparison, and correctness
-// checks are in atomic_free_spread_bench.cu. Build and run both with
-// ./devel/morton_spread/run_atomic_free_spread.sh.
+// Standalone atomic-free 3D type-1 spread: FP32, width 6, sigma 2, periodic.
+// Each thread owns output cells and writes them once, without spreading atomics.
+// GPU bin assignment uses the same fold_rescale as spreading. The benchmark
+// sorts with GPU stable radix by default, with a CPU counting-sort fallback.
+// Timing and validation live in atomic_free_spread_bench.cu.
+// Build/run: ./devel/morton_spread/run_atomic_free_spread.sh.
 
 #include "atomic_free_spread.cuh"
 
 #include <cufinufft/spreadinterp.hpp>
 
 #include <cmath>
+#include <type_traits>
 
 namespace atomic_free_spread {
 namespace {
@@ -39,15 +29,15 @@ __global__ void assign_bins(const Point *points, int count, Grid grid, int *bin_
   bin_ids[i] = bx + grid.bins_x * (by + grid.bins_y * bz);
 }
 
-// Fill dest[local][point] for cells tile_begin + local, zero outside the support.
-template<int COUNT>
-__device__ __forceinline__ void stage_tile_weights(float (*dest)[WEIGHT_STRIDE],
+// Fill tile-local weights, zero outside support. The float2 z rows include strength.
+template<int COUNT, typename T>
+__device__ __forceinline__ void stage_tile_weights(T (*dest)[WEIGHT_STRIDE],
                                                    int point, int tile_begin,
                                                    int start, int fine_size,
-                                                   const float *ker) {
+                                                   const float *ker, float2 strength = {}) {
   #pragma unroll
   for (int local = 0; local < COUNT; ++local)
-    dest[local][point] = 0.0f;
+    dest[local][point] = T{};
 
   // start is in [-HALO, fine_size - HALO]; one add normalizes it.
   start += (start < 0) ? fine_size : 0;
@@ -57,31 +47,12 @@ __device__ __forceinline__ void stage_tile_weights(float (*dest)[WEIGHT_STRIDE],
     int cell = start + k;
     cell -= (cell >= fine_size) ? fine_size : 0;
     const int local = cell - tile_begin;
-    if (local >= 0 && local < COUNT)
-      dest[local][point] = ker[k];
-  }
-}
-
-// Same, pre-scaled by the point strength, for the dimension the cell loop reads
-// as one float2 instead of loading the strength separately.
-template<int COUNT>
-__device__ __forceinline__ void stage_tile_weights(float2 (*dest)[WEIGHT_STRIDE],
-                                                   int point, int tile_begin,
-                                                   int start, int fine_size,
-                                                   const float *ker, float2 strength) {
-  #pragma unroll
-  for (int local = 0; local < COUNT; ++local)
-    dest[local][point] = make_float2(0.0f, 0.0f);
-
-  start += (start < 0) ? fine_size : 0;
-
-  #pragma unroll
-  for (int k = 0; k < WIDTH; ++k) {
-    int cell = start + k;
-    cell -= (cell >= fine_size) ? fine_size : 0;
-    const int local = cell - tile_begin;
-    if (local >= 0 && local < COUNT)
-      dest[local][point] = make_float2(ker[k] * strength.x, ker[k] * strength.y);
+    if (local >= 0 && local < COUNT) {
+      if constexpr (std::is_same_v<T, float2>)
+        dest[local][point] = make_float2(ker[k] * strength.x, ker[k] * strength.y);
+      else
+        dest[local][point] = ker[k];
+    }
   }
 }
 
@@ -137,10 +108,7 @@ __device__ __forceinline__ void store_cell_group(
       }
 }
 
-// One block owns one tile; one thread owns a GROUP_X x GROUP_Y x GROUP_Z box of
-// cells. The block stages tile-local, zero-filled weight vectors into shared
-// memory, so summing a staged point needs no support test, branch, or
-// coefficient selection.
+// One block owns a tile and stages zero-filled weights for its thread cell groups.
 __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
                        cuFloatComplex *output) {
   using cufinufft::spreadinterp::eval_kernel_vec_horner;

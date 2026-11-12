@@ -38,7 +38,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 REPO = Path(__file__).resolve().parents[2]
 
 # Calibrated against the earlier manual captures. Each entry is the exact
-# argument tail accepted by atomic_free_spread_bench, minus nrun.
+# argument tail accepted by atomic_free_spread_bench, minus the trailing nrun,
+# kernel, and bin_sort values.
 CASES: Dict[str, Dict[str, object]] = {
     "uniform": {
         "args": [1_000_000, 64, 64, 64, 0, 4, 0, 42],
@@ -398,19 +399,34 @@ def parse_bench_log(text: str) -> Dict[str, object]:
                 result["host_generate_ms"] = float(match.group(1))
         elif line.startswith("prep "):
             result["prep"] = line[len("prep ") :].strip()
-            match = re.search(
+            cpu_match = re.search(
                 r"upload_points=([\d.]+) ms assign_bins=([\d.]+) ms "
                 r"copy_bins=([\d.]+) ms sort=([\d.]+) ms "
                 r"upload_sorted=([\d.]+) ms total=([\d.]+) ms",
                 line,
             )
-            if match:
-                result["prep_upload_points_ms"] = float(match.group(1))
-                result["prep_assign_bins_ms"] = float(match.group(2))
-                result["prep_copy_bins_ms"] = float(match.group(3))
-                result["prep_sort_ms"] = float(match.group(4))
-                result["prep_upload_sorted_ms"] = float(match.group(5))
-                result["prep_total_ms"] = float(match.group(6))
+            gpu_match = re.search(
+                r"upload_points=([\d.]+) ms assign_bins=([\d.]+) ms "
+                r"gpu_bin_sort=([\d.]+) ms total=([\d.]+) ms",
+                line,
+            )
+            if cpu_match:
+                result["prep_upload_points_ms"] = float(cpu_match.group(1))
+                result["prep_assign_bins_ms"] = float(cpu_match.group(2))
+                result["prep_copy_bins_ms"] = float(cpu_match.group(3))
+                result["prep_sort_ms"] = float(cpu_match.group(4))
+                result["prep_upload_sorted_ms"] = float(cpu_match.group(5))
+                result["prep_total_ms"] = float(cpu_match.group(6))
+            elif gpu_match:
+                result["prep_upload_points_ms"] = float(gpu_match.group(1))
+                result["prep_assign_bins_ms"] = float(gpu_match.group(2))
+                result["prep_gpu_bin_sort_ms"] = float(gpu_match.group(3))
+                result["prep_total_ms"] = float(gpu_match.group(4))
+        elif line.startswith("sort "):
+            result["sort"] = line[len("sort ") :].strip()
+            mode_match = re.search(r"mode=(\w+)", line)
+            if mode_match:
+                result["bin_sort_mode"] = mode_match.group(1)
         elif line.startswith("ref "):
             result["reference"] = line[len("ref ") :].strip()
             match = re.search(
@@ -1275,6 +1291,23 @@ def analyze_case(
         raw = metric_value(metrics, section, metric, body)
         key[key_name] = numeric(raw) if numeric(raw) is not None else raw
 
+    # NCU reports short kernel durations in microseconds and longer ones in
+    # milliseconds. Normalize the SpeedOfLight Duration to milliseconds.
+    duration_value = numeric(
+        metric_value(metrics, "GPU Speed Of Light Throughput", "Duration")
+    )
+    duration_unit = metric_value(
+        units, "GPU Speed Of Light Throughput", "Duration"
+    )
+    if duration_value is not None:
+        if duration_unit == "us":
+            duration_value /= 1000.0
+        elif duration_unit == "ns":
+            duration_value /= 1_000_000.0
+        elif duration_unit == "s":
+            duration_value *= 1000.0
+    key["duration_ms"] = duration_value
+
     # NCU switches the "Memory Workload Analysis" throughput unit between
     # Mbyte/s and Gbyte/s depending on magnitude. Normalize it to GByte/s so
     # cases and implementations remain comparable.
@@ -1739,15 +1772,22 @@ def write_summary(
         if case is None:
             continue
         bench = results[case]["bench"]
+        gpu_sort = "prep_gpu_bin_sort_ms" in bench or bench.get("bin_sort_mode") in (
+            "gpu",
+            "radix",
+        )
+        sort_mode = bench.get("bin_sort_mode") or ("gpu" if gpu_sort else "cpu")
         phase_rows.append(
             [
                 workload,
+                sort_mode,
                 fmt(bench.get("host_generate_ms")),
                 fmt(bench.get("prep_upload_points_ms")),
                 fmt(bench.get("prep_assign_bins_ms")),
-                fmt(bench.get("prep_copy_bins_ms")),
-                fmt(bench.get("prep_sort_ms")),
-                fmt(bench.get("prep_upload_sorted_ms")),
+                fmt(bench.get("prep_gpu_bin_sort_ms")) if gpu_sort else "-",
+                "-" if gpu_sort else fmt(bench.get("prep_copy_bins_ms")),
+                "-" if gpu_sort else fmt(bench.get("prep_sort_ms")),
+                "-" if gpu_sort else fmt(bench.get("prep_upload_sorted_ms")),
                 fmt(bench.get("prep_total_ms")),
                 fmt(bench.get("setup_ms")),
                 fmt(bench.get("end_to_end_ms")),
@@ -1762,9 +1802,11 @@ def write_summary(
         md_table(
             [
                 "workload",
+                "bin sort",
                 "host generate",
                 "upload points",
                 "assign bins",
+                "gpu bin sort",
                 "copy bins",
                 "host sort",
                 "upload sorted",
@@ -1782,12 +1824,18 @@ def write_summary(
     )
     lines.append("")
     lines.append(
-        "All columns are milliseconds except the last, which is the ratio "
-        "method-3 execute / atomic-free spread median (above 1 means method 3 is "
-        "slower). `atomic-free end-to-end` is setup total + spread median; "
-        "`method 3 total` is setpts + execute. The atomic-free preprocessing "
-        "(assign bins, copy bins, host counting sort, upload sorted) is not part of "
-        "the `spread` kernel time. Method-3 `setpts` is its own preprocessing phase."
+        "All numeric columns are milliseconds except the last ratio "
+        "(method-3 execute / atomic-free spread median; above 1 means method 3 is "
+        "slower); `bin sort` is the selected preparation mode (`cpu` or `radix`). "
+        "`atomic-free end-to-end` is setup total "
+        "+ spread median; "
+        "`method 3 total` is setpts + execute. CPU preparation fills copy bins, "
+        "host sort, and upload sorted; GPU preparation fills `gpu bin sort` and "
+        "leaves those three as `-`. The host-sort and `gpu bin sort` columns are "
+        "medians of `nrun` timed repetitions; the `gpu bin sort` interval includes the "
+        "histogram, scan, stable radix sort, and sorted-point materialization. Preparation "
+        "is not part of the `spread` kernel time. Method-3 `setpts` is its own "
+        "preprocessing phase."
     )
     lines.append("")
 
@@ -2214,6 +2262,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--cccl", type=Path, default=None, help="CCCL include root")
     parser.add_argument("--arch", default=None, help="nvcc arch, e.g. sm_75")
     parser.add_argument("--nrun", type=int, default=5, help="benchmark timed runs")
+    parser.add_argument(
+        "--bin-sort",
+        choices=("cpu", "radix"),
+        default="radix",
+        help=(
+            "preparation sort: cpu = CPU fallback, radix = stable GPU radix (default)"
+        ),
+    )
     parser.add_argument("--skip-build", action="store_true", help="reuse existing lineinfo binary")
     parser.add_argument("--skip-benchmark", action="store_true", help="skip plain benchmark")
     parser.add_argument("--skip-profile", action="store_true", help="skip ncu collection")
@@ -2229,6 +2285,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="continue with other cases after a failure",
     )
     args = parser.parse_args(argv)
+    bin_sort_code = {"cpu": 0, "radix": 1}[args.bin_sort]
 
     explicit_cases = args.cases is not None
     if explicit_cases:
@@ -2290,6 +2347,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "capture_dir": str(out_dir),
         "host": platform.node(),
         "python": platform.python_version(),
+        "bin_sort": args.bin_sort,
     }
     environment["git_commit"] = runner.capture(
         ["git", "rev-parse", "HEAD"], cwd=REPO
@@ -2383,6 +2441,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"-isystem={poet_include}",
             "devel/morton_spread/atomic_free_spread.cu",
             "devel/morton_spread/f0_point_owned_spread.cu",
+            "devel/morton_spread/gpu_bin_sort.cu",
             "devel/morton_spread/atomic_free_spread_bench.cu",
             "-o",
             str(binary),
@@ -2427,6 +2486,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         str(binary),
                         *[str(v) for v in workload_args],
                         str(args.nrun),
+                        "0",
+                        str(bin_sort_code),
                     ]
                     runner.run(
                         bench_cmd,
@@ -2480,6 +2541,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         str(binary),
                         *[str(v) for v in workload_args],
                         "1",
+                        "0",
+                        str(bin_sort_code),
                     ]
                     runner.run(
                         profile_cmd,
@@ -2541,6 +2604,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if failed and not args.keep_going:
             break
 
+    if args.analyze_only is not None:
+        modes = sorted(
+            {
+                str(result["bench"].get("bin_sort_mode"))
+                for result in results.values()
+                if result.get("bench", {}).get("bin_sort_mode")
+            }
+        )
+        environment["bin_sort"] = ",".join(modes) if modes else "(from capture)"
     environment["generated_at"] = dt.datetime.now().isoformat(timespec="seconds")
     environment["failed_cases"] = ",".join(failed) if failed else ""
     (out_dir / "environment.json").write_text(json.dumps(environment, indent=2) + "\n")

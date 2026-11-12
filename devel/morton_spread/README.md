@@ -91,7 +91,8 @@ wrappers, and `atomic_free_spread_bench.cu` is the entry point. It is a standalo
 baseline for the same type-1 correctness contract. It is not built by `run_exp_a.sh` and
 is not part of the library. Each thread owns a small group of output cells, and each block
 enumerates the Cartesian bins around its tile and writes its cells once. Binning/sorting are
-on the host; there are no splits, partial grids, active-tile lists, or spreading atomics. It
+on the GPU by default (stable radix sort), with a CPU fallback;
+there are no splits, partial grids, active-tile lists, or spreading atomics. It
 calls `eval_kernel_vec_horner` directly and reduces support offsets modulo the grid, which
 makes it an independent check on the optimized staged scan.
 
@@ -160,7 +161,7 @@ longer dominated by redundant point work.
 ./devel/morton_spread/run_atomic_free_spread.sh all    # + bin-size/seed sweep
 # or: BUILD_DIR=/path/to/build/gpu ./devel/morton_spread/run_atomic_free_spread.sh
 # nrun defaults to 5; override with NRUN=10 ./devel/morton_spread/run_atomic_free_spread.sh
-build/gpu/atomic_free_spread_bench M N1 N2 N3 cluster bin_size [pattern [seed [nrun]]]
+build/gpu/atomic_free_spread_bench M N1 N2 N3 cluster bin_size [pattern [seed [nrun [kernel [bin_sort]]]]]
 ```
 
 `pattern` selects point placement: `0` = uniform / eight tight clusters (the default),
@@ -182,8 +183,9 @@ current results on the T1000:
 | grid nodes 4096, 6x9x13, qb=2 | 2 | 6.21e-7 |
 | grid nodes 2e4, 33x35x31, qb=4 | 2 | 2.10e-7 |
 
-The benchmark times host point generation, the two host-to-device uploads, the GPU bin
-assignment, the host counting sort, and the spread kernel. The spread time is the median of
+The benchmark times host point generation, point upload, GPU bin assignment,
+the selected sorting path, and the spread kernel. CPU sorting additionally times
+the bin-ID download and sorted-point upload. The spread time is the median of
 `nrun` CUDA-event runs after two warm-ups (min/max are printed too); method 3 `setpts` and
 `execute` are timed separately. `prep total` is the sum of the upload/bin/copy/sort phases,
 `setup` adds point generation, and `end_to_end` is `setup + spread`; reference work is
@@ -212,6 +214,52 @@ uniform (+6.4%), 12.69 -> 12.77 ms clustered (+0.6%), and 1.575 -> 1.644 ms spar
 1.37x / 1.41x / 1.91x, so the mandatory gates still pass. A staging-time normalization
 variant measured ~2-3% instead, but this source keeps the same reduction as the library so
 the two implementations match.
+
+## GPU bin sorting
+
+The standalone benchmark now defaults to **stable GPU radix sorting** from
+`organic-ladybug` (`f5ea3f6e`). The spread kernels and their launch interfaces are
+unchanged. `gpu_bin_sort.cu/.cuh` use CUB to build bin offsets and materialize sorted
+`Point` records. Stable radix reproduces the CPU sort order exactly;
+spreading still reads contiguous records, not a permutation indirection.
+
+The existing `kernel` argument remains `0` (atomic-free) or `1` (F0). The new,
+trailing `bin_sort` argument is `0` (CPU fallback) or `1` (stable radix, default).
+
+```bash
+./devel/morton_spread/run_atomic_free_spread.sh all  # default radix + boundary tests
+BIN_SORT=0 ./devel/morton_spread/run_atomic_free_spread.sh # CPU fallback
+./devel/morton_spread/run_gpu_bin_sort.sh           # focused sorter tests
+./devel/morton_spread/profile_atomic_free_spread.py --bin-sort radix
+# --bin-sort cpu restores CPU preprocessing in the profiler
+```
+
+The sorter is radix-only: a reusable scratch allocation, histogram/scan, CUB
+stable radix sort of indices, and a gather. It runs on the default stream; no
+algorithm selection, permutation accessor, or workspace diagnostics are exposed.
+
+The sorter tests check exact offsets and sorted point records against the CPU
+reference, including empty inputs, one bin, sparse bins, unchanged input keys,
+and repeated workspace reuse. The benchmark additionally tests boundary coordinates
+and validates radix output against the CPU sort outside the timed region before
+checking the spread against method 3.
+
+Post-import measurements on the T1000, retaining this branch's geometry tuning
+at `4b518145` (six interleaved process runs, 25 timed spreads each; medians in ms):
+
+| workload | CPU prep + spread | GPU radix prep + spread | GPU radix spread |
+|---|---:|---:|---:|
+| uniform 1e6, 64^3 | 26.14 | 17.29 | 12.01 |
+| clustered 1e6, 64^3 | 27.06 | 22.84 | 18.43 |
+| sparse 1e5, 128^3 | 3.33 | 2.66 | 2.13 |
+| dense 1e5, 64^3 | 7.06 | 6.62 | 6.10 |
+
+Spread times were unchanged within measurement noise. Preparation totals exclude
+point generation, workspace allocation, warm-up, and validation. The sorter owns
+reusable device scratch; these are steady-state measurements, not cold-start
+latency guarantees. CPU sort timing also uses repeated runs and reports a median.
+After reducing the sorter to 109 implementation/header lines, an interleaved
+six-process A/B found prep + spread unchanged within 0.1% on all four shapes.
 
 ## Profiling the atomic-free baseline against method 3
 
