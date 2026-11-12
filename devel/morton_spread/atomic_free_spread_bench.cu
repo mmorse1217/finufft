@@ -16,7 +16,7 @@
 // pattern: 0 = uniform/cluster (default), 1 = seam and out-of-domain points,
 //          2 = exact grid nodes and near-node offsets, 3 = one dense cluster.
 //          Patterns 1-3 ignore cluster and use seed for reproducible selection.
-// nrun: timed spread runs after two warm-ups (default 5; median reported).
+// nrun: paired timed runs per scope after two warm-ups (default 5; median reported).
 // kernel: 0 = atomic-free baseline (default), 1 = F0 point-owned spread.
 // bin_sort: 0 = CPU fallback, 1 = stable radix GPU bin sort (default).
 
@@ -187,27 +187,77 @@ HostPoints generate_points(int count, int nx, int ny, int nz, int cluster,
   return host;
 }
 
+double median(std::vector<double> values) {
+  std::sort(values.begin(), values.end());
+  return values[values.size() / 2];
+}
+
+struct TimingPair {
+  std::vector<double> ours, method3;
+};
+
+// Equal warmups and samples, reversing order each round. CUDA events measure
+// device-resident work; synchronized wall time includes host transfers/work.
+template<typename Ours, typename Method3>
+TimingPair measure_pair(int nrun, bool wall_time, Ours ours, Method3 method3) {
+  TimingPair samples;
+  CudaTimer timer;
+  auto measure = [&](auto &operation) {
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const auto start = Clock::now();
+    if (!wall_time) timer.begin();
+    operation();
+    CUDA_CHECK(cudaGetLastError());
+    if (!wall_time) return timer.end();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return elapsed_ms(start);
+  };
+  for (int run = -2; run < nrun; ++run) {
+    double a, b;
+    if (run % 2 == 0) {
+      a = measure(ours);
+      b = measure(method3);
+    } else {
+      b = measure(method3);
+      a = measure(ours);
+    }
+    if (run >= 0) {
+      samples.ours.push_back(a);
+      samples.method3.push_back(b);
+    }
+  }
+  return samples;
+}
+
 struct ReferenceResult {
   std::vector<cuFloatComplex> grid;
   double setpts_ms = 0.0;
   double execute_ms = 0.0;
   double total_ms = 0.0;
+  TimingPair spread, gpu_pipeline, host_pipeline;
 };
 
-// Independent library reference: method 3, spread-only, same kernel settings.
+// Both implementations reuse allocations/plans. Generation, validation, and
+// allocation are outside every timing scope. Host inputs use native layouts.
+template<typename Upload, typename Prepare, typename Spread, typename Download>
 ReferenceResult run_reference(const HostPoints &host, int nx, int ny, int nz,
-                              long long num_cells) {
+                              long long num_cells, int nrun, bool gpu_sort,
+                              Upload upload, Prepare prepare, Spread spread,
+                              Download download) {
   const int count = (int)host.points.size();
   DeviceBuffer<float> dx(count), dy(count), dz(count);
   DeviceBuffer<cuFloatComplex> dc(count), reference_grid(num_cells);
-  CUDA_CHECK(cudaMemcpy(dx.get(), host.x.data(), count * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dy.get(), host.y.data(), count * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dz.get(), host.z.data(), count * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dc.get(), host.strengths.data(), count * sizeof(cuFloatComplex),
-                        cudaMemcpyHostToDevice));
+  const auto upload_reference = [&]() {
+    CUDA_CHECK(cudaMemcpy(dx.get(), host.x.data(), count * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dy.get(), host.y.data(), count * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dz.get(), host.z.data(), count * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dc.get(), host.strengths.data(), count * sizeof(cuFloatComplex),
+                          cudaMemcpyHostToDevice));
+  };
+  upload_reference();
 
   cufinufft_opts opts;
   cufinufft_default_opts(&opts);
@@ -220,36 +270,49 @@ ReferenceResult run_reference(const HostPoints &host, int nx, int ny, int nz,
   cufinufftf_plan plan;
   FINUFFT_CHECK(cufinufftf_makeplan(1, 3, dims, 1, 1, 1e-5, &plan, &opts));
 
-  // Poison the reference output too, so an unwritten reference cell is visible.
-  CUDA_CHECK(cudaMemset(reference_grid.get(), 0xFF,
-                        (size_t)num_cells * sizeof(cuFloatComplex)));
-
-  // Warm up cuFINUFFT's lazy kernel loading, plan allocations, and the GPU
-  // clocks before timing setpts/execute. Without this, the short setpts phase
-  // is dominated by first-call and clock-state noise.
-  FINUFFT_CHECK(cufinufftf_setpts(plan, count, dx.get(), dy.get(), dz.get(), 0, nullptr,
-                                  nullptr, nullptr));
-  FINUFFT_CHECK(cufinufftf_execute(plan, dc.get(), reference_grid.get()));
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  // Repoison after the warmup so the timed execute's coverage check is meaningful.
-  CUDA_CHECK(cudaMemset(reference_grid.get(), 0xFF,
-                        (size_t)num_cells * sizeof(cuFloatComplex)));
-
   ReferenceResult result;
-  CudaTimer timer;
-  timer.begin();
-  FINUFFT_CHECK(cufinufftf_setpts(plan, count, dx.get(), dy.get(), dz.get(), 0, nullptr,
-                                  nullptr, nullptr));
-  result.setpts_ms = timer.end();
-  timer.begin();
-  FINUFFT_CHECK(cufinufftf_execute(plan, dc.get(), reference_grid.get()));
-  result.execute_ms = timer.end();
-  result.total_ms = result.setpts_ms + result.execute_ms;
   result.grid.resize((size_t)num_cells);
-  CUDA_CHECK(cudaMemcpy(result.grid.data(), reference_grid.get(),
-                        (size_t)num_cells * sizeof(cuFloatComplex),
-                        cudaMemcpyDeviceToHost));
+  const auto setpts = [&]() {
+    FINUFFT_CHECK(cufinufftf_setpts(plan, count, dx.get(), dy.get(), dz.get(), 0,
+                                   nullptr, nullptr, nullptr));
+  };
+  const auto execute = [&]() {
+    FINUFFT_CHECK(cufinufftf_execute(plan, dc.get(), reference_grid.get()));
+  };
+  const auto download_reference = [&]() {
+    CUDA_CHECK(cudaMemcpy(result.grid.data(), reference_grid.get(),
+                          (size_t)num_cells * sizeof(cuFloatComplex),
+                          cudaMemcpyDeviceToHost));
+  };
+
+  // Diagnostic setpts median; totals below are measured as whole pipelines,
+  // never constructed by adding independently measured phase medians.
+  CudaTimer timer;
+  std::vector<double> setpts_samples;
+  for (int run = -2; run < nrun; ++run) {
+    timer.begin();
+    setpts();
+    const double ms = timer.end();
+    if (run >= 0) setpts_samples.push_back(ms);
+  }
+  result.setpts_ms = median(setpts_samples);
+  result.spread = measure_pair(nrun, false, spread, execute);
+  result.execute_ms = median(result.spread.method3);
+  if (gpu_sort) {
+    result.gpu_pipeline = measure_pair(nrun, false,
+        [&]() { prepare(); spread(); }, [&]() { setpts(); execute(); });
+    result.total_ms = median(result.gpu_pipeline.method3);
+  }
+  result.host_pipeline = measure_pair(nrun, true,
+      [&]() { upload(); prepare(); spread(); download(); },
+      [&]() { upload_reference(); setpts(); execute(); download_reference(); });
+
+  // Fresh, untimed correctness run: previous outputs cannot mask missing writes.
+  CUDA_CHECK(cudaMemset(reference_grid.get(), 0xFF,
+                        (size_t)num_cells * sizeof(cuFloatComplex)));
+  setpts();
+  execute();
+  download_reference();
   FINUFFT_CHECK(cufinufftf_destroy(plan));
   return result;
 }

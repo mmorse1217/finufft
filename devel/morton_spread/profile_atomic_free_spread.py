@@ -388,7 +388,12 @@ def build_environment(cuda_home: Path) -> Dict[str, str]:
 
 
 def parse_bench_log(text: str) -> Dict[str, object]:
-    result: Dict[str, object] = {}
+    # Stable CSV columns, including captures that predate symmetric timings.
+    result: Dict[str, object] = {
+        f"comparison_{scope}_{name}": None
+        for scope in ("spread", "gpu_pipeline", "host_pipeline")
+        for name in ("warmup", "timed", "ours_ms", "method3_ms")
+    }
     for line in text.splitlines():
         if line.startswith("case "):
             result["case"] = line[len("case ") :].strip()
@@ -449,17 +454,18 @@ def parse_bench_log(text: str) -> Dict[str, object]:
                 result["spread_max_ms"] = float(match.group(3))
                 result["spread_Mpoint_s"] = float(match.group(4))
                 result["spread_Mcell_s"] = float(match.group(5))
-        elif line.startswith("timing "):
-            result["timing"] = line[len("timing ") :].strip()
-            match = re.search(
-                r"setup=([\d.]+) ms end_to_end=([\d.]+) ms "
-                r"spread_vs_ref_exec=([\d.]+)x",
-                line,
+        elif line.startswith("comparison "):
+            match = re.fullmatch(
+                r"comparison scope=(spread|gpu_pipeline|host_pipeline) "
+                r"warmup=(\d+) timed=(\d+) ours=([\d.eE+-]+) ms "
+                r"method3=([\d.eE+-]+) ms", line.strip()
             )
             if match:
-                result["setup_ms"] = float(match.group(1))
-                result["end_to_end_ms"] = float(match.group(2))
-                result["spread_vs_ref_exec"] = float(match.group(3))
+                prefix = f"comparison_{match.group(1)}_"
+                result[prefix + "warmup"] = int(match.group(2))
+                result[prefix + "timed"] = int(match.group(3))
+                result[prefix + "ours_ms"] = float(match.group(4))
+                result[prefix + "method3_ms"] = float(match.group(5))
         elif line.startswith("correct "):
             result["correct"] = line[len("correct ") :].strip()
             match = re.search(
@@ -1599,9 +1605,8 @@ def write_summary(
     )
     lines.append("")
     lines.append(
-        "The gap between method-3 bench `execute` and its NCU kernel time is about "
-        "2.1-2.3 ms on every workload here, consistent with a fixed output-grid clear "
-        "plus launch/synchronization overhead."
+        "NCU replay differs from the unprofiled benchmark medians; their difference "
+        "must not be interpreted as a measurement of clear overhead."
     )
     lines.append("")
 
@@ -1756,7 +1761,38 @@ def write_summary(
         ("source sample total", "source_sample_total", 0, "ratio"),
     ]
 
-    lines.append("## Benchmark phase breakdown")
+    lines.append("## Symmetric benchmark comparisons")
+    lines.append("")
+    lines.append(
+        "All times are unprofiled medians from paired alternating runs. Spread and "
+        "GPU pipeline use CUDA events; host pipeline uses synchronized host wall clock. "
+        "Spread compares ours with method-3 execute, including its output clear. "
+        "GPU pipeline starts with original inputs on GPU and ends with output on GPU: "
+        "ours assign+sort+spread versus method3 setpts+execute. Host pipeline starts "
+        "with inputs in native host layouts and includes uploads, preparation, spread, "
+        "and output downloads. All scopes exclude generation, allocations, and plan "
+        "creation. CPU fallback has no GPU pipeline measurement. Missing comparisons "
+        "are unavailable; legacy diagnostic totals cannot supply them."
+    )
+    comparison_rows = []
+    for workload in workloads:
+        bench = next(results[case]["bench"] for case in order
+                     if case in results and results[case].get("workload") == workload)
+        for scope in ("spread", "gpu_pipeline", "host_pipeline"):
+            prefix = f"comparison_{scope}_"
+            values = [bench.get(prefix + name) for name in
+                      ("warmup", "timed", "ours_ms", "method3_ms")]
+            comparison_rows.append([
+                workload, scope,
+                *["unavailable" if value is None else fmt(value, 3) for value in values],
+            ])
+    lines.append(md_table(
+        ["workload", "scope", "warmup", "timed", "ours median ms", "method3 median ms"],
+        comparison_rows,
+    ))
+    lines.append("")
+
+    lines.append("## Benchmark phase breakdown (diagnostics)")
     lines.append("")
     phase_rows = []
     for workload in workloads:
@@ -1789,13 +1825,12 @@ def write_summary(
                 "-" if gpu_sort else fmt(bench.get("prep_sort_ms")),
                 "-" if gpu_sort else fmt(bench.get("prep_upload_sorted_ms")),
                 fmt(bench.get("prep_total_ms")),
-                fmt(bench.get("setup_ms")),
-                fmt(bench.get("end_to_end_ms")),
+
                 fmt(bench.get("reference_setpts_ms")),
                 fmt(bench.get("reference_execute_ms")),
                 fmt(bench.get("reference_total_ms")),
                 fmt(bench.get("spread_median_ms")),
-                fmt(bench.get("spread_vs_ref_exec")),
+
             ]
         )
     lines.append(
@@ -1811,25 +1846,23 @@ def write_summary(
                 "host sort",
                 "upload sorted",
                 "prep total",
-                "setup total",
-                "atomic-free end-to-end",
+
                 "method 3 setpts",
                 "method 3 execute",
-                "method 3 total",
+                "method 3 total diagnostic (not host E2E)",
                 "atomic-free spread median",
-                "method-3 execute / spread",
+
             ],
             phase_rows,
         )
     )
     lines.append("")
     lines.append(
-        "All numeric columns are milliseconds except the last ratio "
-        "(method-3 execute / atomic-free spread median; above 1 means method 3 is "
-        "slower); `bin sort` is the selected preparation mode (`cpu` or `radix`). "
-        "`atomic-free end-to-end` is setup total "
-        "+ spread median; "
-        "`method 3 total` is setpts + execute. CPU preparation fills copy bins, "
+        "All numeric columns are milliseconds. These are diagnostics, not symmetric "
+        "end-to-end comparisons. In new captures, method-3 setpts is a median, execute "
+        "is the paired spread median, and total is an independently timed setpts+execute "
+        "pipeline median, not a sum of medians. Legacy total semantics can differ. "
+        "CPU preparation fills copy bins, "
         "host sort, and upload sorted; GPU preparation fills `gpu bin sort` and "
         "leaves those three as `-`. The host-sort and `gpu bin sort` columns are "
         "medians of `nrun` timed repetitions; the `gpu bin sort` interval includes the "
@@ -1907,7 +1940,7 @@ def write_summary(
             f"(min {fmt(bench.get('spread_min_ms'))}, max {fmt(bench.get('spread_max_ms'))}); "
             f"method 3 execute **{fmt(bench.get('reference_execute_ms'))} ms** "
             f"(setpts {fmt(bench.get('reference_setpts_ms'))} ms); "
-            f"method-3 execute / spread **{fmt(bench.get('spread_vs_ref_exec'))}x**; "
+
             f"relL2 **{fmt(bench.get('relL2'), 3)}**; checks **{bench.get('overall', '-')}**."
         )
         lines.append("")
