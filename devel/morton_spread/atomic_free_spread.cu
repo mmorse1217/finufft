@@ -64,6 +64,7 @@ __device__ __forceinline__ void accumulate_batch(
     const float (*kx)[WEIGHT_STRIDE], const float (*ky)[WEIGHT_STRIDE],
     const float2 (*kz)[WEIGHT_STRIDE], int staged, int x0, int y0, int z0,
     float2 (&acc)[GROUP_X][GROUP_Y][GROUP_Z]) {
+  #pragma unroll
   for (int j = 0; j < staged; ++j) {
     float x[GROUP_X];
     #pragma unroll
@@ -138,10 +139,11 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
   // Keep consecutive points contiguous so the scan can use vector loads.
   // kx[local][j] is point j's weight for tile_x + local (likewise y); kz also
   // includes the strength. Padding separates the warp's two z slices into
-  // different bank groups.
-  __shared__ __align__(16) float kx[TILE_X][WEIGHT_STRIDE];
-  __shared__ __align__(16) float ky[TILE_Y][WEIGHT_STRIDE];
-  __shared__ __align__(16) float2 kz[TILE_Z][WEIGHT_STRIDE];
+  // different bank groups. Alternate buffers so staging can overlap the prior
+  // batch's accumulation. The next staging barrier also protects buffer reuse.
+  __shared__ __align__(16) float kx_buffers[2][TILE_X][WEIGHT_STRIDE];
+  __shared__ __align__(16) float ky_buffers[2][TILE_Y][WEIGHT_STRIDE];
+  __shared__ __align__(16) float2 kz_buffers[2][TILE_Z][WEIGHT_STRIDE];
   __syncthreads();
 
   const int linear_tid =
@@ -155,6 +157,7 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
   const int stage_point = linear_tid % STAGE_POINTS;
   const bool is_stager = stage_dim < 3;
 
+  int buffer = 0;
   float2 acc[GROUP_X][GROUP_Y][GROUP_Z] = {};
 
   for (int z_bin_index = 0; z_bin_index < z_bins.count; ++z_bin_index) {
@@ -178,6 +181,9 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
         // only staging and accumulation are conditional.
         for (int base = bin_begin; base < bin_end; base += STAGE_POINTS) {
           const int staged = min(STAGE_POINTS, bin_end - base);
+          auto &kx = kx_buffers[buffer];
+          auto &ky = ky_buffers[buffer];
+          auto &kz = kz_buffers[buffer];
           if (is_stager && stage_point < staged) {
             const Point p = points[base + stage_point];
             const float raw = stage_dim == 0 ? p.x : (stage_dim == 1 ? p.y : p.z);
@@ -204,7 +210,7 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
             else
               accumulate_batch(kx, ky, kz, staged, x0, y0, z0, acc);
           }
-          __syncthreads();
+          buffer ^= 1;
         }
       }
     }
