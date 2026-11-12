@@ -22,11 +22,11 @@ constexpr int TILE_X = 8;
 constexpr int TILE_Y = 8;
 constexpr int TILE_Z = 8;
 
-// Cells per thread in each dimension. A warp spans one z slice, so the z
-// weights it reads stay a broadcast.
-constexpr int GROUP_X = 2;
+// Four adjacent x cells share one strength-scaled z weight. Each half-warp
+// spans one z slice.
+constexpr int GROUP_X = 4;
 constexpr int GROUP_Y = 1;
-constexpr int GROUP_Z = 2;
+constexpr int GROUP_Z = 1;
 
 constexpr int BLOCK_X = TILE_X / GROUP_X;
 constexpr int BLOCK_Y = TILE_Y / GROUP_Y;

@@ -65,7 +65,7 @@ __device__ __forceinline__ void stage_tile_weights(float (*dest)[WEIGHT_STRIDE],
 // Same, pre-scaled by the point strength, for the dimension the cell loop reads
 // as one float2 instead of loading the strength separately.
 template<int COUNT>
-__device__ __forceinline__ void stage_tile_weights(float2 (*dest)[STAGE_POINTS],
+__device__ __forceinline__ void stage_tile_weights(float2 (*dest)[WEIGHT_STRIDE],
                                                    int point, int tile_begin,
                                                    int start, int fine_size,
                                                    const float *ker, float2 strength) {
@@ -90,7 +90,7 @@ __device__ __forceinline__ void stage_tile_weights(float2 (*dest)[STAGE_POINTS],
 // GROUP_X + GROUP_Y + GROUP_Z shared loads for GROUP_X * GROUP_Y * GROUP_Z cells.
 __device__ __forceinline__ void accumulate_batch(
     const float (*kx)[WEIGHT_STRIDE], const float (*ky)[WEIGHT_STRIDE],
-    const float2 (*kz)[STAGE_POINTS], int staged, int x0, int y0, int z0,
+    const float2 (*kz)[WEIGHT_STRIDE], int staged, int x0, int y0, int z0,
     float2 (&acc)[GROUP_X][GROUP_Y][GROUP_Z]) {
   for (int j = 0; j < staged; ++j) {
     float weight[GROUP_X][GROUP_Y];
@@ -165,10 +165,11 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
 
   // Keep consecutive points contiguous so the scan can use vector loads.
   // kx[local][j] is point j's weight for tile_x + local (likewise y); kz also
-  // includes the strength. Only x/y need padding: z reads are warp broadcasts.
+  // includes the strength. Padding separates the warp's two z slices into
+  // different bank groups.
   __shared__ __align__(16) float kx[TILE_X][WEIGHT_STRIDE];
   __shared__ __align__(16) float ky[TILE_Y][WEIGHT_STRIDE];
-  __shared__ __align__(16) float2 kz[TILE_Z][STAGE_POINTS];
+  __shared__ __align__(16) float2 kz[TILE_Z][WEIGHT_STRIDE];
   __syncthreads();
 
   const int linear_tid =
@@ -186,7 +187,7 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
 
   for (int z_bin_index = 0; z_bin_index < z_bins.count; ++z_bin_index) {
     const int bz = z_bins[z_bin_index];
-    // Skip accumulation when a bin's periodic support misses this warp's z slice.
+    // Skip accumulation when a bin's periodic support misses this half-warp's z slice.
     int dz = tile_z + z0 - bz * grid.bin_size;
     if (dz + GROUP_Z <= -HALO) dz += grid.nz;
     if (dz + GROUP_Z > grid.nz - HALO) dz -= grid.nz;
@@ -224,7 +225,13 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
             }
           }
           __syncthreads();
-          if (covered_z) accumulate_batch(kx, ky, kz, staged, x0, y0, z0, acc);
+          if (covered_z) {
+            // Unroll full batches at compile time; keep partial batches compact.
+            if (staged == STAGE_POINTS)
+              accumulate_batch(kx, ky, kz, STAGE_POINTS, x0, y0, z0, acc);
+            else
+              accumulate_batch(kx, ky, kz, staged, x0, y0, z0, acc);
+          }
           __syncthreads();
         }
       }
