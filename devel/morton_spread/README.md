@@ -185,11 +185,21 @@ current results on the T1000:
 
 The benchmark times host point generation, point upload, GPU bin assignment,
 the selected sorting path, and the spread kernel. CPU sorting additionally times
-the bin-ID download and sorted-point upload. The spread time is the median of
-`nrun` CUDA-event runs after two warm-ups (min/max are printed too); method 3 `setpts` and
-`execute` are timed separately. `prep total` is the sum of the upload/bin/copy/sort phases,
-`setup` adds point generation, and `end_to_end` is `setup + spread`; reference work is
-validation only and is not included.
+the bin-ID download and sorted-point upload. These phase diagnostics are separate
+from the paired comparisons: each implementation gets two warm-ups and `nrun`
+timed runs per scope, with execution order reversed each round. Medians are reported.
+
+- `spread`: prepared GPU inputs to complete GPU output, including method 3's clear.
+- `gpu_pipeline`: original GPU inputs to GPU output; assign+sort+spread versus
+  setpts+execute. This scope is unavailable for CPU sorting.
+- `host_pipeline`: native-layout host inputs to host output, including uploads,
+  preparation, spread, and downloads. CPU sorting is included when selected.
+
+The first two scopes use CUDA events on the default stream; the host scope uses
+synchronized wall time. All exclude generation, allocation, and plan creation;
+plans and buffers are reused. Host layout conversion is not measured. Pipeline
+medians measure complete runs, not sums of phase medians. `prep total` remains a
+sum of diagnostic phases; it is not an end-to-end comparison.
 
 Correctness instrumentation checks valid bin IDs, a monotonic offset table with
 `offsets[num_bins] == M`, that every output cell was written (the grid is poisoned with a
@@ -304,8 +314,9 @@ benchmark median. Source instructions/samples are deduplicated by `(kernel, SASS
 keeping the first source correlation, because Nsight repeats PCs under inline
 definitions and call sites. The semantic groups are a source-text heuristic, not
 compiler metadata. The benchmark's method-3 `execute` includes the output-grid clear,
-while the atomic-free `spread` interval excludes host preprocessing; use the phase
-breakdown in `summary.md`/`profile.md` for end-to-end comparisons.
+while the atomic-free `spread` interval excludes host preprocessing; use the
+symmetric benchmark comparison table in `summary.md` for end-to-end comparisons.
+Legacy captures without paired measurements show these comparisons as unavailable.
 
 ## Source naming
 

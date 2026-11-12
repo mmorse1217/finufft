@@ -302,6 +302,18 @@ ReferenceResult run_reference(const HostPoints &host, int nx, int ny, int nz,
     result.gpu_pipeline = measure_pair(nrun, false,
         [&]() { prepare(); spread(); }, [&]() { setpts(); execute(); });
     result.total_ms = median(result.gpu_pipeline.method3);
+  } else {
+    // The CPU fallback has no device-only pipeline; retain the independent
+    // method-3 diagnostic total without reporting a GPU pipeline comparison.
+    std::vector<double> totals;
+    for (int run = -2; run < nrun; ++run) {
+      timer.begin();
+      setpts();
+      execute();
+      const double ms = timer.end();
+      if (run >= 0) totals.push_back(ms);
+    }
+    result.total_ms = median(totals);
   }
   result.host_pipeline = measure_pair(nrun, true,
       [&]() { upload(); prepare(); spread(); download(); },
@@ -574,7 +586,6 @@ int run_benchmark(int argc, char **argv) {
 
   const double prepare_ms = upload_points_ms + assign_bins_ms + copy_bins_ms +
                             sort_ms + upload_sorted_ms + gpu_bin_sort_ms;
-  const double setup_ms = generate_ms + prepare_ms;
   std::printf("host   generate=%.3f ms\n", generate_ms);
   if (bin_sort != 0) {
     std::printf("prep   upload_points=%.3f ms assign_bins=%.3f ms "
@@ -597,23 +608,51 @@ int run_benchmark(int argc, char **argv) {
     return 1;
   }
 
-  const ReferenceResult reference = run_reference(host, nx, ny, nz, num_cells);
   const Point *spread_points =
       bin_sort != 0 ? device_sorted_sources->get() : device_points.get();
   const int *spread_offsets = device_offsets.get();
 
-  // Time warm-ups separately so the reported spread interval is a steady state.
-  std::vector<double> spread_ms;
-  spread_ms.reserve((size_t)nrun);
-  CudaTimer spread_timer;
-  for (int run = -2; run < nrun; ++run) {
-    spread_timer.begin();
+  // Native host layouts and all output buffers exist before timing begins.
+  std::vector<cuFloatComplex> downloaded_output((size_t)num_cells);
+  std::vector<int> cursor(offsets.size());
+  const auto upload = [&]() {
+    CUDA_CHECK(cudaMemcpy(device_points.get(), host.points.data(), count * sizeof(Point),
+                          cudaMemcpyHostToDevice));
+  };
+  const auto prepare = [&]() {
+    atomic_free_spread::launch_assign_bins(device_points.get(), count, grid,
+                                           device_bin_ids.get());
+    CUDA_CHECK(cudaGetLastError());
+    if (bin_sort != 0) {
+      CUDA_CHECK(bin_sorter->run(device_points.get(), device_bin_ids.get(), count,
+                                device_offsets.get(), device_sorted_sources->get()));
+    } else {
+      CUDA_CHECK(cudaMemcpy(bin_ids.data(), device_bin_ids.get(), count * sizeof(int),
+                            cudaMemcpyDeviceToHost));
+      std::fill(offsets.begin(), offsets.end(), 0);
+      for (int bin : bin_ids) ++offsets[bin + 1];
+      std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
+      cursor = offsets;
+      for (int i = 0; i < count; ++i)
+        sorted[cursor[bin_ids[i]]++] = host.points[i];
+      CUDA_CHECK(cudaMemcpy(device_points.get(), sorted.data(), count * sizeof(Point),
+                            cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(device_offsets.get(), offsets.data(),
+                            offsets.size() * sizeof(int), cudaMemcpyHostToDevice));
+    }
+  };
+  const auto spread = [&]() {
     launch_selected_spread(kernel, spread_points, spread_offsets, grid,
                            device_output.get());
-    CUDA_CHECK(cudaGetLastError());
-    const double milliseconds = spread_timer.end();
-    if (run >= 0) spread_ms.push_back(milliseconds);
-  }
+  };
+  const auto download = [&]() {
+    CUDA_CHECK(cudaMemcpy(downloaded_output.data(), device_output.get(),
+                          (size_t)num_cells * sizeof(cuFloatComplex),
+                          cudaMemcpyDeviceToHost));
+  };
+  const ReferenceResult reference = run_reference(
+      host, nx, ny, nz, num_cells, nrun, bin_sort != 0, upload, prepare, spread, download);
+  std::vector<double> spread_ms = reference.spread.ours;
   std::sort(spread_ms.begin(), spread_ms.end());
   const double spread_median_ms = spread_ms[spread_ms.size() / 2];
   const double spread_min_ms = spread_ms.front();
@@ -625,9 +664,13 @@ int run_benchmark(int argc, char **argv) {
               nrun, spread_min_ms, spread_median_ms, spread_max_ms,
               count / spread_median_ms / 1000.0,
               (double)num_cells / spread_median_ms / 1000.0);
-  std::printf("timing setup=%.3f ms end_to_end=%.3f ms spread_vs_ref_exec=%.2fx\n",
-              setup_ms, setup_ms + spread_median_ms,
-              spread_median_ms > 0.0 ? reference.execute_ms / spread_median_ms : 0.0);
+  const auto print_comparison = [&](const char *scope, const TimingPair &samples) {
+    std::printf("comparison scope=%s warmup=2 timed=%d ours=%.3f ms method3=%.3f ms\n",
+                scope, nrun, median(samples.ours), median(samples.method3));
+  };
+  print_comparison("spread", reference.spread);
+  if (bin_sort != 0) print_comparison("gpu_pipeline", reference.gpu_pipeline);
+  print_comparison("host_pipeline", reference.host_pipeline);
 
   // Correctness run: poison the output first so an unwritten cell is visible.
   CUDA_CHECK(cudaMemset(device_output.get(), 0xFF,
