@@ -29,12 +29,15 @@ __global__ void assign_bins(const Point *points, int count, Grid grid, int *bin_
   bin_ids[i] = bx + grid.bins_x * (by + grid.bins_y * bz);
 }
 
-// Fill tile-local weights, zero outside support. The float2 z rows include strength.
+// Fill tile-local weights, zero outside support, and return the covered-cell mask.
+// The float2 z rows include strength.
 template<int COUNT, typename T>
-__device__ __forceinline__ void stage_tile_weights(T (*dest)[WEIGHT_STRIDE],
+__device__ __forceinline__ unsigned stage_tile_weights(T (*dest)[WEIGHT_STRIDE],
                                                    int point, int tile_begin,
                                                    int start, int fine_size,
                                                    const float *ker, float2 strength = {}) {
+  static_assert(COUNT <= 32, "tile coverage must fit in a bit mask");
+  unsigned covered = 0;
   #pragma unroll
   for (int local = 0; local < COUNT; ++local)
     dest[local][point] = T{};
@@ -48,12 +51,14 @@ __device__ __forceinline__ void stage_tile_weights(T (*dest)[WEIGHT_STRIDE],
     cell -= (cell >= fine_size) ? fine_size : 0;
     const int local = cell - tile_begin;
     if (local >= 0 && local < COUNT) {
+      covered |= 1u << local;
       if constexpr (std::is_same_v<T, float2>)
         dest[local][point] = make_float2(ker[k] * strength.x, ker[k] * strength.y);
       else
         dest[local][point] = ker[k];
     }
   }
+  return covered;
 }
 
 // Add the staged batch to this thread's cell group. Each y-z product serves the
@@ -144,7 +149,9 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
   __shared__ __align__(16) float kx_buffers[2][TILE_X][WEIGHT_STRIDE];
   __shared__ __align__(16) float ky_buffers[2][TILE_Y][WEIGHT_STRIDE];
   __shared__ __align__(16) float2 kz_buffers[2][TILE_Z][WEIGHT_STRIDE];
+  __shared__ unsigned z_covered[2];
   __syncthreads();
+  // Keep immutable bin ranges in registers across the batch barriers.
   const auto x_bins = shared_x_bins, y_bins = shared_y_bins, z_bins = shared_z_bins;
 
   const int linear_tid =
@@ -160,14 +167,10 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
 
   int buffer = 0;
   float2 acc[GROUP_X][GROUP_Y][GROUP_Z] = {};
+  const unsigned z_mask = ((1ull << GROUP_Z) - 1) << z0;
 
   for (int z_bin_index = 0; z_bin_index < z_bins.count; ++z_bin_index) {
     const int bz = z_bins[z_bin_index];
-    // Skip accumulation when a bin's periodic support misses this half-warp's z slice.
-    int dz = tile_z + z0 - bz * grid.bin_size;
-    if (dz + GROUP_Z <= -HALO) dz += grid.nz;
-    if (dz + GROUP_Z > grid.nz - HALO) dz -= grid.nz;
-    const bool covered_z = dz < min(grid.bin_size, grid.nz - bz * grid.bin_size) + HALO;
     for (int y_bin_index = 0; y_bin_index < y_bins.count; ++y_bin_index) {
       const int by = y_bins[y_bin_index];
       for (int x_bin_index = 0; x_bin_index < x_bins.count;) {
@@ -178,18 +181,15 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
         const int bin = bx + grid.bins_x * (by + grid.bins_y * bz);
         const int bin_begin = bin_offsets[bin];
         const int bin_end = bin_offsets[bin + run];
-        const Point *point = points + bin_begin + stage_point;
-        Point p{};
-        if (is_stager && bin_begin + stage_point < bin_end)
-          p = *point;
         // This loop carries the block's barriers, so every thread must run it;
         // only staging and accumulation are conditional.
-        for (int base = bin_begin; base < bin_end; base += STAGE_POINTS, point += STAGE_POINTS) {
+        for (int base = bin_begin; base < bin_end; base += STAGE_POINTS) {
           const int staged = min(STAGE_POINTS, bin_end - base);
           auto &kx = kx_buffers[buffer];
           auto &ky = ky_buffers[buffer];
           auto &kz = kz_buffers[buffer];
           if (is_stager && stage_point < staged) {
+            const Point p = points[base + stage_point];
             const float raw = stage_dim == 0 ? p.x : (stage_dim == 1 ? p.y : p.z);
             const int size =
                 stage_dim == 0 ? grid.nx : (stage_dim == 1 ? grid.ny : grid.nz);
@@ -202,15 +202,23 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
             } else if (stage_dim == 1) {
               stage_tile_weights<TILE_Y>(ky, stage_point, tile_y, start, grid.ny, ker);
             } else {
-              stage_tile_weights<TILE_Z>(kz, stage_point, tile_z, start, grid.nz, ker,
-                                         make_float2(p.strength.x, p.strength.y));
+              unsigned covered = stage_tile_weights<TILE_Z>(
+                  kz, stage_point, tile_z, start, grid.nz, ker, p.strength);
+              // Union this batch's support; inactive lanes in a partial batch
+              // must neither participate in the shuffle nor supply a value.
+              static_assert(STAGE_POINTS == 32, "one staging warp per dimension");
+              const unsigned active = 0xffffffffu >> (STAGE_POINTS - staged);
+              #pragma unroll
+              for (int offset = STAGE_POINTS / 2; offset > 0; offset /= 2) {
+                const unsigned other = __shfl_down_sync(active, covered, offset);
+                if (stage_point + offset < staged) covered |= other;
+              }
+              if (stage_point == 0) z_covered[buffer] = covered;
             }
           }
           __syncthreads();
-          // Fetch the next batch while this batch's weights are accumulated.
-          if (is_stager && base + STAGE_POINTS + stage_point < bin_end)
-            p = point[STAGE_POINTS];
-          if (covered_z) {
+          // No staged point contributes outside this mask, including at the seam.
+          if (z_covered[buffer] & z_mask) {
             // Unroll full batches at compile time; keep partial batches compact.
             if (staged == STAGE_POINTS)
               accumulate_batch(kx, ky, kz, STAGE_POINTS, x0, y0, z0, acc);
