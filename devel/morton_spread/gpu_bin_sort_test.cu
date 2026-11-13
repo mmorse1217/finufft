@@ -65,7 +65,7 @@ void test(int capacity, int bins) {
 int main() {
   try {
     for (int bins : {1, 3, 4096, 32768})
-      for (int count : {0, 1, 31, 20000, 1000000}) test(count, bins);
+      for (int count : {0, 1, 31, 255, 256, 257, 20000, 1000000}) test(count, bins);
     std::puts("all cases PASS");
   } catch (const std::exception &e) {
     std::fprintf(stderr, "%s\n", e.what());

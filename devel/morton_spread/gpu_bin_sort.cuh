@@ -21,8 +21,8 @@ class BinSorter {
   struct Free { void operator()(void *p) const { cudaFree(p); } };
   std::unique_ptr<void, Free> storage_, temp_;
   int capacity_, bins_, bits_;
-  int *keys_, *keys_out_, *indices_, *indices_out_, *counts_;
-  size_t radix_bytes_ = 0, scan_bytes_ = 0;
+  int *keys_, *keys_out_, *indices_, *indices_out_;
+  size_t radix_bytes_ = 0;
 };
 
 }  // namespace gpu_bin_sort
