@@ -10,16 +10,17 @@ namespace {
 constexpr int THREADS = 256;
 using atomic_free_spread::Point;
 
-__global__ void histogram(const int *keys, int count, int bins, int *counts) {
+__global__ void histogram(const int *bin_ids, int count, int bins, int *counts,
+                          int *keys, int *indices) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   // Invalid keys go to a sentinel rather than corrupting memory. The caller
   // must validate keys; offsets[bins] will exclude invalid points.
-  if (i < count) atomicAdd(&counts[keys[i] >= 0 && keys[i] < bins ? keys[i] : bins], 1);
-}
-
-__global__ void iota(int *indices, int count) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < count) indices[i] = i;
+  if (i < count) {
+    int key = bin_ids[i];
+    keys[i] = key;
+    indices[i] = i;
+    atomicAdd(&counts[key >= 0 && key < bins ? key : bins], 1);
+  }
 }
 
 __global__ void gather(const Point *points, const int *indices, int count, Point *out) {
@@ -62,13 +63,10 @@ cudaError_t BinSorter::run(const Point *points, const int *bin_ids, int count,
   if (!count) return cudaMemsetAsync(offsets, 0, (size_t(bins_) + 1) * sizeof(int));
   const int blocks = 1 + (count - 1) / THREADS;
   // CUB may modify both buffers, so preserve the caller's bin IDs.
-  TRY(cudaMemcpyAsync(keys_, bin_ids, size_t(count) * sizeof(int), cudaMemcpyDeviceToDevice));
   TRY(cudaMemsetAsync(counts_, 0, (size_t(bins_) + 1) * sizeof(int)));
-  histogram<<<blocks, THREADS>>>(keys_, count, bins_, counts_);
+  histogram<<<blocks, THREADS>>>(bin_ids, count, bins_, counts_, keys_, indices_);
   TRY(cudaGetLastError());
   TRY(cub::DeviceScan::ExclusiveSum(temp_.get(), scan_bytes_, counts_, offsets, bins_ + 1));
-  iota<<<blocks, THREADS>>>(indices_, count);
-  TRY(cudaGetLastError());
   cub::DoubleBuffer<int> keys(keys_, keys_out_), indices(indices_, indices_out_);
   if (count > 1 && bits_)
     TRY(cub::DeviceRadixSort::SortPairs(temp_.get(), radix_bytes_, keys, indices,
