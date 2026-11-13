@@ -19,13 +19,14 @@ namespace {
 constexpr int WEIGHT_STRIDE = STAGE_POINTS + 4;
 
 // A flattened Cartesian bin ID, with x varying fastest.
-__global__ void assign_bins(const Point *points, int count, Grid grid, int *bin_ids) {
+__global__ void assign_bins(const Point *points, int count, Grid grid,
+                            float inv_grid_bin_size, int *bin_ids) {
   using cufinufft::spreadinterp::fold_rescale;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
-  int bx = min(int(fold_rescale(points[i].x, grid.nx) / grid.bin_size), grid.bins_x - 1);
-  int by = min(int(fold_rescale(points[i].y, grid.ny) / grid.bin_size), grid.bins_y - 1);
-  int bz = min(int(fold_rescale(points[i].z, grid.nz) / grid.bin_size), grid.bins_z - 1);
+  int bx = min(int(fold_rescale(points[i].x, grid.nx) * inv_grid_bin_size), grid.bins_x - 1);
+  int by = min(int(fold_rescale(points[i].y, grid.ny) * inv_grid_bin_size), grid.bins_y - 1);
+  int bz = min(int(fold_rescale(points[i].z, grid.nz) * inv_grid_bin_size), grid.bins_z - 1);
   bin_ids[i] = bx + grid.bins_x * (by + grid.bins_y * bz);
 }
 
@@ -237,7 +238,8 @@ __global__ void spread(const Point *points, const int *bin_offsets, Grid grid,
 
 void launch_assign_bins(const Point *points, int count, Grid grid, int *bin_ids) {
   constexpr int THREADS = 256;
-  assign_bins<<<(count + THREADS - 1) / THREADS, THREADS>>>(points, count, grid, bin_ids);
+  assign_bins<<<(count + THREADS - 1) / THREADS, THREADS>>>(
+      points, count, grid, 1.0f / grid.bin_size, bin_ids);
 }
 
 void launch_spread(const Point *points, const int *bin_offsets, Grid grid,
