@@ -9,24 +9,16 @@ namespace {
 constexpr int THREADS = 256;
 using atomic_free_spread::Point;
 
-__global__ void initialize(const int *bin_ids, int count, int *keys, int *indices) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < count) {
-    keys[i] = bin_ids[i];
-    indices[i] = i;
+__global__ void make_offsets(const int *keys, int count, int bins, int *offsets) {
+  int bin = blockIdx.x * blockDim.x + threadIdx.x;
+  if (bin > bins) return;
+  int first = 0, last = count;
+  while (first < last) {
+    int mid = first + (last - first) / 2;
+    if (keys[mid] < bin) first = mid + 1;
+    else last = mid;
   }
-}
-
-__global__ void gather(const Point *points, const int *indices, const int *keys,
-                       int count, int bins, Point *out, int *offsets) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i > count) return;
-  if (i < count) out[i] = points[indices[i]];
-  // Each key transition owns the intervening bin starts, including empty bins.
-  // The extra thread at count fills the trailing empty bins and final offset.
-  int previous = i ? max(-1, min(keys[i - 1], bins)) : -1;
-  int current = i < count ? min(keys[i], bins) : bins;
-  for (int bin = previous; bin < current; ++bin) offsets[bin + 1] = i;
+  offsets[bin] = first;
 }
 
 void check(cudaError_t error) {
@@ -40,16 +32,13 @@ BinSorter::BinSorter(int capacity, int bins) : capacity_(capacity), bins_(bins) 
   bits_ = bins > 1 ? 32 - __builtin_clz(bins - 1) : 0;
   const size_t n = std::max(capacity, 1);
   void *p = nullptr;
-  check(cudaMalloc(&p, 4 * n * sizeof(int)));
+  check(cudaMalloc(&p, n * sizeof(int)));
   storage_.reset(p);
   keys_ = static_cast<int *>(p);
-  keys_out_ = keys_ + n;
-  indices_ = keys_out_ + n;
-  indices_out_ = indices_ + n;
-  cub::DoubleBuffer<int> keys(keys_, keys_out_), indices(indices_, indices_out_);
-  if (capacity > 1 && bits_)
-    check(cub::DeviceRadixSort::SortPairs(nullptr, radix_bytes_, keys, indices,
-                                         capacity, 0, bits_));
+  check(cub::DeviceRadixSort::SortPairs(nullptr, radix_bytes_,
+                                       static_cast<const int *>(nullptr), keys_,
+                                       static_cast<const Point *>(nullptr),
+                                       static_cast<Point *>(nullptr), capacity, 0, bits_));
   check(cudaMalloc(&p, std::max(size_t(1), radix_bytes_)));
   temp_.reset(p);
 }
@@ -60,16 +49,9 @@ cudaError_t BinSorter::run(const Point *points, const int *bin_ids, int count,
                            int *offsets, Point *sorted) {
   if (count < 0 || count > capacity_) return cudaErrorInvalidValue;
   if (!count) return cudaMemsetAsync(offsets, 0, (size_t(bins_) + 1) * sizeof(int));
-  const int blocks = 1 + (count - 1) / THREADS;
-  // CUB may modify both buffers, so preserve the caller's bin IDs.
-  initialize<<<blocks, THREADS>>>(bin_ids, count, keys_, indices_);
-  TRY(cudaGetLastError());
-  cub::DoubleBuffer<int> keys(keys_, keys_out_), indices(indices_, indices_out_);
-  if (count > 1 && bits_)
-    TRY(cub::DeviceRadixSort::SortPairs(temp_.get(), radix_bytes_, keys, indices,
-                                       count, 0, bits_));
-  gather<<<1 + count / THREADS, THREADS>>>(points, indices.Current(), keys.Current(),
-                                          count, bins_, sorted, offsets);
+  TRY(cub::DeviceRadixSort::SortPairs(temp_.get(), radix_bytes_, bin_ids, keys_,
+                                     points, sorted, count, 0, bits_));
+  make_offsets<<<1 + bins_ / THREADS, THREADS>>>(keys_, count, bins_, offsets);
   return cudaGetLastError();
 }
 #undef TRY

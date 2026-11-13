@@ -21,7 +21,7 @@ class BinSorter {
   struct Free { void operator()(void *p) const { cudaFree(p); } };
   std::unique_ptr<void, Free> storage_, temp_;
   int capacity_, bins_, bits_;
-  int *keys_, *keys_out_, *indices_, *indices_out_;
+  int *keys_;
   size_t radix_bytes_ = 0;
 };
 
